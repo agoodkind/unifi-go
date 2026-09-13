@@ -16,7 +16,18 @@
  	Cfgversion string `json:"cfgversion"`
  	Version    string `json:"version"` // upgrade target firmware version
  }
-@@ -252,5 +253,6 @@
+@@ -231,6 +232,10 @@
+ 	case "reboot":
+ 		s.bootTime = now
+ 		return []Effect{{Kind: EffectRebooted}}
++	case "synthetic-set-report-version":
++		// Synthetic drift injection for the isolated controller test.
++		s.cfgversion = r.Cfgversion
++		return nil
+ 	default:
+ 		return []Effect{{Kind: EffectUnknownCmd, Text: r.Cmd}}
+ 	}
+@@ -252,5 +257,6 @@
  func (s *Session) applySetparam(r informResponse) []Effect {
  	effects := []Effect{{Kind: EffectMgmtCfg, Text: r.MgmtCfg}}
 +	s.applySystemConfig(r.SystemCfg)
