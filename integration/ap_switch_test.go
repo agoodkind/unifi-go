@@ -476,11 +476,13 @@ func TestLiveSocketOperations(t *testing.T) {
 		if err != nil {
 			t.Fatal("live preview failed", err)
 		}
+		previewCompleted := time.Now()
 		after, err := os.ReadFile("/state/devices.json")
 		if err != nil || !bytes.Equal(before, after) {
 			t.Fatal("preview changed state bytes")
 		}
-		fresh := device.LastInform
+		fresh := previewCompleted
+		var previewInform time.Time
 		for {
 			observed, err := client.Device(ctx, device.ID)
 			if err != nil {
@@ -490,6 +492,7 @@ func TestLiveSocketOperations(t *testing.T) {
 				if observed.ReportedConfigVersion != device.ReportedConfigVersion {
 					t.Fatal("preview delivered configuration")
 				}
+				previewInform = observed.LastInform
 				break
 			}
 			select {
@@ -498,10 +501,13 @@ func TestLiveSocketOperations(t *testing.T) {
 			case <-time.After(time.Second):
 			}
 		}
+		if !previewInform.After(previewCompleted) {
+			t.Fatal("preview accepted an inform received before preview completed")
+		}
 		if err := os.WriteFile(fmt.Sprintf("/state/preview-%s-%d.json", phase, index), mustLiveJSON(t, struct {
-			ID         network.DeviceID
-			Start, End time.Time
-		}{device.ID, fresh, time.Now()}), 0o600); err != nil {
+			ID                 network.DeviceID
+			Start, Inform, End time.Time
+		}{device.ID, fresh, previewInform, time.Now()}), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		var version network.ConfigVersion
@@ -672,8 +678,8 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 		Management, System configmap.Values
 	}
 	type window struct {
-		ID         network.DeviceID
-		Start, End time.Time
+		ID                 network.DeviceID
+		Start, Inform, End time.Time
 	}
 	var expected []expectation
 	var windows []window
@@ -695,6 +701,9 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 			var period window
 			if json.Unmarshal(body, &period) != nil {
 				r.t.Fatal("invalid preview interval")
+			}
+			if !period.Inform.After(period.Start) || !period.End.After(period.Inform) {
+				r.t.Fatal("preview interval does not bracket a subsequent inform")
 			}
 			windows = append(windows, period)
 		}
@@ -748,7 +757,7 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 			if payload.Type == "setparam" {
 				r.t.Fatal("preview interval delivered setparam")
 			}
-			if payload.Type == "noop" {
+			if payload.Type == "noop" && seconds >= float64(period.Inform.UnixNano())/1e9 {
 				noops[index] = true
 			}
 		}
