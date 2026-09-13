@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 )
 
 type policyValue interface {
@@ -56,8 +57,13 @@ func (value *Optional[T]) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 	var decoded T
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
 		return fmt.Errorf("unmarshal optional value: %w", err)
+	}
+	if decoder.Decode(new(json.RawMessage)) != io.EOF {
+		return fmt.Errorf("unmarshal optional value: trailing JSON value")
 	}
 	*value = Supplied(decoded)
 	return nil

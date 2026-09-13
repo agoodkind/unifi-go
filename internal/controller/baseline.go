@@ -126,7 +126,10 @@ func apBaselineBindings(config network.APConfig, descriptor profile.DeviceDescri
 			if len(wirelessPrefixes) != 1 {
 				return nil, false
 			}
-			deviceName := system[wirelessPrefixes[0]+"devname"]
+			deviceName, ok := system[wirelessPrefixes[0]+"devname"]
+			if !ok || deviceName == "" {
+				return nil, false
+			}
 			aaaPrefixes := matchingAAAPrefixes(system, wifi.Name, deviceName)
 			if len(aaaPrefixes) != 1 {
 				return nil, false
@@ -147,7 +150,7 @@ func switchBaselineBindings(config network.SwitchConfig, descriptor profile.Devi
 			return nil, false
 		}
 		prefix := fmt.Sprintf("switch.port.%d.", port.Index)
-		if !hasPrefix(system, prefix) {
+		if !hasSwitchPortIdentity(system, prefix) {
 			return nil, false
 		}
 		identity := strconv.FormatUint(uint64(port.Index), 10)
@@ -199,7 +202,9 @@ func matchingWirelessPrefixes(values configmap.Values, identity, parent string) 
 			continue
 		}
 		prefix := strings.TrimSuffix(key, "ssid")
-		if values[prefix+"parent"] == parent {
+		reportedParent, hasParent := values[prefix+"parent"]
+		deviceName, hasDeviceName := values[prefix+"devname"]
+		if hasParent && reportedParent == parent && hasDeviceName && deviceName != "" {
 			prefixes = append(prefixes, prefix)
 		}
 	}
@@ -213,7 +218,8 @@ func matchingAAAPrefixes(values configmap.Values, identity, deviceName string) [
 			continue
 		}
 		prefix := strings.TrimSuffix(key, "ssid")
-		if values[prefix+"devname"] == deviceName {
+		reportedDeviceName, ok := values[prefix+"devname"]
+		if deviceName != "" && ok && reportedDeviceName == deviceName {
 			prefixes = append(prefixes, prefix)
 		}
 	}
@@ -233,11 +239,8 @@ func uniqueSorted(values []string) []string {
 	return slices.Compact(values)
 }
 
-func hasPrefix(values configmap.Values, prefix string) bool {
-	for key := range values {
-		if strings.HasPrefix(key, prefix) {
-			return true
-		}
-	}
-	return false
+func hasSwitchPortIdentity(values configmap.Values, prefix string) bool {
+	status, hasStatus := values[prefix+"status"]
+	pvid, hasPVID := values[prefix+"pvid"]
+	return values[prefix+"opmode"] == "switch" && hasStatus && status != "" && hasPVID && pvid != ""
 }

@@ -28,6 +28,70 @@ import (
 	"goodkind.io/unifi-go/network"
 )
 
+func TestTypedCLIRejectsUnknownNestedPolicy(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "nested-unknown.json")
+	writeTypedFixture(t, configPath, []byte(`{"radios":[{"band":"2.4ghz","power":{"mode":"auto","mod":"typo"}}]}`))
+
+	var output bytes.Buffer
+	err := run(t.Context(), []string{"apply", "ap", "--device", "02:00:00:00:00:11", "--file", configPath, "--socket", filepath.Join(directory, "missing.sock")}, &output)
+	if err == nil || err.Error() != "invalid typed configuration or unknown field" {
+		t.Fatalf("run() error = %v", err)
+	}
+}
+
+func TestPersistedBaselineRejectsIncompleteResourceIdentity(t *testing.T) {
+	const key = "0123456789abcdef0123456789abcdef" // gitleaks:allow
+	const version network.ConfigVersion = "review-v1"
+	management := "cfgversion=" + string(version) + "\n"
+	switchConfig := typedSwitchFixture()
+	apConfig := typedAPFixture("/run/secrets/review")
+	tests := map[string]controller.Device{
+		"switch unknown port field": {
+			MAC: "02:00:00:00:00:31", Key: key, Family: network.FamilySwitch,
+			Descriptor:     &profile.DeviceDescriptor{Family: network.FamilySwitch, Ports: []profile.PortCapability{{Index: 1, Interface: "eth0"}}},
+			DesiredSwitch:  &switchConfig,
+			DesiredVersion: version,
+			LastSetParam: &controller.Reply{
+				Type: controller.ReplySetparam, ConfigVersion: string(version), ManagementConfig: management,
+				SystemConfig: "switch.port.1.unknown=value\n",
+			},
+		},
+		"access point missing devnames": {
+			MAC: "02:00:00:00:00:32", Key: key, Family: network.FamilyAP,
+			Descriptor:     &profile.DeviceDescriptor{Family: network.FamilyAP, Radios: []profile.RadioCapability{{ID: "ng", Interface: "wifi0", Band: network.Band2GHz}}},
+			DesiredAP:      &apConfig,
+			DesiredVersion: version,
+			LastSetParam: &controller.Reply{
+				Type: controller.ReplySetparam, ConfigVersion: string(version), ManagementConfig: management,
+				SystemConfig: "radio.1.phyname=wifi0\nwireless.1.ssid=Documentation\nwireless.1.parent=wifi0\naaa.1.ssid=Documentation\n",
+			},
+		},
+	}
+
+	for name, device := range tests {
+		t.Run(name, func(t *testing.T) {
+			state := filepath.Join(t.TempDir(), "state.json")
+			writeTypedJSON(t, state, []controller.Device{device})
+			c := openTypedController(t, state)
+			if err := c.Register(device.MAC, key); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var persisted []controller.Device
+			if err := json.Unmarshal(data, &persisted); err != nil {
+				t.Fatal(err)
+			}
+			if len(persisted) != 1 || persisted[0].Baseline == nil || persisted[0].Baseline.TypedReady {
+				t.Fatal("incomplete resource identity marked typed ready")
+			}
+		})
+	}
+}
+
 func TestTypedControlIntegration(t *testing.T) {
 	var omitted network.Optional[bool]
 	disabled := network.Supplied(false)

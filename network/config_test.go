@@ -1,6 +1,7 @@
 package network
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -68,12 +69,11 @@ func TestAPConfigValidateRejectsInvalidConfigurations(t *testing.T) {
 		"unknown bss transition": {func(config *APConfig) {
 			config.Networks.Value[0].BSSTransition = Supplied(BSSTransitionMode("automatic"))
 		}, "networks[0].bss_transition"},
-		"duplicate radio band":      {func(config *APConfig) { config.Radios.Value = append(config.Radios.Value, config.Radios.Value[0]) }, "radios[2].band"},
-		"unknown radio band":        {func(config *APConfig) { config.Radios.Value[0].Band = RadioBand("6ghz") }, "radios[0].band"},
-		"zero channel":              {func(config *APConfig) { config.Radios.Value[0].Channel = Supplied(uint16(0)) }, "radios[0].channel"},
-		"invalid width":             {func(config *APConfig) { config.Radios.Value[0].WidthMHz = Supplied(ChannelWidthMHz(80)) }, "radios[0].width_mhz"},
-		"unknown power":             {func(config *APConfig) { config.Radios.Value[0].Power.Value.Mode = Supplied(PowerMode("high")) }, "radios[0].power.mode"},
-		"incomplete explicit power": {func(config *APConfig) { config.Radios.Value[1].Power.Value.DBm = Optional[int]{} }, "radios[1].power.dbm"},
+		"duplicate radio band": {func(config *APConfig) { config.Radios.Value = append(config.Radios.Value, config.Radios.Value[0]) }, "radios[2].band"},
+		"unknown radio band":   {func(config *APConfig) { config.Radios.Value[0].Band = RadioBand("6ghz") }, "radios[0].band"},
+		"zero channel":         {func(config *APConfig) { config.Radios.Value[0].Channel = Supplied(uint16(0)) }, "radios[0].channel"},
+		"invalid width":        {func(config *APConfig) { config.Radios.Value[0].WidthMHz = Supplied(ChannelWidthMHz(80)) }, "radios[0].width_mhz"},
+		"unknown power":        {func(config *APConfig) { config.Radios.Value[0].Power.Value.Mode = Supplied(PowerMode("high")) }, "radios[0].power.mode"},
 	}
 
 	for name, test := range tests {
@@ -85,6 +85,26 @@ func TestAPConfigValidateRejectsInvalidConfigurations(t *testing.T) {
 				t.Fatalf("Validate() error = %v, want path %q", err, test.path)
 			}
 		})
+	}
+}
+
+func TestAPConfigValidateAllowsOmittedExplicitPowerDBm(t *testing.T) {
+	config := validAPConfig()
+	config.Radios.Value[1].Power.Value.DBm = Optional[int]{}
+
+	if err := config.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestAPConfigValidateCompleteRequiresExplicitPowerDBm(t *testing.T) {
+	config := validAPConfig()
+	config.Radios.Value[1].Power.Value.DBm = Optional[int]{}
+
+	err := config.ValidateComplete()
+	failure, ok := errors.AsType[*ControlError](err)
+	if !ok || failure.Code != PolicyRequired || failure.Field != "radios[1].power.dbm" {
+		t.Fatalf("ValidateComplete() error = %v", err)
 	}
 }
 

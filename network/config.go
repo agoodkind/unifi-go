@@ -258,9 +258,6 @@ func validateRadio(radio RadioConfig, index int, configuredBands map[RadioBand]s
 	if power.Mode.Present && power.Mode.Value != PowerAuto && power.Mode.Value != PowerExplicit {
 		return fmt.Errorf("%s.power.mode: unknown value %q", path, power.Mode.Value)
 	}
-	if power.Mode.Present && power.Mode.Value == PowerExplicit && !power.DBm.Present {
-		return fmt.Errorf("%s.power.dbm: required for explicit power", path)
-	}
 	if power.Mode.Present && power.Mode.Value == PowerAuto && power.DBm.Present {
 		return fmt.Errorf("%s.power.dbm: must be empty for automatic power", path)
 	}
@@ -378,6 +375,9 @@ func (config APConfig) ValidateComplete() error {
 		}
 		if !radio.Power.Value.Mode.Present {
 			return requiredPolicy(path + ".power.mode")
+		}
+		if radio.Power.Value.Mode.Value == PowerExplicit && !radio.Power.Value.DBm.Present {
+			return requiredPolicy(path + ".power.dbm")
 		}
 	}
 	for index, wifi := range config.Networks.Value {
