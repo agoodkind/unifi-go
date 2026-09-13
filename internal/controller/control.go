@@ -31,14 +31,17 @@ const (
 
 // ControlRequest is sent over the private local socket; secrets use file references.
 type ControlRequest struct {
-	Device    network.DeviceID      `json:"device,omitempty"`
-	AP        *network.APConfig     `json:"ap,omitempty"`
-	Switch    *network.SwitchConfig `json:"switch,omitempty"`
-	Config    *network.Config       `json:"config,omitempty"`
-	Operation Operation             `json:"operation"`
-	MAC       string                `json:"mac,omitempty"`
-	KeyFile   string                `json:"key_file,omitempty"`
-	Command   *Reply                `json:"command,omitempty"`
+	Device       network.DeviceID        `json:"device,omitempty"`
+	AP           *network.APConfig       `json:"ap,omitempty"`
+	Switch       *network.SwitchConfig   `json:"switch,omitempty"`
+	Config       *network.Config         `json:"config,omitempty"`
+	Operation    Operation               `json:"operation"`
+	MAC          string                  `json:"mac,omitempty"`
+	KeyFile      string                  `json:"key_file,omitempty"`
+	Command      *Reply                  `json:"command,omitempty"`
+	TypedCommand *network.Command        `json:"typed_command,omitempty"`
+	Baseline     *network.BaselineImport `json:"baseline,omitempty"`
+	SetupSSH     bool                    `json:"setup_ssh,omitempty"`
 }
 
 type controlResponse struct {
@@ -67,6 +70,16 @@ func (c *Controller) Control(w http.ResponseWriter, r *http.Request) {
 		response.Version, err = c.apply(request.Device, network.FamilySwitch, request.AP, request.Switch)
 	case "apply-config":
 		response.Version, err = c.applyConfig(request.Device, request.Config)
+	case "command":
+		if request.TypedCommand == nil {
+			err = &network.ControlError{Code: network.InvalidConfig}
+		} else {
+			var command Reply
+			command.Type, command.Command, command.Parameters = ReplyCommand, CommandType(request.TypedCommand.Name), request.TypedCommand.Parameters
+			err = c.Queue(string(request.Device), command)
+		}
+	case "baseline-import":
+		err = c.importBaseline(request.Device, request.Baseline)
 	case "device":
 		var snapshot network.DeviceSnapshot
 		snapshot, err = c.deviceSnapshot(request.Device)
@@ -95,20 +108,20 @@ func (c *Controller) Control(w http.ResponseWriter, r *http.Request) {
 		if request.Command == nil {
 			err = errors.New("adopt requires a typed setparam template")
 		} else {
-			err = c.Adopt(request.MAC, *request.Command)
+			err = c.Adopt(request.MAC, *request.Command, request.SetupSSH)
 		}
 	default:
 		err = errors.New("unknown operation")
 	}
 	if err != nil {
-		if request.Operation == "apply-ap" || request.Operation == "apply-switch" || request.Operation == "apply-config" || request.Operation == "device" || request.Operation == "devices" {
+		if typedControlOperation(request.Operation) {
 			writeControlError(w, err)
 			return
 		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if request.Operation == "apply-ap" || request.Operation == "apply-switch" || request.Operation == "apply-config" || request.Operation == "device" || request.Operation == "devices" {
+	if typedControlOperation(request.Operation) {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(response); err != nil {
 			return
@@ -118,6 +131,17 @@ func (c *Controller) Control(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func typedControlOperation(operation Operation) bool {
+	switch operation {
+	case "apply-ap", "apply-switch", "apply-config", "device", "devices", "command", "baseline-import":
+		return true
+	case OpStatus, OpImport, OpSend, OpAdopt:
+		return false
+	default:
+		return false
+	}
+}
+
 func decodeControlRequest(w http.ResponseWriter, r *http.Request) (ControlRequest, bool) {
 	var request ControlRequest
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8388608))
@@ -125,7 +149,7 @@ func decodeControlRequest(w http.ResponseWriter, r *http.Request) (ControlReques
 		http.Error(w, "invalid control request", http.StatusBadRequest)
 		return request, false
 	}
-	if !validConfigRequestEncoding(body) {
+	if !ValidConfigEnvelopeEncoding(body) {
 		writeControlError(w, &network.ControlError{Code: network.InvalidEncoding, Field: ""})
 		return request, false
 	}
@@ -142,7 +166,8 @@ func decodeControlRequest(w http.ResponseWriter, r *http.Request) (ControlReques
 	return request, true
 }
 
-func validConfigRequestEncoding(body []byte) bool {
+// ValidConfigEnvelopeEncoding rejects lossy Unicode in configuration envelope fields.
+func ValidConfigEnvelopeEncoding(body []byte) bool {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	opening, err := decoder.Token()
 	if err != nil {
@@ -162,6 +187,9 @@ func validConfigRequestEncoding(body []byte) bool {
 			return true
 		}
 		if strings.EqualFold(name, "config") && !validConfigObjectEncoding(value) {
+			return false
+		}
+		if strings.EqualFold(name, "baseline") && !ValidConfigEnvelopeEncoding(value) {
 			return false
 		}
 	}
@@ -292,7 +320,7 @@ func (c *Controller) applyConfig(id network.DeviceID, config *network.Config) (n
 	if config.Version == "" || config.Management == "" && config.System == "" {
 		return "", &network.ControlError{Code: network.InvalidConfig, Field: ""}
 	}
-	command := Reply{Type: ReplySetparam, ConfigVersion: string(config.Version), ManagementConfig: config.Management, SystemConfig: config.System, Command: "", Key: "", URI: "", Interval: 0, BlockedStations: "", ServerTime: 0}
+	command := Reply{Type: ReplySetparam, ConfigVersion: string(config.Version), ManagementConfig: config.Management, SystemConfig: config.System, Command: "", Key: "", URI: "", Interval: 0, BlockedStations: "", ServerTime: 0, Parameters: nil}
 	if err := c.Queue(string(id), command); err != nil {
 		return "", err
 	}

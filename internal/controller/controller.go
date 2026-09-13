@@ -2,6 +2,7 @@
 package controller
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -221,8 +222,8 @@ func (c *Controller) Register(mac, key string) error {
 	return nil
 }
 
-// Adopt queues captured configuration with new SSH credentials for a registered AP.
-func (c *Controller) Adopt(mac string, template Reply) error {
+// Adopt queues captured configuration and optionally installs generated SSH credentials.
+func (c *Controller) Adopt(mac string, template Reply, setupSSH bool) error {
 	mac, err := normalizeMAC(mac)
 	if err != nil {
 		return err
@@ -249,24 +250,26 @@ func (c *Controller) Adopt(mac string, template Reply) error {
 		}
 		device = Device{MAC: mac, Key: inform.DefaultKey, LastSetParam: nil, SSHUsername: "", SSHPassword: "", SSHPasswordHash: "", NextKey: hex.EncodeToString(keyBytes), Family: "", Descriptor: nil, DesiredAP: nil, DesiredSwitch: nil, DesiredVersion: "", Baseline: nil}
 	}
-	passwordBytes := make([]byte, 16)
-	if _, err := rand.Read(passwordBytes); err != nil {
-		return fault("generate SSH password", err)
-	}
-	password := hex.EncodeToString(passwordBytes)
-	passwordHash, err := sha512_crypt.New().Generate([]byte(password), nil)
-	if err != nil {
-		return fault("hash SSH password", err)
-	}
-	device.SSHUsername = "unifi-go"
-	device.SSHPassword = password
-	device.SSHPasswordHash = passwordHash
-	for key, value := range map[string]string{
-		"sshd.status": "enabled", "sshd.1.status": "enabled", "sshd.auth.passwd": "enabled",
-		"users.status": "enabled", "users.1.status": "enabled", "users.1.name": device.SSHUsername,
-		"users.1.password": device.SSHPasswordHash,
-	} {
-		systemConfig = setConfigValue(systemConfig, key, value)
+	if setupSSH {
+		passwordBytes := make([]byte, 16)
+		if _, err := rand.Read(passwordBytes); err != nil {
+			return fault("generate SSH password", err)
+		}
+		password := hex.EncodeToString(passwordBytes)
+		passwordHash, err := sha512_crypt.New().Generate([]byte(password), nil)
+		if err != nil {
+			return fault("hash SSH password", err)
+		}
+		device.SSHUsername = "unifi-go"
+		device.SSHPassword = password // gitleaks:allow -- generated credential, not a literal secret
+		device.SSHPasswordHash = passwordHash
+		for key, value := range map[string]string{
+			"sshd.status": "enabled", "sshd.1.status": "enabled", "sshd.auth.passwd": "enabled",
+			"users.status": "enabled", "users.1.status": "enabled", "users.1.name": device.SSHUsername,
+			"users.1.password": device.SSHPasswordHash,
+		} {
+			systemConfig = setConfigValue(systemConfig, key, value)
+		}
 	}
 	targetKey := device.Key
 	if device.NextKey != "" {
@@ -316,6 +319,11 @@ func (c *Controller) Queue(mac string, command Reply) error {
 	if err := command.validate(); err != nil {
 		return err
 	}
+	parameters := make(map[string]json.RawMessage, len(command.Parameters))
+	for name, value := range command.Parameters {
+		parameters[name] = bytes.Clone(value)
+	}
+	command.Parameters = parameters
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	device, exists := c.devices[mac]
@@ -394,10 +402,10 @@ func (c *Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid device report", http.StatusBadRequest)
 		return
 	}
-	reply := Reply{Type: ReplyNoop, Command: "", Key: "", URI: "", Interval: 10, ConfigVersion: "", ManagementConfig: "", SystemConfig: "", BlockedStations: "", ServerTime: 0}
+	reply := Reply{Type: ReplyNoop, Command: "", Key: "", URI: "", Interval: 10, ConfigVersion: "", ManagementConfig: "", SystemConfig: "", BlockedStations: "", ServerTime: 0, Parameters: nil}
 	consumeCommand := false
 	if device.NextKey != "" && !adoptionCompleted {
-		reply = Reply{Type: ReplyCommand, Command: CommandSetAdopt, Key: device.NextKey, URI: c.advertise, Interval: 0, ConfigVersion: "", ManagementConfig: "", SystemConfig: "", BlockedStations: "", ServerTime: 0}
+		reply = Reply{Type: ReplyCommand, Command: CommandSetAdopt, Key: device.NextKey, URI: c.advertise, Interval: 0, ConfigVersion: "", ManagementConfig: "", SystemConfig: "", BlockedStations: "", ServerTime: 0, Parameters: nil}
 	} else if queue := c.queues[mac]; len(queue) != 0 {
 		reply = queue[0]
 		consumeCommand = true

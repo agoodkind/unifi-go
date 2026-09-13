@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,17 +12,20 @@ import (
 	"os"
 	"path/filepath"
 
+	"goodkind.io/unifi-go/internal/controller"
 	"goodkind.io/unifi-go/network"
 )
 
 type typedOperation string
 
 const (
-	operationApply   typedOperation = "apply"
-	operationDevices typedOperation = "devices"
-	operationDevice  typedOperation = "device"
-	operationClients typedOperation = "clients"
-	operationPorts   typedOperation = "ports"
+	operationApply          typedOperation = "apply"
+	operationDevices        typedOperation = "devices"
+	operationDevice         typedOperation = "device"
+	operationClients        typedOperation = "clients"
+	operationPorts          typedOperation = "ports"
+	operationCommand        typedOperation = "command"
+	operationBaselineImport typedOperation = "baseline-import"
 )
 
 func runTyped(ctx context.Context, args []string, output io.Writer) error {
@@ -61,6 +65,9 @@ func runTyped(ctx context.Context, args []string, output io.Writer) error {
 		return errors.New("device is required")
 	}
 	id := network.DeviceID(*device)
+	if operation == operationCommand || operation == operationBaselineImport {
+		return runTransportTyped(ctx, client, id, operation, *file)
+	}
 	if operation == "apply" {
 		return applyTyped(ctx, client, id, family, *file, output)
 	}
@@ -82,11 +89,34 @@ func runTyped(ctx context.Context, args []string, output io.Writer) error {
 		return encodeTyped(output, snapshot.Switch.Ports)
 	case operationDevice:
 		return encodeTyped(output, snapshot)
-	case operationApply, operationDevices:
+	case operationApply, operationDevices, operationCommand, operationBaselineImport:
 		return errors.New("invalid snapshot operation")
 	default:
 		return errors.New("unknown snapshot operation")
 	}
+}
+
+func runTransportTyped(ctx context.Context, client *network.Client, id network.DeviceID, operation typedOperation, path string) error {
+	if operation == operationCommand {
+		var command network.Command
+		if err := decodeConfigFile(path, &command); err != nil {
+			return err
+		}
+		if err := client.SendCommand(ctx, id, command); err != nil {
+			slog.Error("send command failed", "err", err)
+			return fmt.Errorf("send command: %w", err)
+		}
+		return nil
+	}
+	var baseline network.BaselineImport
+	if err := decodeConfigFile(path, &baseline); err != nil {
+		return err
+	}
+	if err := client.ImportBaseline(ctx, id, baseline); err != nil {
+		slog.Error("import baseline failed", "err", err)
+		return fmt.Errorf("import baseline: %w", err)
+	}
+	return nil
 }
 
 func runConfigApply(ctx context.Context, args []string, output io.Writer) error {
@@ -137,7 +167,7 @@ func readConfigFile(path string) (string, error) {
 	return string(data), nil
 }
 
-func decodeConfigFile[T network.APConfig | network.SwitchConfig](path string, config *T) error {
+func decodeConfigFile[T network.APConfig | network.SwitchConfig | network.Command | network.BaselineImport](path string, config *T) error {
 	file, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return errors.New("cannot read configuration file")
@@ -150,7 +180,17 @@ func decodeConfigFile[T network.APConfig | network.SwitchConfig](path string, co
 	if info.Size() > 8388608 {
 		return errors.New("configuration file exceeds 8 MiB")
 	}
-	decoder := json.NewDecoder(io.LimitReader(file, 8388608))
+	body, err := io.ReadAll(io.LimitReader(file, 8388609))
+	if err != nil {
+		return errors.New("cannot read configuration file")
+	}
+	if len(body) > 8388608 {
+		return errors.New("configuration file exceeds 8 MiB")
+	}
+	if !controller.ValidConfigEnvelopeEncoding(body) {
+		return &network.ControlError{Code: network.InvalidEncoding}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(config); err != nil {
 		return errors.New("invalid typed configuration or unknown field")

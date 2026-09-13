@@ -13,6 +13,110 @@ import (
 
 const baselineSchemaVersion uint16 = 1
 
+func (c *Controller) importBaseline(id network.DeviceID, imported *network.BaselineImport) error {
+	if imported == nil || imported.AP != nil && imported.Switch != nil {
+		return &network.ControlError{Code: network.InvalidConfig}
+	}
+	if err := imported.Config.Validate(); err != nil {
+		return &network.ControlError{Code: network.InvalidEncoding}
+	}
+	if imported.Config.Version == "" || imported.Config.Management == "" || imported.Config.System == "" {
+		return &network.ControlError{Code: network.BaselineUnusable}
+	}
+	management, err := configmap.Parse(imported.Config.Management)
+	if err != nil {
+		return &network.ControlError{Code: network.BaselineUnusable}
+	}
+	system, err := configmap.Parse(imported.Config.System)
+	if err != nil {
+		return &network.ControlError{Code: network.BaselineUnusable}
+	}
+	mac, err := normalizeMAC(string(id))
+	if err != nil {
+		return &network.ControlError{Code: network.InvalidDevice}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	device, exists := c.devices[mac]
+	if !exists {
+		return &network.ControlError{Code: network.NotRegistered}
+	}
+	if device.NextKey != "" {
+		return &network.ControlError{Code: network.AdoptionPending}
+	}
+	if device.Descriptor == nil {
+		return &network.ControlError{Code: network.NoReport}
+	}
+	input := profile.CompilationInput{Baseline: profile.SetParam{Version: imported.Config.Version, Management: management, System: system}, AP: imported.AP, Switch: imported.Switch, Bindings: nil}
+	compilation, err := c.validateBaselineProjection(*device.Descriptor, input)
+	if err != nil {
+		return err
+	}
+	previous := device
+	device.Baseline = &ConfigurationBaseline{SchemaVersion: baselineSchemaVersion, Config: imported.Config, TypedReady: true, Bindings: profile.CloneBindings(compilation.Bindings)}
+	device.DesiredAP, device.DesiredSwitch = compilation.AP, compilation.Switch
+	device.DesiredVersion = imported.Config.Version
+	c.devices[mac] = device
+	if err := c.saveLocked(); err != nil {
+		c.devices[mac] = previous
+		return &network.ControlError{Code: network.PersistenceFailed}
+	}
+	return nil
+}
+
+func (c *Controller) validateBaselineProjection(descriptor profile.DeviceDescriptor, input profile.CompilationInput) (profile.Compilation, error) {
+	switch descriptor.Family {
+	case network.FamilyAP:
+		if input.Switch != nil {
+			return profile.Compilation{}, &network.ControlError{Code: network.FamilyMismatch}
+		}
+		if err := validateAPProjection(input.AP); err != nil {
+			return profile.Compilation{}, err
+		}
+		result, err := c.registry.CompileAP(descriptor, input, network.APConfig{}, fileSecrets{})
+		if err != nil {
+			return profile.Compilation{}, compilerFailure(err)
+		}
+		return result, nil
+	case network.FamilySwitch:
+		if input.AP != nil {
+			return profile.Compilation{}, &network.ControlError{Code: network.FamilyMismatch}
+		}
+		if input.Switch != nil {
+			if err := input.Switch.Validate(); err != nil {
+				return profile.Compilation{}, compilerFailure(err)
+			}
+			for _, port := range input.Switch.Ports.Value {
+				if !uniquePortCapability(descriptor.Ports, port.Index) || !hasSwitchPortIdentity(input.Baseline.System, fmt.Sprintf("switch.port.%d.", port.Index)) {
+					return profile.Compilation{}, &network.ControlError{Code: network.BaselineUnusable}
+				}
+			}
+		}
+		result, err := c.registry.CompileSwitch(descriptor, input, network.SwitchConfig{}, fileSecrets{})
+		if err != nil {
+			return profile.Compilation{}, compilerFailure(err)
+		}
+		return result, nil
+	default:
+		return profile.Compilation{}, &network.ControlError{Code: network.FamilyMismatch}
+	}
+}
+
+func validateAPProjection(config *network.APConfig) error {
+	if config == nil {
+		return nil
+	}
+	if err := config.Validate(); err != nil {
+		return compilerFailure(err)
+	}
+	for _, wifi := range config.Networks.Value {
+		if !wifi.Bands.Present || len(wifi.Bands.Value) == 0 {
+			return &network.ControlError{Code: network.BaselineUnusable}
+		}
+	}
+	return nil
+}
+
 // ConfigurationBaseline persists exact configuration text and typed ownership.
 type ConfigurationBaseline struct {
 	SchemaVersion uint16                    `json:"schema_version"`

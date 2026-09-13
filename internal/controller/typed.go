@@ -101,7 +101,7 @@ func (c *Controller) apply(id network.DeviceID, family network.DeviceFamily, ap 
 		return "", compilerFailure(err)
 	}
 	param := compilation.Param
-	command, err := c.typedReply(&param, device, descriptor)
+	command, err := c.typedReply(&param, device)
 	if err != nil {
 		return "", err
 	}
@@ -241,10 +241,7 @@ func typedCompilationInput(device Device) (profile.CompilationInput, error) {
 	return input, nil
 }
 
-func (c *Controller) typedReply(param *profile.SetParam, device Device, descriptor profile.DeviceDescriptor) (Reply, error) {
-	if err := c.augmentSystem(param.System, device, descriptor); err != nil {
-		return Reply{}, &network.ControlError{Code: network.EncodingFailed, Field: ""}
-	}
+func (c *Controller) typedReply(param *profile.SetParam, device Device) (Reply, error) {
 	version, err := profile.CanonicalVersion(*param)
 	if err != nil {
 		return Reply{}, &network.ControlError{Code: network.EncodingFailed}
@@ -260,7 +257,7 @@ func (c *Controller) typedReply(param *profile.SetParam, device Device, descript
 	if err != nil {
 		return Reply{}, &network.ControlError{Code: network.EncodingFailed, Field: ""}
 	}
-	command := Reply{Type: ReplySetparam, ConfigVersion: string(param.Version), ManagementConfig: managementEncoded, SystemConfig: systemEncoded, Command: "", Key: "", URI: "", Interval: 0, BlockedStations: "", ServerTime: 0}
+	command := Reply{Type: ReplySetparam, ConfigVersion: string(param.Version), ManagementConfig: managementEncoded, SystemConfig: systemEncoded, Command: "", Key: "", URI: "", Interval: 0, BlockedStations: "", ServerTime: 0, Parameters: nil}
 
 	return command, nil
 }

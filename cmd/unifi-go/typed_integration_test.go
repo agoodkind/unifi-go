@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -445,7 +444,7 @@ func TestTypedControlIntegration(t *testing.T) {
 		t.Fatal("legacy credential metadata changed baseline policy")
 	}
 	const pendingID network.DeviceID = "02:00:00:00:00:13"
-	if err := reloaded.Adopt(string(pendingID), controller.Reply{Type: controller.ReplySetparam, ManagementConfig: "cfgversion=adopt\n", SystemConfig: "users.status=enabled\n"}); err != nil {
+	if err := reloaded.Adopt(string(pendingID), controller.Reply{Type: controller.ReplySetparam, ManagementConfig: "cfgversion=adopt\n", SystemConfig: "users.status=enabled\n"}, false); err != nil {
 		t.Fatal(err)
 	}
 	_, err = restarted.ApplyAP(ctx, pendingID, apConfig)
@@ -663,22 +662,9 @@ func assertTypedMetadata(t *testing.T, reply controller.Reply, key string) confi
 	if err != nil {
 		t.Fatal("invalid outgoing system configuration")
 	}
-	for name, expected := range map[string]string{
-		"unifi.key": key, "unifi.mcip": "192.0.2.1", "unifi.version": "0.1.0",
-		"unifi.cfgcap_info": "0x7", "unifi.feature.always_send_crash_logs": "disabled", "unifi.idp": "enabled",
-	} {
-		if system[name] != expected {
-			t.Fatalf("controller metadata incorrect: %s", name)
-		}
-	}
-	uuid := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-	for _, name := range []string{"unifi.anonymous_controller_id", "unifi.anonymous_site_id", "unifi.reporterid"} {
-		if !uuid.MatchString(system[name]) {
-			t.Fatalf("invalid controller UUID: %s", name)
-		}
-	}
-	if !regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(system["unifi.siteid"]) || system["unifi.anonymous_controller_id"] != system["unifi.reporterid"] || system["unifi.anonymous_site_id"] == system["unifi.anonymous_controller_id"] {
-		t.Fatal("invalid controller identity relationship")
+	management, err := configmap.Parse(reply.ManagementConfig)
+	if err != nil || management["authkey"] != key || management["inform_url"] != "http://192.0.2.1:8080/inform" || management["cfgversion"] != reply.ConfigVersion {
+		t.Fatal("required connection metadata changed")
 	}
 	return system
 }
@@ -693,6 +679,10 @@ func assertSameTypedIdentity(t *testing.T, first, current configmap.Values) {
 }
 
 func TestGenericConfigControlIntegration(t *testing.T) {
+	t.Run("command and baseline ownership", testCommandAndBaselineOwnership)
+	t.Run("explicit adoption SSH", testExplicitAdoptionSSH)
+	t.Run("import AP identities", testImportAPIdentities)
+	t.Run("transport persistence rollback", testTransportPersistenceRollback)
 	directory := t.TempDir()
 	state := filepath.Join(directory, "state.json")
 	const key = "0123456789abcdef0123456789abcdef"
@@ -732,8 +722,8 @@ func TestGenericConfigControlIntegration(t *testing.T) {
 	}
 	config := network.Config{
 		Version:    "generic-config-v1",
-		Management: "unknown.management.key=value=with=equals\nunknown.management.trailing=preserve-space \n",
-		System:     "unknown.system.key=quoted\\value\nunknown.system.empty=\n",
+		Management: "z=last\n\na=first\nunknown.management.key=value=with=equals\nunknown.management.trailing=preserve-space \n",
+		System:     "unknown.security=operator\nrepeat=one\nrepeat=two\n\nunknown.system.key=quoted\\value\nunknown.system.empty=\nlabel=雪😀\n",
 	}
 	version, err := client.ApplyConfig(t.Context(), id, config)
 	if err != nil {
@@ -808,6 +798,8 @@ func TestRawConfigSocketEncoding(t *testing.T) {
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}
 	for _, body := range [][]byte{
+		[]byte(`{"operation":"baseline-import","device":"02:00:00:00:00:32","baseline":{"config":{"version":"version","management":"key=value","system":"key=\ud800"}}}`),
+		append([]byte(`{"operation":"baseline-import","device":"02:00:00:00:00:32","baseline":{"config":{"version":"version","management":"key=value","system":"key=`), append([]byte{0xff}, []byte(`"}}}`)...)...),
 		append([]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"`), append([]byte{0xff}, []byte(`","management":"key=value","system":""}}`)...)...),
 		[]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"version","management":"\ud800","system":""}}`),
 		[]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"version","management":"key=value","system":"\udc00"}}`),

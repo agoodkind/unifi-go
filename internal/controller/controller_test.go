@@ -350,7 +350,7 @@ func TestAdoptQueuesCapturedConfigWithGeneratedSSHCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	template := setparamReply("old", "authkey=old\ninform_url=http://old/inform\ncfgversion=old\n", "users.status=enabled\nusers.1.name=old\nusers.1.password=old\nsshd.status=enabled\nsshd.1.status=enabled\nsshd.auth.passwd=enabled\nwireless.1.ssid=keep-me\n")
-	if err := c.Adopt(testMAC, template); err != nil {
+	if err := c.Adopt(testMAC, template, true); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(state)
@@ -385,7 +385,7 @@ func TestAdoptUsesInformKeyTransitionWithoutSSH(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "state.json")
 	c := openController(t, state)
 	template := setparamReply("old", "authkey=old\ninform_url=http://old/inform\ncfgversion=old\n", "users.status=enabled\nusers.1.name=old\nusers.1.password=old\nsshd.status=enabled\nsshd.1.status=enabled\nsshd.auth.passwd=enabled\n")
-	if err := c.Adopt(testMAC, template); err != nil {
+	if err := c.Adopt(testMAC, template, false); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(state)
