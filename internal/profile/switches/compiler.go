@@ -39,6 +39,10 @@ func (compiler) Compile(descriptor profile.DeviceDescriptor, input profile.Compi
 	}
 	prior := profile.MergeSwitch(input.Switch, network.SwitchConfig{})
 	effective := profile.MergeSwitch(input.Switch, request)
+	if err := effective.Validate(); err != nil {
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose switch: %w", err)
+	}
 	bindings, err := resolvePorts(param.System, prior)
 	if err != nil {
 		slog.Warn("configuration composition failed")

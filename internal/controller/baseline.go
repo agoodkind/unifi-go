@@ -50,7 +50,7 @@ func (c *Controller) importBaseline(id network.DeviceID, imported *network.Basel
 	typedReady := imported.AP != nil || imported.Switch != nil
 	var compilation profile.Compilation
 	if typedReady {
-		input := profile.CompilationInput{Baseline: profile.SetParam{Version: imported.Config.Version, Management: management, System: system}, AP: imported.AP, Switch: imported.Switch, Bindings: nil}
+		input := profile.CompilationInput{Baseline: profile.SetParam{Version: imported.Config.Version, Management: management, System: system}, AP: imported.AP, Switch: imported.Switch, Bindings: nil, WiFiCopies: cloneWiFiCopies(device.wifiCopies)}
 		compilation, err = c.validateBaselineProjection(*device.Descriptor, input)
 		if err != nil {
 			return err
@@ -114,7 +114,10 @@ func validateAPProjection(config *network.APConfig) error {
 		return compilerFailure(err)
 	}
 	for _, wifi := range config.Networks.Value {
-		if !wifi.Bands.Present || len(wifi.Bands.Value) == 0 {
+		if wifi.Bands.Present && len(wifi.Bands.Value) == 0 {
+			return &network.ControlError{Code: network.BaselineUnusable}
+		}
+		if !wifi.Bands.Present && (!wifi.RadioIDs.Present || len(wifi.RadioIDs.Value) == 0) {
 			return &network.ControlError{Code: network.BaselineUnusable}
 		}
 	}

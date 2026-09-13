@@ -66,6 +66,38 @@ func TestBaselineImportRejectsAmbiguousOwnership(t *testing.T) {
 	}
 }
 
+func TestBaselineImportAcceptsStableRadioIDs(t *testing.T) {
+	const key = "0123456789abcdef0123456789abcdef" // gitleaks:allow
+	const id network.DeviceID = "02:00:00:00:04:11"
+	directory := t.TempDir()
+	state := filepath.Join(directory, "state.json")
+	writeTypedJSON(t, state, []controller.Device{{MAC: string(id), Key: key}})
+	managed := openTypedController(t, state)
+	client := network.Dial(startTypedSocket(t, managed))
+	report := informmodel.Report{
+		Type: "uap", Model: "StableRadioAP", Version: "1",
+		RadioTable: []informmodel.Radio{{Name: "wifi0", Radio: "ng"}, {Name: "wifi1", Radio: "na"}},
+		PortTable:  []informmodel.Port{{Index: 1, Interface: "eth0"}},
+	}
+	typedExchange(t, managed, id, key, report, false)
+
+	config, baseline := typedBSSFixture(t, filepath.Join(directory, "unused-secret"), "stable-radio-baseline")
+	config.Radios.Value[0].ID = "wifi0"
+	config.Radios.Value[1].ID = "wifi1"
+	for index := range config.Networks.Value {
+		config.Networks.Value[index].Bands = network.Optional[[]network.RadioBand]{}
+		config.Networks.Value[index].RadioIDs = network.Supplied([]network.RadioID{"wifi0"})
+	}
+	config.Networks.Value[0].RadioIDs = network.Supplied([]network.RadioID{"wifi0", "wifi1"})
+	if err := client.ImportBaseline(t.Context(), id, network.BaselineImport{Config: baseline.Config, AP: &config}); err != nil {
+		t.Fatal("stable radio identity baseline import failed", err)
+	}
+	networks, err := client.WiFiNetworks(t.Context(), id)
+	if err != nil || len(networks) != 4 || len(networks[0].RadioIDs) == 0 {
+		t.Fatal("stable radio identity did not survive baseline import")
+	}
+}
+
 func TestFailedRawReplacementPreservesTypedAcknowledgement(t *testing.T) {
 	fixture := newPreviewFixture(t)
 	version, err := fixture.client.ApplyAP(t.Context(), previewTestID, fixture.config)
@@ -144,4 +176,66 @@ func TestRawReplacementClearsSupersededTypedAcknowledgement(t *testing.T) {
 	if fixture.controller.Status()[0].Pending != 1 {
 		t.Fatal("reconciled typed apply did not queue one reply")
 	}
+}
+
+func TestWiFiListResolvesIdentityOnlyBaselinePolicy(t *testing.T) {
+	_, baseline := typedBSSFixture(t, "unused-fixture-secret", "imported")
+	values, err := configmap.Parse(baseline.Config.System)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values["bridge.2.devname"] = "br0.20"
+	values["bridge.2.port.1.devname"], values["bridge.2.port.2.devname"] = "ath0", "ath1"
+	delete(values, "bridge.1.port.10.devname")
+	delete(values, "bridge.1.port.20.devname")
+	values["aaa.1.br.devname"], values["aaa.2.br.devname"] = "br0.20", "br0.20"
+	baseline.Config.System, err = values.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{
+		Name: "fixture-legacy", Bands: network.Supplied([]network.RadioBand{network.Band2GHz, network.Band5GHz}),
+	}})}
+	views := importIdentityOnlyWiFiList(t, baseline, projection)
+	if !views[0].Enabled.Present || !views[0].Enabled.Value || !views[0].VLAN.Present || views[0].VLAN.Null || views[0].VLAN.Value != 20 || !views[0].SecurityMode.Present || views[0].SecurityMode.Value != network.WPA2Personal {
+		t.Fatalf("safe WiFi list lost bound baseline policy: enabled=%+v vlan=%+v security=%+v", views[0].Enabled, views[0].VLAN, views[0].SecurityMode)
+	}
+
+	unknown := *baseline
+	unknownValues := values.Clone()
+	unknownValues["bridge.2.devname"] = "operator-bridge"
+	for _, index := range []string{"1", "2"} {
+		delete(unknownValues, "wireless."+index+".status")
+		delete(unknownValues, "aaa."+index+".status")
+		unknownValues["aaa."+index+".br.devname"] = "operator-bridge"
+		delete(unknownValues, "aaa."+index+".wpa")
+		delete(unknownValues, "aaa."+index+".wpa.1.pairwise")
+		delete(unknownValues, "aaa."+index+".wpa.key.1.mgmt")
+	}
+	unknown.Config.System, err = unknownValues.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	views = importIdentityOnlyWiFiList(t, &unknown, projection)
+	if views[0].Enabled.Present || views[0].VLAN.Present || views[0].SecurityMode.Present {
+		t.Fatal("unknown bound policy acquired concrete values")
+	}
+}
+
+func importIdentityOnlyWiFiList(t *testing.T, baseline *controller.ConfigurationBaseline, projection network.APConfig) []network.WiFiNetworkView {
+	t.Helper()
+	state := filepath.Join(t.TempDir(), "state.json")
+	writeTypedJSON(t, state, []controller.Device{{MAC: string(previewTestID), Key: previewTestKey}})
+	managed := openTypedController(t, state)
+	client := network.Dial(startTypedSocket(t, managed))
+	report := informmodel.Report{Type: "uap", RadioTable: []informmodel.Radio{{Name: "wifi0", Radio: "ng"}, {Name: "wifi1", Radio: "na"}}}
+	typedExchange(t, managed, previewTestID, previewTestKey, report, true)
+	if err := client.ImportBaseline(t.Context(), previewTestID, network.BaselineImport{Config: baseline.Config, AP: &projection}); err != nil {
+		t.Fatal("identity-only import failed", err)
+	}
+	views, err := client.WiFiNetworks(t.Context(), previewTestID)
+	if err != nil || len(views) != 1 {
+		t.Fatal("WiFi list failed", err)
+	}
+	return views
 }

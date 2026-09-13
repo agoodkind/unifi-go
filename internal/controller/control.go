@@ -31,26 +31,32 @@ const (
 
 // ControlRequest is sent over the private local socket; secrets use file references.
 type ControlRequest struct {
-	Device       network.DeviceID        `json:"device,omitempty"`
-	AP           *network.APConfig       `json:"ap,omitempty"`
-	Switch       *network.SwitchConfig   `json:"switch,omitempty"`
-	Config       *network.Config         `json:"config,omitempty"`
-	Operation    Operation               `json:"operation"`
-	MAC          string                  `json:"mac,omitempty"`
-	KeyFile      string                  `json:"key_file,omitempty"`
-	Command      *Reply                  `json:"command,omitempty"`
-	TypedCommand *network.Command        `json:"typed_command,omitempty"`
-	Baseline     *network.BaselineImport `json:"baseline,omitempty"`
-	SetupSSH     bool                    `json:"setup_ssh,omitempty"`
-	PreviewToken network.PreviewToken    `json:"preview_token,omitempty"`
+	Device       network.DeviceID          `json:"device,omitempty"`
+	AP           *network.APConfig         `json:"ap,omitempty"`
+	Switch       *network.SwitchConfig     `json:"switch,omitempty"`
+	Config       *network.Config           `json:"config,omitempty"`
+	Operation    Operation                 `json:"operation"`
+	MAC          string                    `json:"mac,omitempty"`
+	KeyFile      string                    `json:"key_file,omitempty"`
+	Command      *Reply                    `json:"command,omitempty"`
+	TypedCommand *network.Command          `json:"typed_command,omitempty"`
+	Baseline     *network.BaselineImport   `json:"baseline,omitempty"`
+	SetupSSH     bool                      `json:"setup_ssh,omitempty"`
+	PreviewToken network.PreviewToken      `json:"preview_token,omitempty"`
+	WiFiAdd      *network.AddWiFiRequest   `json:"wifi_add,omitempty"`
+	WiFiSet      *network.SetWiFiRequest   `json:"wifi_set,omitempty"`
+	WiFiRemove   *string                   `json:"wifi_remove,omitempty"`
+	Radio        *network.RadioConfig      `json:"radio,omitempty"`
+	Port         *network.SwitchPortConfig `json:"port,omitempty"`
 }
 
 type controlResponse struct {
-	Error   *network.ControlError    `json:"error,omitempty"`
-	Version network.ConfigVersion    `json:"version,omitempty"`
-	Device  *network.DeviceSnapshot  `json:"device,omitempty"`
-	Devices []network.DeviceSnapshot `json:"devices,omitempty"`
-	Preview *network.ConfigPreview   `json:"preview,omitempty"`
+	Error        *network.ControlError     `json:"error,omitempty"`
+	Version      network.ConfigVersion     `json:"version,omitempty"`
+	Device       *network.DeviceSnapshot   `json:"device,omitempty"`
+	Devices      []network.DeviceSnapshot  `json:"devices,omitempty"`
+	Preview      *network.ConfigPreview    `json:"preview,omitempty"`
+	WiFiNetworks []network.WiFiNetworkView `json:"wifi_networks,omitempty"`
 }
 
 // Control handles CLI requests on a separate Unix socket.
@@ -84,6 +90,8 @@ func (c *Controller) Control(w http.ResponseWriter, r *http.Request) {
 		}
 	case "baseline-import":
 		err = c.importBaseline(request.Device, request.Baseline)
+	case "wifi-list", "wifi-add", "wifi-set", "wifi-remove", "radio-set", "port-set":
+		response, err = c.resourceControl(request)
 	case "device":
 		var snapshot network.DeviceSnapshot
 		snapshot, err = c.deviceSnapshot(request.Device)
@@ -137,13 +145,63 @@ func (c *Controller) Control(w http.ResponseWriter, r *http.Request) {
 
 func typedControlOperation(operation Operation) bool {
 	switch operation {
-	case "apply-ap", "apply-switch", "preview-ap", "preview-switch", "apply-config", "device", "devices", "command", "baseline-import":
+	case "apply-ap", "apply-switch", "preview-ap", "preview-switch", "apply-config", "device", "devices", "command", "baseline-import", "wifi-list", "wifi-add", "wifi-set", "wifi-remove", "radio-set", "port-set":
 		return true
 	case OpStatus, OpImport, OpSend, OpAdopt:
 		return false
 	default:
 		return false
 	}
+}
+
+func validResourceRequest(request ControlRequest, expected string) bool {
+	if request.AP != nil || request.Switch != nil || request.Config != nil || request.MAC != "" || request.KeyFile != "" || request.Command != nil || request.TypedCommand != nil || request.Baseline != nil || request.SetupSSH || request.PreviewToken != "" {
+		return false
+	}
+	fields := map[string]bool{
+		"wifi-add":    request.WiFiAdd != nil,
+		"wifi-set":    request.WiFiSet != nil,
+		"wifi-remove": request.WiFiRemove != nil,
+		"radio-set":   request.Radio != nil,
+		"port-set":    request.Port != nil,
+	}
+	for name, present := range fields {
+		if present != (name == expected) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Controller) resourceControl(request ControlRequest) (controlResponse, error) {
+	var response controlResponse
+	expected := string(request.Operation)
+	if request.Operation == "wifi-list" {
+		expected = ""
+	}
+	if !validResourceRequest(request, expected) {
+		return response, &network.ControlError{Code: network.InvalidConfig}
+	}
+	var err error
+	switch request.Operation {
+	case "wifi-list":
+		response.WiFiNetworks, err = c.wifiNetworks(request.Device)
+	case "wifi-add":
+		response.Version, err = c.addWiFi(request.Device, *request.WiFiAdd)
+	case "wifi-set":
+		response.Version, err = c.setWiFi(request.Device, *request.WiFiSet)
+	case "wifi-remove":
+		response.Version, err = c.removeWiFi(request.Device, *request.WiFiRemove)
+	case "radio-set":
+		response.Version, err = c.setRadio(request.Device, *request.Radio)
+	case "port-set":
+		response.Version, err = c.setSwitchPort(request.Device, *request.Port)
+	case OpStatus, OpImport, OpSend, OpAdopt:
+		err = &network.ControlError{Code: network.InvalidConfig}
+	default:
+		err = &network.ControlError{Code: network.InvalidConfig}
+	}
+	return response, err
 }
 
 func decodeControlRequest(w http.ResponseWriter, r *http.Request) (ControlRequest, bool) {
@@ -338,7 +396,7 @@ func writeControlError(w http.ResponseWriter, err error) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
-	if err := json.NewEncoder(w).Encode(controlResponse{Error: failure, Version: "", Device: nil, Devices: nil, Preview: nil}); err != nil {
+	if err := json.NewEncoder(w).Encode(controlResponse{Error: failure, Version: "", Device: nil, Devices: nil, Preview: nil, WiFiNetworks: nil}); err != nil {
 		return
 	}
 }

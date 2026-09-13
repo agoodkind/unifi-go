@@ -36,7 +36,10 @@ func main() {
 
 func run(ctx context.Context, args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: unifi-go serve|adopt|import|send|status [flags]")
+		return errors.New("usage: unifi-go serve|adopt|import|send|status|apply|wifi|radio|port [flags]")
+	}
+	if args[0] == "wifi" || args[0] == "radio" || args[0] == "port" {
+		return runResource(ctx, args, output)
 	}
 	switch typedOperation(args[0]) {
 	case operationApply, operationDevices, operationDevice, operationClients, operationPorts, operationCommand, operationBaselineImport:
@@ -57,7 +60,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if args[0] == "serve" {
 		return serve(ctx, *listen, *advertise, *state, *socket, output)
 	}
-	request := controller.ControlRequest{Operation: controller.Operation(args[0]), MAC: *mac, KeyFile: *keyFile, Command: nil, Device: "", AP: nil, Switch: nil, Config: nil, TypedCommand: nil, Baseline: nil, SetupSSH: *setupSSH, PreviewToken: ""}
+	request := controller.ControlRequest{Operation: controller.Operation(args[0]), MAC: *mac, KeyFile: *keyFile, Command: nil, Device: "", AP: nil, Switch: nil, Config: nil, TypedCommand: nil, Baseline: nil, SetupSSH: *setupSSH, PreviewToken: "", WiFiAdd: nil, WiFiSet: nil, WiFiRemove: nil, Radio: nil, Port: nil}
 	if args[0] == "send" || args[0] == "adopt" {
 		data, err := os.ReadFile(filepath.Clean(*commandFile))
 		if err != nil {
