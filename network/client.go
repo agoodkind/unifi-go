@@ -35,6 +35,7 @@ type controlRequest struct {
 	Config       *Config         `json:"config,omitempty"`
 	TypedCommand *Command        `json:"typed_command,omitempty"`
 	Baseline     *BaselineImport `json:"baseline,omitempty"`
+	PreviewToken PreviewToken    `json:"preview_token,omitempty"`
 }
 
 type controlResponse struct {
@@ -42,6 +43,7 @@ type controlResponse struct {
 	Version ConfigVersion    `json:"version,omitempty"`
 	Device  *DeviceSnapshot  `json:"device,omitempty"`
 	Devices []DeviceSnapshot `json:"devices,omitempty"`
+	Preview *ConfigPreview   `json:"preview,omitempty"`
 }
 
 // Dial creates a client for socket; connections open on demand.

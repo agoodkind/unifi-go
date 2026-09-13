@@ -42,6 +42,7 @@ type ControlRequest struct {
 	TypedCommand *network.Command        `json:"typed_command,omitempty"`
 	Baseline     *network.BaselineImport `json:"baseline,omitempty"`
 	SetupSSH     bool                    `json:"setup_ssh,omitempty"`
+	PreviewToken network.PreviewToken    `json:"preview_token,omitempty"`
 }
 
 type controlResponse struct {
@@ -49,6 +50,7 @@ type controlResponse struct {
 	Version network.ConfigVersion    `json:"version,omitempty"`
 	Device  *network.DeviceSnapshot  `json:"device,omitempty"`
 	Devices []network.DeviceSnapshot `json:"devices,omitempty"`
+	Preview *network.ConfigPreview   `json:"preview,omitempty"`
 }
 
 // Control handles CLI requests on a separate Unix socket.
@@ -65,9 +67,11 @@ func (c *Controller) Control(w http.ResponseWriter, r *http.Request) {
 	var response controlResponse
 	switch request.Operation {
 	case "apply-ap":
-		response.Version, err = c.apply(request.Device, network.FamilyAP, request.AP, request.Switch)
+		response.Version, err = c.apply(request.Device, network.FamilyAP, request.AP, request.Switch, request.PreviewToken)
 	case "apply-switch":
-		response.Version, err = c.apply(request.Device, network.FamilySwitch, request.AP, request.Switch)
+		response.Version, err = c.apply(request.Device, network.FamilySwitch, request.AP, request.Switch, request.PreviewToken)
+	case "preview-ap", "preview-switch":
+		response.Preview, err = c.previewControl(request)
 	case "apply-config":
 		response.Version, err = c.applyConfig(request.Device, request.Config)
 	case "command":
@@ -133,7 +137,7 @@ func (c *Controller) Control(w http.ResponseWriter, r *http.Request) {
 
 func typedControlOperation(operation Operation) bool {
 	switch operation {
-	case "apply-ap", "apply-switch", "apply-config", "device", "devices", "command", "baseline-import":
+	case "apply-ap", "apply-switch", "preview-ap", "preview-switch", "apply-config", "device", "devices", "command", "baseline-import":
 		return true
 	case OpStatus, OpImport, OpSend, OpAdopt:
 		return false
@@ -334,7 +338,7 @@ func writeControlError(w http.ResponseWriter, err error) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
-	if err := json.NewEncoder(w).Encode(controlResponse{Error: failure, Version: "", Device: nil, Devices: nil}); err != nil {
+	if err := json.NewEncoder(w).Encode(controlResponse{Error: failure, Version: "", Device: nil, Devices: nil, Preview: nil}); err != nil {
 		return
 	}
 }

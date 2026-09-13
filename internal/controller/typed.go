@@ -53,7 +53,7 @@ func (fileSecrets) ReadSecret(path network.SecretFile) ([]byte, error) {
 	return data, nil
 }
 
-func (c *Controller) apply(id network.DeviceID, family network.DeviceFamily, ap *network.APConfig, sw *network.SwitchConfig) (network.ConfigVersion, error) {
+func (c *Controller) apply(id network.DeviceID, family network.DeviceFamily, ap *network.APConfig, sw *network.SwitchConfig, token network.PreviewToken) (network.ConfigVersion, error) {
 	mac, err := normalizeMAC(string(id))
 	if err != nil {
 		return "", &network.ControlError{Code: network.InvalidDevice, Field: ""}
@@ -64,55 +64,95 @@ func (c *Controller) apply(id network.DeviceID, family network.DeviceFamily, ap 
 	if !exists {
 		return "", &network.ControlError{Code: network.NotRegistered, Field: ""}
 	}
+	var compilation profile.Compilation
+	if token != "" {
+		compilation, err = c.revalidatePreviewLocked(device, family, ap, sw, token)
+	} else {
+		compilation, err = c.compileLocked(device, family, ap, sw)
+	}
+	if err != nil {
+		return "", err
+	}
+	version, err := c.commitCompiledLocked(device, compilation)
+	if err == nil && token != "" {
+		delete(c.previews, token)
+	}
+	return version, err
+}
+
+func (c *Controller) compileLocked(device Device, family network.DeviceFamily, ap *network.APConfig, sw *network.SwitchConfig) (profile.Compilation, error) {
+	return c.compileWithSecretsLocked(device, family, ap, sw, fileSecrets{})
+}
+
+func (c *Controller) compileWithSecretsLocked(device Device, family network.DeviceFamily, ap *network.APConfig, sw *network.SwitchConfig, secrets profile.SecretReader) (profile.Compilation, error) {
 	if device.NextKey != "" {
-		return "", &network.ControlError{Code: network.AdoptionPending, Field: ""}
+		return profile.Compilation{}, &network.ControlError{Code: network.AdoptionPending, Field: ""}
 	}
 	if device.Family != "" && device.Family != family {
-		return "", &network.ControlError{Code: network.FamilyMismatch, Field: ""}
+		return profile.Compilation{}, &network.ControlError{Code: network.FamilyMismatch, Field: ""}
 	}
-	report, exists := c.reports[mac]
+	report, exists := c.reports[device.MAC]
 	if !exists {
-		return "", &network.ControlError{Code: network.NoReport, Field: ""}
+		return profile.Compilation{}, &network.ControlError{Code: network.NoReport, Field: ""}
 	}
 	descriptor, err := profile.DescribeWithFamily(report, family)
 	if err != nil {
-		return "", &network.ControlError{Code: network.FamilyMismatch, Field: ""}
+		return profile.Compilation{}, &network.ControlError{Code: network.FamilyMismatch, Field: ""}
 	}
 	input, err := typedCompilationInput(device)
 	if err != nil {
-		return "", err
+		return profile.Compilation{}, err
+	}
+	if c.awaiting[device.MAC] != "" || len(c.queues[device.MAC]) != 0 {
+		return profile.Compilation{}, &network.ControlError{Code: network.ConfigurationPending}
 	}
 	var compilation profile.Compilation
 	switch family {
 	case network.FamilyAP:
 		if ap == nil || sw != nil {
-			return "", &network.ControlError{Code: network.InvalidConfig, Field: ""}
+			return profile.Compilation{}, &network.ControlError{Code: network.InvalidConfig, Field: ""}
 		}
-		compilation, err = c.registry.CompileAP(descriptor, input, *ap, fileSecrets{})
+		compilation, err = c.registry.CompileAP(descriptor, input, *ap, secrets)
 	case network.FamilySwitch:
 		if sw == nil || ap != nil {
-			return "", &network.ControlError{Code: network.InvalidConfig, Field: ""}
+			return profile.Compilation{}, &network.ControlError{Code: network.InvalidConfig, Field: ""}
 		}
-		compilation, err = c.registry.CompileSwitch(descriptor, input, *sw, fileSecrets{})
+		compilation, err = c.registry.CompileSwitch(descriptor, input, *sw, secrets)
 	default:
-		return "", &network.ControlError{Code: network.FamilyMismatch, Field: ""}
+		return profile.Compilation{}, &network.ControlError{Code: network.FamilyMismatch, Field: ""}
 	}
 	if err != nil {
-		return "", compilerFailure(err)
+		return profile.Compilation{}, compilerFailure(err)
 	}
+	if hasSSHPassword(ap, sw) && (compilation.Param.System["users.1.name"] == "" || !strings.HasPrefix(compilation.Param.System["users.1.password"], "$6$")) {
+		return profile.Compilation{}, &network.ControlError{Code: network.EncodingFailed}
+	}
+	if _, err := c.typedReply(&compilation.Param, device); err != nil {
+		return profile.Compilation{}, err
+	}
+	return compilation, nil
+}
+
+func (c *Controller) commitCompiledLocked(device Device, compilation profile.Compilation) (network.ConfigVersion, error) {
 	param := compilation.Param
 	command, err := c.typedReply(&param, device)
 	if err != nil {
 		return "", err
 	}
 	previous := device
-	if ap != nil && ap.SSH.Present && ap.SSH.Value.Password.Present || sw != nil && sw.SSH.Present && sw.SSH.Value.Password.Present {
-		username, passwordHash := param.System["users.1.name"], param.System["users.1.password"]
-		if username == "" || !strings.HasPrefix(passwordHash, "$6$") {
-			return "", &network.ControlError{Code: network.EncodingFailed, Field: ""}
-		}
+	ap := compilation.AP
+	username, passwordHash := param.System["users.1.name"], param.System["users.1.password"]
+	if hasSSHPassword(compilation.AP, compilation.Switch) && username != "" && strings.HasPrefix(passwordHash, "$6$") {
 		device.SSHUsername, device.SSHPasswordHash = username, passwordHash
 		device.SSHPassword = ""
+	}
+	family := network.FamilySwitch
+	if ap != nil {
+		family = network.FamilyAP
+	}
+	descriptor, err := profile.DescribeWithFamily(c.reports[device.MAC], family)
+	if err != nil {
+		return "", &network.ControlError{Code: network.FamilyMismatch}
 	}
 	device.Family, device.Descriptor = family, &descriptor
 	device.DesiredAP, device.DesiredSwitch, device.DesiredVersion = compilation.AP, compilation.Switch, param.Version
@@ -121,13 +161,20 @@ func (c *Controller) apply(id network.DeviceID, family network.DeviceFamily, ap 
 		SchemaVersion: baselineSchemaVersion, TypedReady: true, Bindings: profile.CloneBindings(compilation.Bindings),
 		Config: network.Config{Version: param.Version, Management: command.ManagementConfig, System: command.SystemConfig},
 	}
-	c.devices[mac] = device
+	c.devices[device.MAC] = device
 	if err := c.saveLocked(); err != nil {
-		c.devices[mac] = previous
+		c.devices[device.MAC] = previous
 		return "", &network.ControlError{Code: network.PersistenceFailed, Field: ""}
 	}
-	c.queues[mac] = append(c.queues[mac], command)
+	if previous.DesiredVersion != param.Version {
+		c.queues[device.MAC] = append(c.queues[device.MAC], command)
+		c.awaiting[device.MAC] = param.Version
+	}
 	return param.Version, nil
+}
+
+func hasSSHPassword(ap *network.APConfig, sw *network.SwitchConfig) bool {
+	return ap != nil && ap.SSH.Present && ap.SSH.Value.Password.Present || sw != nil && sw.SSH.Present && sw.SSH.Value.Password.Present
 }
 
 func (c *Controller) snapshotLocked(device Device) (network.DeviceSnapshot, error) {
@@ -236,7 +283,15 @@ func typedCompilationInput(device Device) (profile.CompilationInput, error) {
 	if err != nil {
 		return profile.CompilationInput{}, &network.ControlError{Code: network.BaselineUnusable}
 	}
-	input := profile.CompilationInput{Baseline: profile.SetParam{Version: device.Baseline.Config.Version, Management: baselineManagement, System: baselineSystem}, AP: device.DesiredAP, Switch: device.DesiredSwitch, Bindings: device.Baseline.Bindings}
+	input := profile.CompilationInput{Baseline: profile.SetParam{Version: device.Baseline.Config.Version, Management: baselineManagement, System: baselineSystem}, AP: nil, Switch: nil, Bindings: profile.CloneBindings(device.Baseline.Bindings)}
+	if device.DesiredAP != nil {
+		cloned := profile.MergeAP(device.DesiredAP, network.APConfig{})
+		input.AP = &cloned
+	}
+	if device.DesiredSwitch != nil {
+		cloned := profile.MergeSwitch(device.DesiredSwitch, network.SwitchConfig{})
+		input.Switch = &cloned
+	}
 
 	return input, nil
 }
@@ -249,6 +304,7 @@ func (c *Controller) typedReply(param *profile.SetParam, device Device) (Reply, 
 	param.Version = version
 	management := param.Management.Clone()
 	management["authkey"], management["inform_url"], management["cfgversion"] = device.Key, c.advertise, string(param.Version)
+	param.Management = management
 	managementEncoded, err := management.Encode()
 	if err != nil {
 		return Reply{}, &network.ControlError{Code: network.EncodingFailed, Field: ""}

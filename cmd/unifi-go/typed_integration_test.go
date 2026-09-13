@@ -92,6 +92,7 @@ func TestPersistedBaselineRejectsIncompleteResourceIdentity(t *testing.T) {
 }
 
 func TestTypedControlIntegration(t *testing.T) {
+	t.Run("preview transaction", testPreviewTransaction)
 	var omitted network.Optional[bool]
 	disabled := network.Supplied(false)
 	untagged := network.Cleared[network.VLANID]()
@@ -218,7 +219,10 @@ func TestTypedControlIntegration(t *testing.T) {
 		if entry.id == switchID && !strings.Contains(reply.SystemConfig, "vlan.") {
 			t.Fatal("switch VLAN configuration missing")
 		}
+		entry.report.ConfigVersion = string(entry.version)
+		typedExchange(t, c, entry.id, key, entry.report, entry.gcm)
 	}
+	apReport.ConfigVersion, swReport.ConfigVersion = string(apVersion), string(swVersion)
 	snapshots, err := client.Devices(ctx)
 	if err != nil || len(snapshots) != 2 || snapshots[0].ID != apID {
 		t.Fatal("device list failed")
@@ -306,11 +310,41 @@ func TestTypedControlIntegration(t *testing.T) {
 		if strings.Contains(output.String(), secret) || strings.Contains(output.String(), secretPath) {
 			t.Fatal("apply output exposed credentials")
 		}
+		beforePreview := previewStateBytes(t, state)
+		previewOutput, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", configFile, "--socket", socket, "--dry-run").CombinedOutput()
+		if err != nil {
+			t.Fatal("fresh executable preview failed")
+		}
+		var preview network.ConfigPreview
+		decoder := json.NewDecoder(bytes.NewReader(previewOutput))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&preview); err != nil || preview.Token == "" || decoder.Decode(new(json.RawMessage)) != io.EOF {
+			t.Fatal("fresh executable did not return only ConfigPreview")
+		}
+		if !bytes.Equal(beforePreview, previewStateBytes(t, state)) {
+			t.Fatal("fresh executable preview changed state")
+		}
+		for _, status := range c.Status() {
+			if status.Pending != 0 {
+				t.Fatal("fresh executable preview queued work")
+			}
+		}
+		tokenFile := filepath.Join(directory, family+".token")
+		writeTypedFixture(t, tokenFile, []byte(string(preview.Token)+"\n"))
+		if _, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", configFile, "--socket", socket, "--preview-token-file", tokenFile).CombinedOutput(); err != nil {
+			t.Fatal("fresh executable token application failed")
+		}
+		if _, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", configFile, "--socket", socket, "--dry-run", "--preview-token-file", tokenFile).CombinedOutput(); err == nil {
+			t.Fatal("fresh executable accepted conflicting preview flags")
+		}
 	}
 	if _, err := client.ApplyAP(ctx, apID, apConfig); err != nil {
 		t.Fatal(err)
 	}
-	repeated := assertTypedMetadata(t, typedExchange(t, c, apID, key, apReport, false), key)
+	if reply := typedExchange(t, c, apID, key, apReport, false); reply.Type != controller.ReplyNoop {
+		t.Fatal("unchanged configuration was queued")
+	}
+	repeated := assertTypedMetadata(t, typedPersistedReply(t, state, apID), key)
 	assertSameTypedIdentity(t, firstSystem, repeated)
 	if _, err := client.ApplySwitch(ctx, switchID, swConfig); err != nil {
 		t.Fatal(err)
@@ -360,7 +394,10 @@ func TestTypedControlIntegration(t *testing.T) {
 	if err != nil || restartedVersion != apVersion {
 		t.Fatal("restarted Apply changed the desired version")
 	}
-	restartedSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, apReport, true), key)
+	if reply := typedExchange(t, reloaded, apID, key, apReport, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("unchanged restarted configuration was queued")
+	}
+	restartedSystem := assertTypedMetadata(t, typedPersistedReply(t, state, apID), key)
 	assertSameTypedIdentity(t, firstSystem, restartedSystem)
 	if restartedSystem["users.1.password"] != storedHash {
 		t.Fatal("restart lost the persisted SSH hash")
@@ -371,7 +408,10 @@ func TestTypedControlIntegration(t *testing.T) {
 	if _, err := restarted.ApplyAP(ctx, apID, apConfig); err != nil {
 		t.Fatal(err)
 	}
-	uplinkSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, uplinkReport, true), key)
+	if reply := typedExchange(t, reloaded, apID, key, uplinkReport, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("unrelated uplink report queued unchanged policy")
+	}
+	uplinkSystem := assertTypedMetadata(t, typedPersistedReply(t, state, apID), key)
 	if uplinkSystem["sshd.1.ifname"] != "br0" {
 		t.Fatal("preserved AP SSH did not bind the management bridge")
 	}
@@ -380,14 +420,20 @@ func TestTypedControlIntegration(t *testing.T) {
 	if _, err := restarted.ApplyAP(ctx, apID, explicitSSH); err != nil {
 		t.Fatal(err)
 	}
-	explicitSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, apReport, true), key)
+	explicitReply := typedExchange(t, reloaded, apID, key, apReport, true)
+	explicitSystem := assertTypedMetadata(t, explicitReply, key)
+	apReport.ConfigVersion = explicitReply.ConfigVersion
+	typedExchange(t, reloaded, apID, key, apReport, true)
 	if explicitSystem["users.1.name"] != "explicit-user" || explicitSystem["users.1.password"] == storedHash || explicitSystem["users.1.password"] == secret || !strings.HasPrefix(explicitSystem["users.1.password"], "$6$") {
 		t.Fatal("stored SSH overrode explicit typed SSH")
 	}
 	if _, err := restarted.ApplyAP(ctx, apID, apConfig); err != nil {
 		t.Fatal(err)
 	}
-	omittedSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, apReport, true), key)
+	if reply := typedExchange(t, reloaded, apID, key, apReport, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("omitted SSH policy queued unchanged configuration")
+	}
+	omittedSystem := assertTypedMetadata(t, typedPersistedReply(t, state, apID), key)
 	if omittedSystem["users.1.name"] != "explicit-user" || omittedSystem["users.1.password"] != explicitSystem["users.1.password"] {
 		t.Fatal("omitted SSH restored obsolete adoption credentials")
 	}
@@ -408,7 +454,10 @@ func TestTypedControlIntegration(t *testing.T) {
 	if _, err := afterSSHClient.ApplyAP(ctx, apID, apConfig); err != nil {
 		t.Fatal(err)
 	}
-	afterSSHSystem := assertTypedMetadata(t, typedExchange(t, afterSSHRestart, apID, key, apReport, true), key)
+	if reply := typedExchange(t, afterSSHRestart, apID, key, apReport, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("unchanged SSH policy queued after restart")
+	}
+	afterSSHSystem := assertTypedMetadata(t, typedPersistedReply(t, state, apID), key)
 	if afterSSHSystem["users.1.password"] != explicitSystem["users.1.password"] || afterSSHSystem["users.1.name"] != "explicit-user" {
 		t.Fatal("restart restored obsolete SSH credentials")
 	}
@@ -440,8 +489,11 @@ func TestTypedControlIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal("unrelated legacy credential metadata overrode the baseline")
 	}
-	if reply := typedExchange(t, badController, apID, key, apReport, true); reply.Type != controller.ReplySetparam || strings.Contains(reply.SystemConfig, "injected=value") {
+	if reply := typedExchange(t, badController, apID, key, apReport, true); reply.Type != controller.ReplyNoop {
 		t.Fatal("legacy credential metadata changed baseline policy")
+	}
+	if strings.Contains(typedPersistedReply(t, badState, apID).SystemConfig, "injected=value") {
+		t.Fatal("legacy credential metadata changed persisted policy")
 	}
 	const pendingID network.DeviceID = "02:00:00:00:00:13"
 	if err := reloaded.Adopt(string(pendingID), controller.Reply{Type: controller.ReplySetparam, ManagementConfig: "cfgversion=adopt\n", SystemConfig: "users.status=enabled\n"}, false); err != nil {

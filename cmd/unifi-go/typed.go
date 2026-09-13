@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"goodkind.io/unifi-go/internal/controller"
 	"goodkind.io/unifi-go/network"
@@ -46,11 +47,19 @@ func runTyped(ctx context.Context, args []string, output io.Writer) error {
 	socket := flags.String("socket", "/tmp/unifi-go.sock", "local control socket")
 	device := flags.String("device", "", "device identifier")
 	file := flags.String("file", "", "typed configuration file")
+	dryRun := flags.Bool("dry-run", false, "preview typed configuration without applying it")
+	tokenFile := flags.String("preview-token-file", "", "opaque preview token file")
 	if err := flags.Parse(remaining); err != nil {
 		return errors.New("invalid command arguments")
 	}
 	if flags.NArg() != 0 {
 		return errors.New("unexpected command arguments")
+	}
+	if (*dryRun || *tokenFile != "") && operation != operationApply {
+		return errors.New("preview flags require typed apply")
+	}
+	if *dryRun && *tokenFile != "" {
+		return errors.New("dry-run cannot be combined with preview-token-file")
 	}
 	client := network.Dial(*socket)
 	if operation == "devices" {
@@ -69,7 +78,7 @@ func runTyped(ctx context.Context, args []string, output io.Writer) error {
 		return runTransportTyped(ctx, client, id, operation, *file)
 	}
 	if operation == "apply" {
-		return applyTyped(ctx, client, id, family, *file, output)
+		return applyTyped(ctx, client, id, family, *file, *dryRun, *tokenFile, output)
 	}
 	snapshot, err := client.Device(ctx, id)
 	if err != nil {
@@ -201,21 +210,44 @@ func decodeConfigFile[T network.APConfig | network.SwitchConfig | network.Comman
 	return nil
 }
 
-func applyTyped(ctx context.Context, client *network.Client, id network.DeviceID, family, path string, output io.Writer) error {
+func applyTyped(ctx context.Context, client *network.Client, id network.DeviceID, family, path string, dryRun bool, tokenFile string, output io.Writer) error {
+	if dryRun {
+		return previewTyped(ctx, client, id, family, path, output)
+	}
 	var version network.ConfigVersion
 	var err error
-	if family == "ap" {
+	var token network.PreviewToken
+	if tokenFile != "" {
+		data, readErr := os.ReadFile(filepath.Clean(tokenFile))
+		if readErr != nil {
+			return errors.New("cannot read preview token file")
+		}
+		token = network.PreviewToken(strings.TrimSpace(string(data)))
+		if token == "" {
+			return &network.ControlError{Code: network.PreviewStale}
+		}
+	}
+	switch family {
+	case "ap":
 		var config network.APConfig
 		if err := decodeConfigFile(path, &config); err != nil {
 			return err
 		}
-		version, err = client.ApplyAP(ctx, id, config)
-	} else {
+		if token != "" {
+			version, err = client.ApplyAPPreview(ctx, id, config, token)
+		} else {
+			version, err = client.ApplyAP(ctx, id, config)
+		}
+	default:
 		var config network.SwitchConfig
 		if err := decodeConfigFile(path, &config); err != nil {
 			return err
 		}
-		version, err = client.ApplySwitch(ctx, id, config)
+		if token != "" {
+			version, err = client.ApplySwitchPreview(ctx, id, config, token)
+		} else {
+			version, err = client.ApplySwitch(ctx, id, config)
+		}
 	}
 	if err != nil {
 		slog.Error("apply configuration failed", "err", err)
@@ -224,11 +256,34 @@ func applyTyped(ctx context.Context, client *network.Client, id network.DeviceID
 	return encodeTyped(output, queuedVersion{Version: version})
 }
 
+func previewTyped(ctx context.Context, client *network.Client, id network.DeviceID, family, path string, output io.Writer) error {
+	var preview network.ConfigPreview
+	var err error
+	if family == "ap" {
+		var config network.APConfig
+		if err := decodeConfigFile(path, &config); err != nil {
+			return err
+		}
+		preview, err = client.PreviewAP(ctx, id, config)
+	} else {
+		var config network.SwitchConfig
+		if err := decodeConfigFile(path, &config); err != nil {
+			return err
+		}
+		preview, err = client.PreviewSwitch(ctx, id, config)
+	}
+	if err != nil {
+		slog.Error("preview configuration failed", "err", err)
+		return fmt.Errorf("preview configuration: %w", err)
+	}
+	return encodeTyped(output, preview)
+}
+
 type queuedVersion struct {
 	Version network.ConfigVersion `json:"version"`
 }
 
-func encodeTyped[T network.DeviceSnapshot | []network.DeviceSnapshot | []network.ClientSnapshot | []network.PortSnapshot | queuedVersion](output io.Writer, value T) error {
+func encodeTyped[T network.DeviceSnapshot | []network.DeviceSnapshot | []network.ClientSnapshot | []network.PortSnapshot | network.ConfigPreview | queuedVersion](output io.Writer, value T) error {
 	if err := json.NewEncoder(output).Encode(value); err != nil {
 		return errors.New("cannot write response")
 	}

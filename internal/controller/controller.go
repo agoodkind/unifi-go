@@ -85,6 +85,8 @@ type Controller struct {
 	advertise string
 	devices   map[string]Device
 	queues    map[string][]Reply
+	awaiting  map[string]network.ConfigVersion
+	previews  map[network.PreviewToken]previewRecord
 	status    map[string]Status
 }
 
@@ -94,7 +96,7 @@ func Open(stateFile, advertise string, registries ...profile.Registry) (*Control
 	if err != nil || u.Scheme != "http" || u.Host == "" || u.Path != "/inform" || u.User != nil {
 		return nil, errors.New("advertise must be an HTTP URL ending in /inform")
 	}
-	c := &Controller{mu: sync.Mutex{}, stateFile: stateFile, advertise: advertise, devices: make(map[string]Device), queues: make(map[string][]Reply), status: make(map[string]Status), reports: make(map[string]informmodel.Report), registry: profile.Registry{}}
+	c := &Controller{mu: sync.Mutex{}, stateFile: stateFile, advertise: advertise, devices: make(map[string]Device), queues: make(map[string][]Reply), status: make(map[string]Status), reports: make(map[string]informmodel.Report), registry: profile.Registry{}, awaiting: make(map[string]network.ConfigVersion), previews: make(map[network.PreviewToken]previewRecord)}
 	if len(registries) > 0 {
 		c.registry = registries[0]
 	}
@@ -401,6 +403,9 @@ func (c *Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "invalid device report", http.StatusBadRequest)
 		return
+	}
+	if version := c.awaiting[mac]; version != "" && string(version) == report.ConfigVersion {
+		delete(c.awaiting, mac)
 	}
 	reply := Reply{Type: ReplyNoop, Command: "", Key: "", URI: "", Interval: 10, ConfigVersion: "", ManagementConfig: "", SystemConfig: "", BlockedStations: "", ServerTime: 0, Parameters: nil}
 	consumeCommand := false

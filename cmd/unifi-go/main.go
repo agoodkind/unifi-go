@@ -57,7 +57,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if args[0] == "serve" {
 		return serve(ctx, *listen, *advertise, *state, *socket, output)
 	}
-	request := controller.ControlRequest{Operation: controller.Operation(args[0]), MAC: *mac, KeyFile: *keyFile, Command: nil, Device: "", AP: nil, Switch: nil, Config: nil, TypedCommand: nil, Baseline: nil, SetupSSH: *setupSSH}
+	request := controller.ControlRequest{Operation: controller.Operation(args[0]), MAC: *mac, KeyFile: *keyFile, Command: nil, Device: "", AP: nil, Switch: nil, Config: nil, TypedCommand: nil, Baseline: nil, SetupSSH: *setupSSH, PreviewToken: ""}
 	if args[0] == "send" || args[0] == "adopt" {
 		data, err := os.ReadFile(filepath.Clean(*commandFile))
 		if err != nil {
