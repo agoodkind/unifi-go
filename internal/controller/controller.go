@@ -123,9 +123,10 @@ func Open(stateFile, advertise string, registries ...profile.Registry) (*Control
 		}
 		if device.Baseline == nil && device.LastSetParam != nil {
 			baseline, baselineErr := baselineFromLegacy(device)
-			if baselineErr == nil {
-				device.Baseline = baseline
+			if baselineErr != nil {
+				return nil, fault("derive baseline from legacy state", baselineErr)
 			}
+			device.Baseline = baseline
 		}
 		mac, err := normalizeMAC(device.MAC)
 		if err != nil {

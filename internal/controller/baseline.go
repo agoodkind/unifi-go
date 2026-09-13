@@ -47,13 +47,17 @@ func (c *Controller) importBaseline(id network.DeviceID, imported *network.Basel
 	if device.Descriptor == nil {
 		return &network.ControlError{Code: network.NoReport}
 	}
-	input := profile.CompilationInput{Baseline: profile.SetParam{Version: imported.Config.Version, Management: management, System: system}, AP: imported.AP, Switch: imported.Switch, Bindings: nil}
-	compilation, err := c.validateBaselineProjection(*device.Descriptor, input)
-	if err != nil {
-		return err
+	typedReady := imported.AP != nil || imported.Switch != nil
+	var compilation profile.Compilation
+	if typedReady {
+		input := profile.CompilationInput{Baseline: profile.SetParam{Version: imported.Config.Version, Management: management, System: system}, AP: imported.AP, Switch: imported.Switch, Bindings: nil}
+		compilation, err = c.validateBaselineProjection(*device.Descriptor, input)
+		if err != nil {
+			return err
+		}
 	}
 	previous := device
-	device.Baseline = &ConfigurationBaseline{SchemaVersion: baselineSchemaVersion, Config: imported.Config, TypedReady: true, Bindings: profile.CloneBindings(compilation.Bindings)}
+	device.Baseline = &ConfigurationBaseline{SchemaVersion: baselineSchemaVersion, Config: imported.Config, TypedReady: typedReady, Bindings: profile.CloneBindings(compilation.Bindings)}
 	device.DesiredAP, device.DesiredSwitch = compilation.AP, compilation.Switch
 	device.DesiredVersion = imported.Config.Version
 	c.devices[mac] = device
@@ -143,23 +147,14 @@ func baselineFromLegacy(device Device) (*ConfigurationBaseline, error) {
 		return nil, fmt.Errorf("last setparam is absent")
 	}
 	reply := device.LastSetParam
-	management, err := configmap.Parse(reply.ManagementConfig)
-	if err != nil {
-		return nil, fmt.Errorf("management baseline is not parseable")
+	baseline := baselineFromRawReply(*reply)
+	management, managementOK := parseLegacyConfig(reply.ManagementConfig)
+	if !managementOK {
+		return baseline, nil
 	}
-	system, err := configmap.Parse(reply.SystemConfig)
-	if err != nil {
-		return nil, fmt.Errorf("system baseline is not parseable")
-	}
-	baseline := &ConfigurationBaseline{
-		SchemaVersion: baselineSchemaVersion,
-		Config: network.Config{
-			Version:    network.ConfigVersion(reply.ConfigVersion),
-			Management: reply.ManagementConfig,
-			System:     reply.SystemConfig,
-		},
-		TypedReady: false,
-		Bindings:   nil,
+	system, systemOK := parseLegacyConfig(reply.SystemConfig)
+	if !systemOK {
+		return baseline, nil
 	}
 	complete := reply.ManagementConfig != "" && reply.SystemConfig != ""
 	versionsMatch := device.DesiredVersion != "" && string(device.DesiredVersion) == reply.ConfigVersion
@@ -173,6 +168,14 @@ func baselineFromLegacy(device Device) (*ConfigurationBaseline, error) {
 	baseline.TypedReady = true
 	baseline.Bindings = bindings
 	return baseline, nil
+}
+
+func parseLegacyConfig(raw string) (configmap.Values, bool) {
+	values, err := configmap.Parse(raw)
+	if err != nil {
+		return nil, false
+	}
+	return values, true
 }
 
 func baselineBindings(device Device, management, system configmap.Values) ([]profile.ResourceBinding, bool) {

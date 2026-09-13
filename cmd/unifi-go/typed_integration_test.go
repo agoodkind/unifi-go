@@ -303,15 +303,20 @@ func TestTypedControlIntegration(t *testing.T) {
 			id = switchID
 			writeTypedJSON(t, configFile, swConfig)
 		}
-		output.Reset()
-		if err := run(ctx, []string{"apply", family, "--device", string(id), "--file", configFile, "--socket", socket}, &output); err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(output.String(), secret) || strings.Contains(output.String(), secretPath) {
-			t.Fatal("apply output exposed credentials")
+		previewConfigFile := filepath.Join(directory, family+"-preview.json")
+		if family == "ap" {
+			previewConfig := apConfig
+			previewConfig.Networks.Value = append([]network.WiFiNetwork(nil), apConfig.Networks.Value...)
+			previewConfig.Networks.Value[0].BSSTransition = network.Supplied(network.BSSTransitionDisabled)
+			writeTypedJSON(t, previewConfigFile, previewConfig)
+		} else {
+			previewConfig := swConfig
+			previewConfig.Ports.Value = append([]network.SwitchPortConfig(nil), swConfig.Ports.Value...)
+			previewConfig.Ports.Value[0].Enabled = network.Supplied(true)
+			writeTypedJSON(t, previewConfigFile, previewConfig)
 		}
 		beforePreview := previewStateBytes(t, state)
-		previewOutput, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", configFile, "--socket", socket, "--dry-run").CombinedOutput()
+		previewOutput, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", previewConfigFile, "--socket", socket, "--dry-run").CombinedOutput()
 		if err != nil {
 			t.Fatal("fresh executable preview failed")
 		}
@@ -331,14 +336,60 @@ func TestTypedControlIntegration(t *testing.T) {
 		}
 		tokenFile := filepath.Join(directory, family+".token")
 		writeTypedFixture(t, tokenFile, []byte(string(preview.Token)+"\n"))
-		tokenApplyOutput, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", configFile, "--socket", socket, "--preview-token-file", tokenFile).CombinedOutput()
+		beforeTokenApply := previewStateBytes(t, state)
+		tokenApplyOutput, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", previewConfigFile, "--socket", socket, "--preview-token-file", tokenFile).CombinedOutput()
 		if err != nil {
 			t.Fatal("fresh executable token application failed")
+		}
+		if bytes.Equal(beforeTokenApply, previewStateBytes(t, state)) {
+			t.Fatal("token application did not persist a state change")
 		}
 		for _, forbidden := range []string{secret, secretPath, key, storedHash, storedPlaintext, "desired_ap", "ssh_password"} {
 			if strings.Contains(string(tokenApplyOutput), forbidden) {
 				t.Fatal("token application output exposed credentials")
 			}
+		}
+		var previewVersion struct {
+			Version network.ConfigVersion `json:"version"`
+		}
+		if err := json.Unmarshal(tokenApplyOutput, &previewVersion); err != nil || previewVersion.Version == "" {
+			t.Fatal("token application did not return a version")
+		}
+		if family == "ap" {
+			apReport.ConfigVersion = string(previewVersion.Version)
+			reply := typedExchange(t, c, apID, key, apReport, false)
+			if reply.ConfigVersion != string(previewVersion.Version) {
+				t.Fatal("preview token configuration was not delivered")
+			}
+			restoredVersion, err := client.ApplyAP(ctx, apID, apConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			apReport.ConfigVersion = string(restoredVersion)
+			if reply := typedExchange(t, c, apID, key, apReport, false); reply.ConfigVersion != string(restoredVersion) {
+				t.Fatal("original AP configuration was not restored")
+			}
+		} else {
+			swReport.ConfigVersion = string(previewVersion.Version)
+			reply := typedExchange(t, c, switchID, key, swReport, true)
+			if reply.ConfigVersion != string(previewVersion.Version) {
+				t.Fatal("preview token configuration was not delivered")
+			}
+			restoredVersion, err := client.ApplySwitch(ctx, switchID, swConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			swReport.ConfigVersion = string(restoredVersion)
+			if reply := typedExchange(t, c, switchID, key, swReport, true); reply.ConfigVersion != string(restoredVersion) {
+				t.Fatal("original switch configuration was not restored")
+			}
+		}
+		output.Reset()
+		if err := run(ctx, []string{"apply", family, "--device", string(id), "--file", configFile, "--socket", socket}, &output); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(output.String(), secret) || strings.Contains(output.String(), secretPath) {
+			t.Fatal("apply output exposed credentials")
 		}
 		if _, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", configFile, "--socket", socket, "--dry-run", "--preview-token-file", tokenFile).CombinedOutput(); err == nil {
 			t.Fatal("fresh executable accepted conflicting preview flags")
