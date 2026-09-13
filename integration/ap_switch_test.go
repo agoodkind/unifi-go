@@ -1067,10 +1067,11 @@ func (r *liveRun) restart(models []liveModel, ids, emulators []string) {
 	r.writeJSON("restart-pending-radio.json", network.RadioConfig{ID: network.RadioID(pendingRadioID), Channel: network.Supplied(uint16(44))})
 	pendingVersion := decodeLiveQueuedVersion(r.t, r.cli("radio", "set", "--device="+apID, "--file=/state/restart-pending-radio.json"))
 	r.oracleSetRadio(apID, pendingRadioID, 44)
-	pendingStatus := r.status(apID)
-	if pendingStatus.Pending != 1 || pendingStatus.DesiredConfigVersion != pendingVersion || pendingStatus.ReportedConfigVersion != reportedBeforeRestart {
-		r.t.Fatal("typed configuration was not pending before restart")
-	}
+	var pendingStatus controller.Status
+	r.until("typed configuration pending before restart", func() bool {
+		pendingStatus = r.status(apID)
+		return pendingStatus.Pending == 1 && pendingStatus.DesiredConfigVersion == pendingVersion && pendingStatus.ReportedConfigVersion == reportedBeforeRestart
+	})
 	r.writeJSON("restart-pending-status.json", pendingStatus)
 	before, err := os.ReadFile(filepath.Join(r.dir, "devices.json"))
 	if err != nil {
