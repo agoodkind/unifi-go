@@ -67,16 +67,12 @@ func DescribeWithFamily(report informmodel.Report, familyHint network.DeviceFami
 	if report.Uplink != nil {
 		descriptor.UplinkInterface = report.Uplink.Interface
 	}
+	radioIDs := StableRadioIDs(report.RadioTable)
+	radioCodeCounts := radioCodeCounts(report.RadioTable)
 	for radioIndex, radio := range report.RadioTable {
-		identifier := radio.Radio
-		if identifier == "" {
-			identifier = radio.Name
-		}
-		if identifier == "" {
-			identifier = fmt.Sprintf("radio-%d", radioIndex)
-		}
 		capability := RadioCapability{
-			ID:          identifier,
+			ID:          radioIDs[radioIndex],
+			SyntheticID: radio.Name == "" && (radio.Radio == "" || radioCodeCounts[radio.Radio] != 1),
 			Interface:   radio.Name,
 			Band:        radioBand(radio.Radio),
 			Channels:    append([]uint16(nil), radio.Channels...),
@@ -116,6 +112,33 @@ func DescribeWithFamily(report informmodel.Report, familyHint network.DeviceFami
 		descriptor.Ports = append(descriptor.Ports, capability)
 	}
 	return descriptor, nil
+}
+
+// StableRadioIDs derives the strongest reported identity for each physical radio.
+func StableRadioIDs(radios []informmodel.Radio) []string {
+	bandCounts := radioCodeCounts(radios)
+	result := make([]string, len(radios))
+	for index, radio := range radios {
+		switch {
+		case radio.Name != "":
+			result[index] = radio.Name
+		case radio.Radio != "" && bandCounts[radio.Radio] == 1:
+			result[index] = radio.Radio
+		default:
+			result[index] = fmt.Sprintf("radio-%d", index)
+		}
+	}
+	return result
+}
+
+func radioCodeCounts(radios []informmodel.Radio) map[string]int {
+	result := make(map[string]int, len(radios))
+	for _, radio := range radios {
+		if radio.Radio != "" {
+			result[radio.Radio]++
+		}
+	}
+	return result
 }
 
 func reportedPorts(report informmodel.Report, family network.DeviceFamily) []informmodel.Port {

@@ -38,6 +38,14 @@ const (
 	ConfigurationPending ErrorCode = "configuration_pending"
 	// ConfigurationDrift indicates that the device report differs from the baseline.
 	ConfigurationDrift ErrorCode = "configuration_drift"
+	// DesiredStateMissing indicates that typed desired state is unavailable.
+	DesiredStateMissing ErrorCode = "desired_state_missing"
+	// ResourceNotFound indicates that the selected typed resource is absent.
+	ResourceNotFound ErrorCode = "resource_not_found"
+	// ResourceExists indicates that a typed resource already uses the requested identity.
+	ResourceExists ErrorCode = "resource_exists"
+	// AmbiguousDevice indicates that device auto-selection was not unique.
+	AmbiguousDevice ErrorCode = "ambiguous_device"
 	// PreviewStale indicates that a preview no longer matches current inputs.
 	PreviewStale ErrorCode = "preview_stale"
 	// RequestFailed indicates an otherwise unclassified failure.
@@ -50,13 +58,13 @@ type ControlError struct {
 	Field string    `json:"field,omitempty"`
 }
 
-var safeField = regexp.MustCompile(`^(country_code|networks|radios|ports|ssh(\.(username|password))?|radios\[[0-9]{1,6}\](\.(band|enabled|channel|width_mhz|power(\.(mode|dbm))?))?|networks\[[0-9]{1,6}\](\.(name|enabled|vlan|bands(\[[0-9]{1,6}\])?|bss_transition|security(\.(mode|psk))?))?|ports\[[0-9]{1,6}\](\.(index|enabled|native_vlan|tagged_vlans(\[[0-9]{1,6}\])?|poe))?)$`)
+var safeField = regexp.MustCompile(`^(country_code|networks|radios|ports|ssh(\.(username|password))?|radios\[[0-9]{1,6}\](\.(id|band|enabled|channel|width_mhz|power(\.(mode|dbm))?))?|networks\[[0-9]{1,6}\](\.(name|enabled|vlan|bands(\[[0-9]{1,6}\])?|radio_ids(\[[0-9]{1,6}\])?|bss_transition|security(\.(mode|psk))?))?|ports\[[0-9]{1,6}\](\.(index|enabled|native_vlan|tagged_vlans(\[[0-9]{1,6}\])?|poe))?)$`)
 
 // Error renders the safe category and field without underlying values.
 func (failure *ControlError) Error() string {
 	code := failure.Code
 	switch code {
-	case InvalidDevice, NotRegistered, NoReport, FamilyMismatch, AdoptionPending, InvalidConfig, InvalidEncoding, FileReadFailed, PersistenceFailed, EncodingFailed, ObservationUnavailable, BaselineRequired, BaselineUnusable, PolicyRequired, ConfigurationPending, ConfigurationDrift, PreviewStale, RequestFailed:
+	case InvalidDevice, NotRegistered, NoReport, FamilyMismatch, AdoptionPending, InvalidConfig, InvalidEncoding, FileReadFailed, PersistenceFailed, EncodingFailed, ObservationUnavailable, BaselineRequired, BaselineUnusable, PolicyRequired, ConfigurationPending, ConfigurationDrift, DesiredStateMissing, ResourceNotFound, ResourceExists, AmbiguousDevice, PreviewStale, RequestFailed:
 	default:
 		code = RequestFailed
 	}

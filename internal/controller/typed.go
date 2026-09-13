@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"sort"
 	"strings"
@@ -139,7 +140,7 @@ func (c *Controller) commitCompiledLocked(device Device, compilation profile.Com
 	if err != nil {
 		return "", err
 	}
-	previous := device
+	previous := c.devices[device.MAC]
 	ap := compilation.AP
 	username, passwordHash := param.System["users.1.name"], param.System["users.1.password"]
 	if hasSSHPassword(compilation.AP, compilation.Switch) && username != "" && strings.HasPrefix(passwordHash, "$6$") {
@@ -283,7 +284,7 @@ func typedCompilationInput(device Device) (profile.CompilationInput, error) {
 	if err != nil {
 		return profile.CompilationInput{}, &network.ControlError{Code: network.BaselineUnusable}
 	}
-	input := profile.CompilationInput{Baseline: profile.SetParam{Version: device.Baseline.Config.Version, Management: baselineManagement, System: baselineSystem}, AP: nil, Switch: nil, Bindings: profile.CloneBindings(device.Baseline.Bindings)}
+	input := profile.CompilationInput{Baseline: profile.SetParam{Version: device.Baseline.Config.Version, Management: baselineManagement, System: baselineSystem}, AP: nil, Switch: nil, Bindings: profile.CloneBindings(device.Baseline.Bindings), WiFiCopies: cloneWiFiCopies(device.wifiCopies)}
 	if device.DesiredAP != nil {
 		cloned := profile.MergeAP(device.DesiredAP, network.APConfig{})
 		input.AP = &cloned
@@ -294,6 +295,10 @@ func typedCompilationInput(device Device) (profile.CompilationInput, error) {
 	}
 
 	return input, nil
+}
+
+func cloneWiFiCopies(copies map[string]string) map[string]string {
+	return maps.Clone(copies)
 }
 
 func (c *Controller) typedReply(param *profile.SetParam, device Device) (Reply, error) {

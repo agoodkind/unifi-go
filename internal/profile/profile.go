@@ -37,6 +37,7 @@ type ProtocolCapabilities struct {
 // RadioCapability describes one physical radio's explicit capabilities.
 type RadioCapability struct {
 	ID          string                    `json:"id"`
+	SyntheticID bool                      `json:"synthetic_id,omitempty"`
 	Interface   string                    `json:"interface"`
 	Band        network.RadioBand         `json:"band"`
 	Channels    []uint16                  `json:"channels"`

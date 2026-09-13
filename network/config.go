@@ -3,6 +3,7 @@ package network
 
 import (
 	"fmt"
+	"slices"
 	"unicode/utf8"
 )
 
@@ -19,6 +20,8 @@ type (
 	SecretFile string
 	// RadioBand identifies a WiFi frequency band.
 	RadioBand string
+	// RadioID identifies one physical WiFi radio.
+	RadioID string
 	// WiFiSecurityMode identifies a WiFi authentication mode.
 	WiFiSecurityMode string
 	// BSSTransitionMode identifies whether an SSID advertises BSS Transition.
@@ -78,6 +81,7 @@ type WiFiNetwork struct {
 	Enabled       Optional[bool]              `json:"enabled,omitzero"`
 	VLAN          Optional[VLANID]            `json:"vlan,omitzero"`
 	Bands         Optional[[]RadioBand]       `json:"bands,omitzero"`
+	RadioIDs      Optional[[]RadioID]         `json:"radio_ids,omitzero"`
 	BSSTransition Optional[BSSTransitionMode] `json:"bss_transition,omitzero"`
 	Security      Optional[WiFiSecurity]      `json:"security,omitzero"`
 }
@@ -90,6 +94,7 @@ type PowerConfig struct {
 
 // RadioConfig configures one access point radio.
 type RadioConfig struct {
+	ID       RadioID                   `json:"id,omitempty"`
 	Band     RadioBand                 `json:"band"`
 	Enabled  Optional[bool]            `json:"enabled,omitzero"`
 	Channel  Optional[uint16]          `json:"channel,omitzero"`
@@ -126,6 +131,18 @@ type APConfig struct {
 	SSH         Optional[SSHConfig]     `json:"ssh,omitzero"`
 }
 
+// Clone returns an independent copy of the access point configuration.
+func (config APConfig) Clone() APConfig {
+	result := config
+	result.Networks.Value = slices.Clone(config.Networks.Value)
+	for index := range result.Networks.Value {
+		result.Networks.Value[index].Bands.Value = slices.Clone(config.Networks.Value[index].Bands.Value)
+		result.Networks.Value[index].RadioIDs.Value = slices.Clone(config.Networks.Value[index].RadioIDs.Value)
+	}
+	result.Radios.Value = slices.Clone(config.Radios.Value)
+	return result
+}
+
 // SwitchPortConfig configures one switch port.
 type SwitchPortConfig struct {
 	Index       uint16             `json:"index"`
@@ -141,6 +158,16 @@ type SwitchConfig struct {
 	SSH   Optional[SSHConfig]          `json:"ssh,omitzero"`
 }
 
+// Clone returns an independent copy of the switch configuration.
+func (config SwitchConfig) Clone() SwitchConfig {
+	result := config
+	result.Ports.Value = slices.Clone(config.Ports.Value)
+	for index := range result.Ports.Value {
+		result.Ports.Value[index].TaggedVLANs.Value = slices.Clone(config.Ports.Value[index].TaggedVLANs.Value)
+	}
+	return result
+}
+
 // Validate rejects invalid access point configuration.
 func (config APConfig) Validate() error {
 	if config.CountryCode.Null {
@@ -151,13 +178,18 @@ func (config APConfig) Validate() error {
 	}
 
 	configuredBands := make(map[RadioBand]struct{})
+	configuredRadioIDs := make(map[RadioID]struct{})
 	if config.Radios.Null {
 		return fmt.Errorf("radios: null is not supported")
 	}
 	if config.Radios.Present {
 		configuredBands = make(map[RadioBand]struct{}, len(config.Radios.Value))
+		bandCounts := make(map[RadioBand]int, len(config.Radios.Value))
+		for _, radio := range config.Radios.Value {
+			bandCounts[radio.Band]++
+		}
 		for radioIndex, radio := range config.Radios.Value {
-			if err := validateRadio(radio, radioIndex, configuredBands); err != nil {
+			if err := validateRadio(radio, radioIndex, bandCounts, configuredBands, configuredRadioIDs); err != nil {
 				return err
 			}
 		}
@@ -169,7 +201,7 @@ func (config APConfig) Validate() error {
 	if config.Networks.Present {
 		networkNames := make(map[string]struct{}, len(config.Networks.Value))
 		for networkIndex, wifi := range config.Networks.Value {
-			if err := validateNetwork(wifi, networkIndex, networkNames, configuredBands, config.Radios.Present); err != nil {
+			if err := validateNetwork(wifi, networkIndex, networkNames, configuredBands, configuredRadioIDs, config.Radios.Present); err != nil {
 				return err
 			}
 		}
@@ -230,13 +262,19 @@ func (config SwitchConfig) Validate() error {
 	return nil
 }
 
-func validateRadio(radio RadioConfig, index int, configuredBands map[RadioBand]struct{}) error {
+func validateRadio(radio RadioConfig, index int, bandCounts map[RadioBand]int, configuredBands map[RadioBand]struct{}, configuredRadioIDs map[RadioID]struct{}) error {
 	path := fmt.Sprintf("radios[%d]", index)
 	if !validRadioBand(radio.Band) {
 		return fmt.Errorf("%s.band: unknown value %q", path, radio.Band)
 	}
-	if _, exists := configuredBands[radio.Band]; exists {
-		return fmt.Errorf("%s.band: duplicate value %q", path, radio.Band)
+	if bandCounts[radio.Band] > 1 && radio.ID == "" {
+		return fmt.Errorf("%s.id: required when band %q has multiple radios", path, radio.Band)
+	}
+	if radio.ID != "" {
+		if _, exists := configuredRadioIDs[radio.ID]; exists {
+			return fmt.Errorf("%s.id: duplicate value", path)
+		}
+		configuredRadioIDs[radio.ID] = struct{}{}
 	}
 	configuredBands[radio.Band] = struct{}{}
 	if radio.Enabled.Null || radio.WidthMHz.Null || radio.Power.Null {
@@ -269,9 +307,29 @@ func validateNetwork(
 	index int,
 	names map[string]struct{},
 	configuredBands map[RadioBand]struct{},
+	configuredRadioIDs map[RadioID]struct{},
 	checkConfiguredBands bool,
 ) error {
 	path := fmt.Sprintf("networks[%d]", index)
+	if err := validateNetworkIdentity(network, path, names); err != nil {
+		return err
+	}
+	if network.Enabled.Null || network.Bands.Null || network.RadioIDs.Null || network.BSSTransition.Null || network.Security.Null {
+		return fmt.Errorf("%s: null is not supported", path)
+	}
+	if network.VLAN.Present && !network.VLAN.Null && !validVLAN(network.VLAN.Value) {
+		return fmt.Errorf("%s.vlan: must be from 1 through 4094", path)
+	}
+	if err := validateNetworkSelectors(network, path, configuredBands, configuredRadioIDs, checkConfiguredBands); err != nil {
+		return err
+	}
+	if network.BSSTransition.Present && network.BSSTransition.Value != BSSTransitionEnabled && network.BSSTransition.Value != BSSTransitionDisabled {
+		return fmt.Errorf("%s.bss_transition: unknown value %q", path, network.BSSTransition.Value)
+	}
+	return validateWiFiSecurity(network.Security, path)
+}
+
+func validateNetworkIdentity(network WiFiNetwork, path string, names map[string]struct{}) error {
 	nameLength := len([]byte(network.Name))
 	if nameLength < 1 || nameLength > 32 {
 		return fmt.Errorf("%s.name: byte length must be from 1 through 32", path)
@@ -280,20 +338,28 @@ func validateNetwork(
 		return fmt.Errorf("%s.name: duplicate value %q", path, network.Name)
 	}
 	names[network.Name] = struct{}{}
-	if network.Enabled.Null || network.Bands.Null || network.BSSTransition.Null || network.Security.Null {
-		return fmt.Errorf("%s: null is not supported", path)
-	}
-	if network.VLAN.Present && !network.VLAN.Null && !validVLAN(network.VLAN.Value) {
-		return fmt.Errorf("%s.vlan: must be from 1 through 4094", path)
+	return nil
+}
+
+func validateNetworkSelectors(network WiFiNetwork, path string, configuredBands map[RadioBand]struct{}, configuredRadioIDs map[RadioID]struct{}, checkConfigured bool) error {
+	if network.Bands.Present && network.RadioIDs.Present {
+		return fmt.Errorf("%s: bands and radio_ids are mutually exclusive", path)
 	}
 	if network.Enabled.Present && network.Enabled.Value && network.Bands.Present && len(network.Bands.Value) == 0 {
 		return fmt.Errorf("%s.bands: required for enabled network", path)
 	}
-	if network.BSSTransition.Present && network.BSSTransition.Value != BSSTransitionEnabled && network.BSSTransition.Value != BSSTransitionDisabled {
-		return fmt.Errorf("%s.bss_transition: unknown value %q", path, network.BSSTransition.Value)
+	if network.Enabled.Present && network.Enabled.Value && network.RadioIDs.Present && len(network.RadioIDs.Value) == 0 {
+		return fmt.Errorf("%s.radio_ids: required for enabled network", path)
 	}
-	seenBands := make(map[RadioBand]struct{}, len(network.Bands.Value))
-	for bandIndex, band := range network.Bands.Value {
+	if err := validateNetworkBands(network.Bands.Value, path, configuredBands, checkConfigured); err != nil {
+		return err
+	}
+	return validateNetworkRadioIDs(network.RadioIDs.Value, path, configuredRadioIDs, checkConfigured)
+}
+
+func validateNetworkBands(bands []RadioBand, path string, configuredBands map[RadioBand]struct{}, checkConfigured bool) error {
+	seenBands := make(map[RadioBand]struct{}, len(bands))
+	for bandIndex, band := range bands {
 		bandPath := fmt.Sprintf("%s.bands[%d]", path, bandIndex)
 		if !validRadioBand(band) {
 			return fmt.Errorf("%s: unknown value %q", bandPath, band)
@@ -302,14 +368,36 @@ func validateNetwork(
 			return fmt.Errorf("%s: duplicate value %q", bandPath, band)
 		}
 		seenBands[band] = struct{}{}
-		if _, exists := configuredBands[band]; checkConfiguredBands && !exists {
+		if _, exists := configuredBands[band]; checkConfigured && !exists {
 			return fmt.Errorf("%s: band %q has no radio configuration", bandPath, band)
 		}
 	}
-	if !network.Security.Present {
+	return nil
+}
+
+func validateNetworkRadioIDs(radioIDs []RadioID, path string, configuredRadioIDs map[RadioID]struct{}, checkConfigured bool) error {
+	seenRadioIDs := make(map[RadioID]struct{}, len(radioIDs))
+	for radioIndex, radioID := range radioIDs {
+		radioPath := fmt.Sprintf("%s.radio_ids[%d]", path, radioIndex)
+		if radioID == "" {
+			return fmt.Errorf("%s: must not be empty", radioPath)
+		}
+		if _, exists := seenRadioIDs[radioID]; exists {
+			return fmt.Errorf("%s: duplicate value", radioPath)
+		}
+		seenRadioIDs[radioID] = struct{}{}
+		if _, exists := configuredRadioIDs[radioID]; checkConfigured && !exists {
+			return fmt.Errorf("%s: no radio configuration", radioPath)
+		}
+	}
+	return nil
+}
+
+func validateWiFiSecurity(securityConfig Optional[WiFiSecurity], path string) error {
+	if !securityConfig.Present {
 		return nil
 	}
-	security := network.Security.Value
+	security := securityConfig.Value
 	if security.Mode.Null || security.PSK.Null {
 		return fmt.Errorf("%s.security: null is not supported", path)
 	}
@@ -388,13 +476,15 @@ func (config APConfig) ValidateComplete() error {
 		}{
 			{wifi.Enabled.Present, path + ".enabled"},
 			{wifi.VLAN.Present, path + ".vlan"},
-			{wifi.Bands.Present, path + ".bands"},
 			{wifi.BSSTransition.Present, path + ".bss_transition"},
 			{wifi.Security.Present, path + ".security"},
 		} {
 			if !field.present {
 				return requiredPolicy(field.path)
 			}
+		}
+		if err := validateCompleteNetworkSelector(wifi, path); err != nil {
+			return err
 		}
 		if !wifi.Security.Value.Mode.Present {
 			return requiredPolicy(path + ".security.mode")
@@ -404,6 +494,19 @@ func (config APConfig) ValidateComplete() error {
 		}
 	}
 	return validateCompleteSSH(config.SSH)
+}
+
+func validateCompleteNetworkSelector(wifi WiFiNetwork, path string) error {
+	if wifi.Bands.Present && len(wifi.Bands.Value) > 0 {
+		return nil
+	}
+	if wifi.RadioIDs.Present && len(wifi.RadioIDs.Value) > 0 {
+		return nil
+	}
+	if wifi.RadioIDs.Present {
+		return requiredPolicy(path + ".radio_ids")
+	}
+	return requiredPolicy(path + ".bands")
 }
 
 // ValidateComplete requires a complete typed switch projection.

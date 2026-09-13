@@ -45,6 +45,8 @@ type Device struct {
 	SSHPassword     string                    `json:"ssh_password,omitempty"`
 	SSHPasswordHash string                    `json:"ssh_password_hash,omitempty"`
 	NextKey         string                    `json:"next_key,omitempty"`
+	// wifiCopies carries explicit resource-copy sources for one compilation only.
+	wifiCopies map[string]string
 }
 
 // Status contains only non-secret operational fields.
@@ -251,7 +253,7 @@ func (c *Controller) Adopt(mac string, template Reply, setupSSH bool) error {
 		if _, err := rand.Read(keyBytes); err != nil {
 			return fault("generate inform key", err)
 		}
-		device = Device{MAC: mac, Key: inform.DefaultKey, LastSetParam: nil, SSHUsername: "", SSHPassword: "", SSHPasswordHash: "", NextKey: hex.EncodeToString(keyBytes), Family: "", Descriptor: nil, DesiredAP: nil, DesiredSwitch: nil, DesiredVersion: "", Baseline: nil}
+		device = Device{MAC: mac, Key: inform.DefaultKey, LastSetParam: nil, SSHUsername: "", SSHPassword: "", SSHPasswordHash: "", NextKey: hex.EncodeToString(keyBytes), Family: "", Descriptor: nil, DesiredAP: nil, DesiredSwitch: nil, DesiredVersion: "", Baseline: nil, wifiCopies: nil}
 	}
 	if setupSSH {
 		passwordBytes := make([]byte, 16)

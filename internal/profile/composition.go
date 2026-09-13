@@ -11,10 +11,11 @@ import (
 
 // CompilationInput supplies the full baseline and its prior typed projection.
 type CompilationInput struct {
-	Baseline SetParam
-	AP       *network.APConfig
-	Switch   *network.SwitchConfig
-	Bindings []ResourceBinding
+	Baseline   SetParam
+	AP         *network.APConfig
+	Switch     *network.SwitchConfig
+	Bindings   []ResourceBinding
+	WiFiCopies map[string]string
 }
 
 // Compilation contains the composed baseline and its independent typed projection.
@@ -132,7 +133,7 @@ func DeleteRecord(values configmap.Values, prefix string) {
 
 func overlay[T interface {
 	~bool | ~string | ~uint16 | ~int |
-		[]network.RadioBand | []network.VLANID | []network.WiFiNetwork | []network.RadioConfig | []network.SwitchPortConfig |
+		[]network.RadioBand | []network.RadioID | []network.VLANID | []network.WiFiNetwork | []network.RadioConfig | []network.SwitchPortConfig |
 		network.WiFiSecurity | network.PowerConfig | network.SSHConfig
 }](prior, supplied network.Optional[T]) network.Optional[T] {
 	if supplied.Present {
@@ -171,6 +172,7 @@ func MergeAP(prior *network.APConfig, request network.APConfig) network.APConfig
 			wifi = mergeWiFi(oldNetworks, wifi)
 		}
 		wifi.Bands.Value = slices.Clone(wifi.Bands.Value)
+		wifi.RadioIDs.Value = slices.Clone(wifi.RadioIDs.Value)
 		result.Networks.Value[index] = wifi
 	}
 	for index, radio := range result.Radios.Value {
@@ -217,7 +219,16 @@ func mergeWiFi(prior []network.WiFiNetwork, wifi network.WiFiNetwork) network.Wi
 		}
 		wifi.Enabled = overlay(old.Enabled, wifi.Enabled)
 		wifi.VLAN = overlay(old.VLAN, wifi.VLAN)
+		bandsSupplied := wifi.Bands.Present
+		radioIDsSupplied := wifi.RadioIDs.Present
 		wifi.Bands = overlay(old.Bands, wifi.Bands)
+		wifi.RadioIDs = overlay(old.RadioIDs, wifi.RadioIDs)
+		if bandsSupplied && !radioIDsSupplied {
+			wifi.RadioIDs = network.Optional[[]network.RadioID]{}
+		}
+		if radioIDsSupplied && !bandsSupplied {
+			wifi.Bands = network.Optional[[]network.RadioBand]{}
+		}
 		wifi.BSSTransition = overlay(old.BSSTransition, wifi.BSSTransition)
 		security := wifi.Security
 		wifi.Security = overlay(old.Security, security)
@@ -230,23 +241,35 @@ func mergeWiFi(prior []network.WiFiNetwork, wifi network.WiFiNetwork) network.Wi
 }
 
 func mergeRadio(prior []network.RadioConfig, radio network.RadioConfig) network.RadioConfig {
+	var matches []network.RadioConfig
 	for _, old := range prior {
-		if old.Band != radio.Band {
-			continue
+		if radio.ID != "" {
+			if old.ID == radio.ID {
+				matches = append(matches, old)
+			}
+		} else if old.Band == radio.Band {
+			matches = append(matches, old)
 		}
-		radio.Enabled = overlay(old.Enabled, radio.Enabled)
-		radio.Channel = overlay(old.Channel, radio.Channel)
-		radio.WidthMHz = overlay(old.WidthMHz, radio.WidthMHz)
-		power := radio.Power
-		radio.Power = overlay(old.Power, power)
-		if !power.Present {
-			continue
-		}
-		radio.Power.Value.Mode = overlay(old.Power.Value.Mode, power.Value.Mode)
-		radio.Power.Value.DBm = overlay(old.Power.Value.DBm, power.Value.DBm)
-		if power.Value.Mode.Present && power.Value.Mode.Value == network.PowerAuto {
-			radio.Power.Value.DBm = network.Optional[int]{}
-		}
+	}
+	if len(matches) != 1 {
+		return radio
+	}
+	old := matches[0]
+	if radio.ID == "" {
+		radio.ID = old.ID
+	}
+	radio.Enabled = overlay(old.Enabled, radio.Enabled)
+	radio.Channel = overlay(old.Channel, radio.Channel)
+	radio.WidthMHz = overlay(old.WidthMHz, radio.WidthMHz)
+	power := radio.Power
+	radio.Power = overlay(old.Power, power)
+	if !power.Present {
+		return radio
+	}
+	radio.Power.Value.Mode = overlay(old.Power.Value.Mode, power.Value.Mode)
+	radio.Power.Value.DBm = overlay(old.Power.Value.DBm, power.Value.DBm)
+	if power.Value.Mode.Present && power.Value.Mode.Value == network.PowerAuto {
+		radio.Power.Value.DBm = network.Optional[int]{}
 	}
 	return radio
 }
