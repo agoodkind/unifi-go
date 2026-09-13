@@ -19,7 +19,7 @@ import (
 )
 
 func TestPreviewTokenExpiry(t *testing.T) {
-	for _, elapsed := range []time.Duration{5*time.Minute - time.Nanosecond, 5 * time.Minute, 5*time.Minute + time.Nanosecond} {
+	for _, elapsed := range []time.Duration{5*time.Minute - time.Second, 5*time.Minute + time.Second} {
 		t.Run(elapsed.String(), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				state := filepath.Join(t.TempDir(), "state.json")

@@ -264,6 +264,10 @@ func TestTypedControlIntegration(t *testing.T) {
 	writeTypedJSON(t, invalidFile, invalid)
 	err = run(ctx, []string{"apply", "ap", "--device", string(apID), "--file", invalidFile, "--socket", socket}, &output)
 	assertControlFailure(t, err, network.InvalidConfig, "ssh.username")
+	newlineUsername := apConfig
+	newlineUsername.SSH = network.Supplied(network.SSHConfig{Username: network.Supplied("bad\nname")})
+	_, err = client.ApplyAP(ctx, apID, newlineUsername)
+	assertControlFailure(t, err, network.InvalidConfig, "ssh.username")
 	missing := apConfig
 	missing.Networks.Value = []network.WiFiNetwork{apConfig.Networks.Value[0]}
 	missing.Networks.Value[0].Security.Value.PSK = network.Supplied(network.SecretFile(filepath.Join(directory, "missing-secret")))

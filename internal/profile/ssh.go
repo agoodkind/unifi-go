@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/GehirnInc/crypt/sha512_crypt"
 	"goodkind.io/unifi-go/internal/configmap"
@@ -15,6 +16,9 @@ import (
 // WriteSSH changes only supplied credentials, preserving service policy.
 func WriteSSH(values configmap.Values, ssh network.SSHConfig, secrets SecretReader) error {
 	if ssh.Username.Present {
+		if strings.ContainsAny(ssh.Username.Value, "\r\n") {
+			return &network.ControlError{Code: network.InvalidConfig, Field: "ssh.username"}
+		}
 		if err := values.Set("users.1.name", ssh.Username.Value); err != nil {
 			return &network.ControlError{Code: network.InvalidConfig, Field: "ssh.username"}
 		}
