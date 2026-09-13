@@ -1,0 +1,760 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jamesbraid/unifi-emu/inform"
+	"goodkind.io/unifi-go/internal/configmap"
+	"goodkind.io/unifi-go/internal/controller"
+	"goodkind.io/unifi-go/internal/informmodel"
+	"goodkind.io/unifi-go/internal/profile"
+	"goodkind.io/unifi-go/internal/profile/ap"
+	"goodkind.io/unifi-go/internal/profile/switches"
+	"goodkind.io/unifi-go/network"
+)
+
+func TestTypedControlIntegration(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	state := filepath.Join(directory, "state.json")
+	const key = "0123456789abcdef0123456789abcdef"
+	const apID network.DeviceID = "02:00:00:00:00:11"
+	const switchID network.DeviceID = "02:00:00:00:00:12"
+	const secret = "documentation-only-password"
+	const storedHash = "$6$synthetic$persisted-prehashed-marker"
+	const storedPlaintext = "unused-persisted-plaintext-marker"
+	secretPath := filepath.Join(directory, "credential")
+	writeTypedFixture(t, secretPath, []byte(secret))
+	// This is the legacy persisted shape, before typed fields existed.
+	legacy := []struct {
+		MAC             network.DeviceID `json:"mac"`
+		Key             string           `json:"key"`
+		SSHUsername     string           `json:"ssh_username,omitempty"`
+		SSHPassword     string           `json:"ssh_password,omitempty"`
+		SSHPasswordHash string           `json:"ssh_password_hash,omitempty"`
+	}{{MAC: apID, Key: key, SSHUsername: "preserved-user", SSHPassword: storedPlaintext, SSHPasswordHash: storedHash}, {MAC: switchID, Key: key, SSHUsername: "", SSHPassword: "", SSHPasswordHash: ""}}
+	writeTypedJSON(t, state, legacy)
+	c := openTypedController(t, state)
+	socket := startTypedSocket(t, c)
+	client := network.Dial(socket)
+	apConfig := network.APConfig{CountryCode: 840, Radios: []network.RadioConfig{{Band: network.Band2GHz, Enabled: true, WidthMHz: network.Width20, Power: network.PowerConfig{Mode: network.PowerAuto}}}, Networks: []network.WiFiNetwork{{Name: "Documentation", Enabled: true, Bands: []network.RadioBand{network.Band2GHz}, Security: network.WiFiSecurity{Mode: network.WPA2Personal, PSK: network.SecretFile(secretPath)}}}}
+	swConfig := network.SwitchConfig{Ports: []network.SwitchPortConfig{{Index: 1, Enabled: true, NativeVLAN: 20, TaggedVLANs: []network.VLANID{30}, PoE: network.PoEAuto}}}
+	_, err := client.ApplyAP(ctx, apID, apConfig)
+	assertControlFailure(t, err, network.NoReport, "")
+	up := true
+	poe := uint64(1)
+	apReport := informmodel.Report{Model: "DocumentationAP", Version: "1", RadioTable: []informmodel.Radio{{Name: "wifi0", Radio: "ng"}}, PortTable: []informmodel.Port{{Index: 1, Interface: "eth0"}}, VAPTable: []informmodel.VAP{{Name: "ath0", Radio: "ng", ESSID: "Documentation", Stations: []informmodel.Station{{MAC: "02:00:00:00:00:21", IP: "192.0.2.21"}}}}}
+	apReport.LastError = secret
+	apReport.RadioTable[0].Widths = []informmodel.Uint16Scalar{20}
+	swReport := informmodel.Report{Type: "usw", Model: "DocumentationSwitch", Version: "1", PortTable: []informmodel.Port{{Index: 1, Interface: "eth0", Up: &up, PoECaps: &poe}}}
+	swReport.SwitchCaps = &informmodel.SwitchCapabilities{VLANCaps: &poe}
+	typedExchange(t, c, apID, key, apReport, false)
+	typedExchange(t, c, switchID, key, swReport, true)
+	invalid := apConfig
+	invalid.Networks = []network.WiFiNetwork{apConfig.Networks[0]}
+	invalid.Networks[0].Bands = nil
+	_, err = client.ApplyAP(ctx, apID, invalid)
+	assertControlFailure(t, err, network.InvalidConfig, "networks[0].bands")
+	invalid = apConfig
+	power := 10
+	invalid.Radios = []network.RadioConfig{apConfig.Radios[0]}
+	invalid.Radios[0].Power.DBm = &power
+	if _, err := client.ApplyAP(ctx, apID, invalid); err == nil {
+		t.Fatal("automatic explicit power accepted")
+	}
+	invalid = apConfig
+	invalid.SSH = &network.SSHConfig{Password: network.SecretFile(secretPath)}
+	if _, err := client.ApplyAP(ctx, apID, invalid); err == nil {
+		t.Fatal("invalid SSH accepted")
+	}
+	apVersion, err := client.ApplyAP(ctx, apID, apConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	swVersion, err := client.ApplySwitch(ctx, switchID, swConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ApplyAP(ctx, switchID, apConfig)
+	assertControlFailure(t, err, network.FamilyMismatch, "")
+	if _, err := client.ApplySwitch(ctx, apID, swConfig); err == nil {
+		t.Fatal("switch applied to AP")
+	}
+	var firstSystem configmap.Values
+	for _, entry := range []struct {
+		id      network.DeviceID
+		report  informmodel.Report
+		version network.ConfigVersion
+		gcm     bool
+	}{{apID, apReport, apVersion, false}, {switchID, swReport, swVersion, true}} {
+		reply := typedExchange(t, c, entry.id, key, entry.report, entry.gcm)
+		if reply.Type != controller.ReplySetparam || reply.ConfigVersion != string(entry.version) {
+			t.Fatal("desired reply missing")
+		}
+		management, err := configmap.Parse(reply.ManagementConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if management["authkey"] != key || management["inform_url"] != "http://192.0.2.1:8080/inform" || management["cfgversion"] != string(entry.version) {
+			t.Fatal("management ownership missing")
+		}
+		system := assertTypedMetadata(t, reply, key)
+		if entry.id == apID {
+			firstSystem = system
+			if system["users.1.password"] != storedHash || system["users.1.name"] != "preserved-user" || system["sshd.1.ifname"] != "br0" || strings.Contains(reply.SystemConfig, storedPlaintext) {
+				t.Fatal("stored SSH access was not preserved")
+			}
+		} else {
+			for name := range system {
+				if strings.HasPrefix(name, "sshd.") || strings.HasPrefix(name, "users.") {
+					t.Fatal("typed apply generated SSH credentials")
+				}
+			}
+		}
+		if entry.id == apID && !strings.Contains(reply.SystemConfig, secret) {
+			t.Fatal("AP secret was not compiled")
+		}
+		if entry.id == switchID && !strings.Contains(reply.SystemConfig, "vlan.") {
+			t.Fatal("switch VLAN configuration missing")
+		}
+	}
+	snapshots, err := client.Devices(ctx)
+	if err != nil || len(snapshots) != 2 || snapshots[0].ID != apID {
+		t.Fatal("device list failed")
+	}
+	snapshot, err := client.Device(ctx, apID)
+	if err != nil || snapshot.AP == nil || snapshot.Switch != nil || snapshot.LastInform.IsZero() || len(snapshot.AP.Clients) != 1 {
+		t.Fatal("AP observation missing")
+	}
+	switchSnapshot, err := client.Device(ctx, switchID)
+	if err != nil || switchSnapshot.Switch == nil || switchSnapshot.AP != nil || switchSnapshot.Switch.Ports[0].NativeVLAN != nil {
+		t.Fatal("switch observation incorrectly echoes desired state")
+	}
+	if snapshot.LastError != "device reported an error" {
+		t.Fatal("typed error presence missing")
+	}
+	for _, status := range c.Status() {
+		if status.LastError == secret {
+			t.Fatal("legacy status retained raw error")
+		}
+	}
+	for _, arguments := range [][]string{{"status"}, {"devices"}, {"device", "--device", string(apID)}, {"clients", "--device", string(apID)}, {"ports", "--device", string(switchID)}} {
+		var output bytes.Buffer
+		if err := run(ctx, append(arguments, "--socket", socket), &output); err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{secret, secretPath, key, storedHash, storedPlaintext, "desired_ap", "ssh_password"} {
+			if strings.Contains(output.String(), forbidden) {
+				t.Fatal("CLI exposed secret material")
+			}
+		}
+	}
+	unknown := filepath.Join(directory, "unknown.json")
+	writeTypedFixture(t, unknown, []byte(`{"country_code":840,"unknown":"documentation-only-password"}`))
+	var output bytes.Buffer
+	if err := run(ctx, []string{"apply", "ap", "--device", string(apID), "--file", unknown, "--socket", socket}, &output); err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatal("unknown field was accepted or leaked")
+	}
+	invalidFile := filepath.Join(directory, "invalid.json")
+	writeTypedJSON(t, invalidFile, invalid)
+	err = run(ctx, []string{"apply", "ap", "--device", string(apID), "--file", invalidFile, "--socket", socket}, &output)
+	assertControlFailure(t, err, network.InvalidConfig, "ssh.username")
+	missing := apConfig
+	missing.Networks = []network.WiFiNetwork{apConfig.Networks[0]}
+	missing.Networks[0].Security.PSK = network.SecretFile(filepath.Join(directory, "missing-secret"))
+	_, err = client.ApplyAP(ctx, apID, missing)
+	assertControlFailure(t, err, network.FileReadFailed, "networks[0].security.psk")
+	oversized := filepath.Join(directory, "oversized.json")
+	writeTypedFixture(t, oversized, append(append([]byte("{}"), bytes.Repeat([]byte(" "), 8388608)...), []byte("{}")...))
+	if err := run(ctx, []string{"apply", "switch", "--device", string(switchID), "--file", oversized, "--socket", socket}, &output); err == nil || !strings.Contains(err.Error(), "exceeds 8 MiB") {
+		t.Fatal("oversized config accepted")
+	}
+	binaryPath := filepath.Join(directory, "unifi-go")
+	if output, err := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v: %s", err, output)
+	}
+	processOutput, processErr := exec.CommandContext(ctx, binaryPath, "apply", "ap", "--device", string(apID), "--file", invalidFile, "--socket", socket).CombinedOutput()
+	exitError, ok := errors.AsType[*exec.ExitError](processErr)
+	if !ok || exitError.ExitCode() != 1 || !bytes.Contains(processOutput, []byte("invalid_config: ssh.username")) {
+		t.Fatal("executable did not return actionable failure with exit 1")
+	}
+	if bytes.Contains(processOutput, []byte(secret)) || bytes.Contains(processOutput, []byte(secretPath)) {
+		t.Fatal("executable leaked credential")
+	}
+	for _, family := range []string{"ap", "switch"} {
+		configFile := filepath.Join(directory, family+".json")
+		id := apID
+		if family == "ap" {
+			writeTypedJSON(t, configFile, apConfig)
+		} else {
+			id = switchID
+			writeTypedJSON(t, configFile, swConfig)
+		}
+		output.Reset()
+		if err := run(ctx, []string{"apply", family, "--device", string(id), "--file", configFile, "--socket", socket}, &output); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(output.String(), secret) || strings.Contains(output.String(), secretPath) {
+			t.Fatal("apply output exposed credentials")
+		}
+	}
+	if _, err := client.ApplyAP(ctx, apID, apConfig); err != nil {
+		t.Fatal(err)
+	}
+	repeated := assertTypedMetadata(t, typedExchange(t, c, apID, key, apReport, false), key)
+	assertSameTypedIdentity(t, firstSystem, repeated)
+	if _, err := client.ApplySwitch(ctx, switchID, swConfig); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := openTypedController(t, state)
+	restarted := network.Dial(startTypedSocket(t, reloaded))
+	snapshot, err = restarted.Device(ctx, apID)
+	if err != nil || snapshot.AP == nil || !snapshot.LastInform.IsZero() || len(snapshot.AP.Clients) != 0 {
+		t.Fatal("observations survived restart")
+	}
+	persisted, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var records []controller.Device
+	if err := json.Unmarshal(persisted, &records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Key != key || records[0].DesiredAP == nil || records[0].DesiredVersion != apVersion || records[1].DesiredSwitch == nil || records[1].DesiredVersion != swVersion || records[0].LastSetParam == nil || records[0].LastSetParam.ConfigVersion != string(apVersion) || records[1].LastSetParam == nil || records[1].LastSetParam.ConfigVersion != string(swVersion) {
+		t.Fatal("desired state or keys did not survive")
+	}
+	permissions, err := os.Stat(state)
+	if err != nil || permissions.Mode().Perm() != 0o600 {
+		t.Fatal("state permissions incorrect")
+	}
+	for _, entry := range []struct {
+		id     network.DeviceID
+		report informmodel.Report
+	}{{apID, apReport}, {switchID, swReport}} {
+		if reply := typedExchange(t, reloaded, entry.id, key, entry.report, true); reply.Type != controller.ReplyNoop {
+			t.Fatal("pending command survived restart")
+		}
+	}
+	snapshot, err = restarted.Device(ctx, apID)
+	if err != nil || snapshot.LastInform.IsZero() || len(snapshot.AP.Clients) != 1 {
+		t.Fatal("fresh inform did not restore observations")
+	}
+	restartedVersion, err := restarted.ApplyAP(ctx, apID, apConfig)
+	if err != nil || restartedVersion != apVersion {
+		t.Fatal("restarted Apply changed the desired version")
+	}
+	restartedSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, apReport, true), key)
+	assertSameTypedIdentity(t, firstSystem, restartedSystem)
+	if restartedSystem["users.1.password"] != storedHash {
+		t.Fatal("restart lost the persisted SSH hash")
+	}
+	uplinkReport := apReport
+	uplinkReport.Uplink = &informmodel.UplinkValue{Uplink: informmodel.Uplink{Interface: "eth1"}, Interface: "eth1"}
+	typedExchange(t, reloaded, apID, key, uplinkReport, true)
+	if _, err := restarted.ApplyAP(ctx, apID, apConfig); err != nil {
+		t.Fatal(err)
+	}
+	uplinkSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, uplinkReport, true), key)
+	if uplinkSystem["sshd.1.ifname"] != "br0" {
+		t.Fatal("preserved AP SSH did not bind the management bridge")
+	}
+	explicitSSH := apConfig
+	explicitSSH.SSH = &network.SSHConfig{Username: "explicit-user", Password: network.SecretFile(secretPath)}
+	if _, err := restarted.ApplyAP(ctx, apID, explicitSSH); err != nil {
+		t.Fatal(err)
+	}
+	explicitSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, apReport, true), key)
+	if explicitSystem["users.1.name"] != "explicit-user" || explicitSystem["users.1.password"] == storedHash || explicitSystem["users.1.password"] == secret || !strings.HasPrefix(explicitSystem["users.1.password"], "$6$") {
+		t.Fatal("stored SSH overrode explicit typed SSH")
+	}
+	if _, err := restarted.ApplyAP(ctx, apID, apConfig); err != nil {
+		t.Fatal(err)
+	}
+	omittedSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, apReport, true), key)
+	if omittedSystem["users.1.name"] != "explicit-user" || omittedSystem["users.1.password"] != explicitSystem["users.1.password"] {
+		t.Fatal("omitted SSH restored obsolete adoption credentials")
+	}
+	latest, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var latestRecords []controller.Device
+	if err := json.Unmarshal(latest, &latestRecords); err != nil {
+		t.Fatal(err)
+	}
+	if latestRecords[0].SSHPassword != "" || latestRecords[0].SSHPasswordHash != explicitSystem["users.1.password"] || latestRecords[0].SSHUsername != "explicit-user" {
+		t.Fatal("effective SSH credentials were not persisted without obsolete plaintext")
+	}
+	afterSSHRestart := openTypedController(t, state)
+	afterSSHClient := network.Dial(startTypedSocket(t, afterSSHRestart))
+	typedExchange(t, afterSSHRestart, apID, key, apReport, true)
+	if _, err := afterSSHClient.ApplyAP(ctx, apID, apConfig); err != nil {
+		t.Fatal(err)
+	}
+	afterSSHSystem := assertTypedMetadata(t, typedExchange(t, afterSSHRestart, apID, key, apReport, true), key)
+	if afterSSHSystem["users.1.password"] != explicitSystem["users.1.password"] || afterSSHSystem["users.1.name"] != "explicit-user" {
+		t.Fatal("restart restored obsolete SSH credentials")
+	}
+	switchState := filepath.Join(directory, "stored-switch-ssh.json")
+	switchRecord := records[1]
+	switchRecord.SSHUsername, switchRecord.SSHPasswordHash = "preserved-user", storedHash
+	writeTypedJSON(t, switchState, []controller.Device{switchRecord})
+	switchController := openTypedController(t, switchState)
+	switchClient := network.Dial(startTypedSocket(t, switchController))
+	switchReport := swReport
+	switchReport.PortTable = append([]informmodel.Port{{Index: 2, Interface: "eth1"}}, swReport.PortTable...)
+	switchReport.Uplink = uplinkReport.Uplink
+	typedExchange(t, switchController, switchID, key, switchReport, true)
+	if _, err := switchClient.ApplySwitch(ctx, switchID, swConfig); err != nil {
+		t.Fatal(err)
+	}
+	switchSystem := assertTypedMetadata(t, typedExchange(t, switchController, switchID, key, switchReport, true), key)
+	if switchSystem["sshd.1.ifname"] != "eth0" || switchSystem["users.1.password"] != storedHash {
+		t.Fatal("preserved switch SSH did not select the lowest-index interface")
+	}
+	badState := filepath.Join(directory, "invalid-stored-ssh.json")
+	records[0].SSHPasswordHash = storedHash + "\ninjected=value"
+	writeTypedJSON(t, badState, records)
+	badController := openTypedController(t, badState)
+	badClient := network.Dial(startTypedSocket(t, badController))
+	typedExchange(t, badController, apID, key, apReport, true)
+	_, err = badClient.ApplyAP(ctx, apID, apConfig)
+	assertControlFailure(t, err, network.EncodingFailed, "")
+	if reply := typedExchange(t, badController, apID, key, apReport, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("invalid stored SSH queued a configuration")
+	}
+	const pendingID network.DeviceID = "02:00:00:00:00:13"
+	if err := reloaded.Adopt(string(pendingID), controller.Reply{Type: controller.ReplySetparam, ManagementConfig: "cfgversion=adopt\n", SystemConfig: "users.status=enabled\n"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = restarted.ApplyAP(ctx, pendingID, apConfig)
+	assertControlFailure(t, err, network.AdoptionPending, "")
+}
+
+func TestConfigVersionUXIntegration(t *testing.T) {
+	directory := t.TempDir()
+	state := filepath.Join(directory, "state.json")
+	const key = "0123456789abcdef0123456789abcdef"
+	const id network.DeviceID = "02:00:00:00:00:41"
+	legacySetParam := controller.Reply{Type: controller.ReplySetparam, ConfigVersion: "legacy-v0", ManagementConfig: "cfgversion=legacy-v0\n"}
+	legacy := []struct {
+		MAC    network.DeviceID `json:"mac"`
+		Key    string           `json:"key"`
+		Config controller.Reply `json:"config"`
+	}{{MAC: id, Key: key, Config: legacySetParam}}
+	writeTypedJSON(t, state, legacy)
+
+	controllerInstance := openTypedController(t, state)
+	client := network.Dial(startTypedSocket(t, controllerInstance))
+	report := informmodel.Report{
+		Type:          "uap",
+		ConfigVersion: "reported-v1",
+		Model:         "VersionAP",
+		Version:       "1",
+		RadioTable:    []informmodel.Radio{{Name: "wifi0", Radio: "ng", Widths: []informmodel.Uint16Scalar{20}}},
+		PortTable:     []informmodel.Port{{Index: 1, Interface: "eth0"}},
+	}
+	typedExchange(t, controllerInstance, id, key, report, false)
+	assertVersionState(t, client, id, "reported-v1", "", "legacy-v0")
+
+	typedConfig := network.APConfig{
+		CountryCode: 840,
+		Radios: []network.RadioConfig{{
+			Band: network.Band2GHz, Enabled: true, WidthMHz: network.Width20,
+			Power: network.PowerConfig{Mode: network.PowerAuto},
+		}},
+	}
+	typedVersion, err := client.ApplyAP(t.Context(), id, typedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertVersionState(t, client, id, "reported-v1", typedVersion, typedVersion)
+	if reply := typedExchange(t, controllerInstance, id, key, report, false); reply.ConfigVersion != string(typedVersion) {
+		t.Fatal("typed setparam was not delivered")
+	}
+	report.ConfigVersion = string(typedVersion)
+	typedExchange(t, controllerInstance, id, key, report, false)
+	assertVersionState(t, client, id, typedVersion, typedVersion, typedVersion)
+
+	rawConfig := network.Config{Version: "raw-v2", Management: "cfgversion=raw-v2\n"}
+	if _, err := client.ApplyConfig(t.Context(), id, rawConfig); err != nil {
+		t.Fatal(err)
+	}
+	assertVersionState(t, client, id, typedVersion, typedVersion, rawConfig.Version)
+	if reply := typedExchange(t, controllerInstance, id, key, report, false); reply.ConfigVersion != string(rawConfig.Version) {
+		t.Fatal("raw setparam was not delivered")
+	}
+	report.ConfigVersion = string(rawConfig.Version)
+	typedExchange(t, controllerInstance, id, key, report, false)
+	assertVersionState(t, client, id, rawConfig.Version, typedVersion, rawConfig.Version)
+
+	persisted, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var records []map[string]json.RawMessage
+	if err := json.Unmarshal(persisted, &records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0]["last_setparam"] == nil || records[0]["config"] != nil {
+		t.Fatal("legacy config field was not migrated")
+	}
+}
+
+func assertVersionState(t *testing.T, client *network.Client, id network.DeviceID, reported, desired, lastSetParam network.ConfigVersion) {
+	t.Helper()
+	snapshot, err := client.Device(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ReportedConfigVersion != reported || snapshot.DesiredConfigVersion != desired || snapshot.LastSetParamVersion != lastSetParam {
+		t.Fatalf("versions = %q/%q/%q, want %q/%q/%q", snapshot.ReportedConfigVersion, snapshot.DesiredConfigVersion, snapshot.LastSetParamVersion, reported, desired, lastSetParam)
+	}
+}
+
+func assertTypedMetadata(t *testing.T, reply controller.Reply, key string) configmap.Values {
+	t.Helper()
+	system, err := configmap.Parse(reply.SystemConfig)
+	if err != nil {
+		t.Fatal("invalid outgoing system configuration")
+	}
+	for name, expected := range map[string]string{
+		"unifi.key": key, "unifi.mcip": "192.0.2.1", "unifi.version": "0.1.0",
+		"unifi.cfgcap_info": "0x7", "unifi.feature.always_send_crash_logs": "disabled", "unifi.idp": "enabled",
+	} {
+		if system[name] != expected {
+			t.Fatalf("controller metadata incorrect: %s", name)
+		}
+	}
+	uuid := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	for _, name := range []string{"unifi.anonymous_controller_id", "unifi.anonymous_site_id", "unifi.reporterid"} {
+		if !uuid.MatchString(system[name]) {
+			t.Fatalf("invalid controller UUID: %s", name)
+		}
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(system["unifi.siteid"]) || system["unifi.anonymous_controller_id"] != system["unifi.reporterid"] || system["unifi.anonymous_site_id"] == system["unifi.anonymous_controller_id"] {
+		t.Fatal("invalid controller identity relationship")
+	}
+	return system
+}
+
+func assertSameTypedIdentity(t *testing.T, first, current configmap.Values) {
+	t.Helper()
+	for _, name := range []string{"unifi.anonymous_controller_id", "unifi.anonymous_site_id", "unifi.reporterid", "unifi.siteid"} {
+		if first[name] != current[name] {
+			t.Fatalf("controller identity changed: %s", name)
+		}
+	}
+}
+
+func TestGenericConfigControlIntegration(t *testing.T) {
+	directory := t.TempDir()
+	state := filepath.Join(directory, "state.json")
+	const key = "0123456789abcdef0123456789abcdef"
+	const id network.DeviceID = "02:00:00:00:00:31"
+	writeTypedJSON(t, state, []struct {
+		MAC network.DeviceID `json:"mac"`
+		Key string           `json:"key"`
+	}{{MAC: id, Key: key}})
+	controllerInstance := openTypedController(t, state)
+	socket := startTypedSocket(t, controllerInstance)
+	client := network.Dial(socket)
+	initialState, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidText := string([]byte{0xff})
+	for _, invalid := range []network.Config{
+		{Version: network.ConfigVersion(invalidText), Management: "unknown.key=value\n"},
+		{Version: "generic-config-v1", Management: "unknown.key=" + invalidText + "\n"},
+		{Version: "generic-config-v1", System: "unknown.key=" + invalidText + "\n"},
+	} {
+		_, err := client.ApplyConfig(t.Context(), id, invalid)
+		assertControlFailure(t, err, network.InvalidEncoding, "")
+		assertGenericConfigUnchanged(t, controllerInstance, state, initialState)
+	}
+	invalidFile := filepath.Join(directory, "invalid.cfg")
+	writeTypedFixture(t, invalidFile, append([]byte("unknown.cli.key="), append([]byte{0xff}, '\n')...))
+	if err := run(t.Context(), []string{"apply", "config", "--device", string(id), "--version", "generic-cli-v1", "--management-file", invalidFile, "--socket", socket}, io.Discard); err == nil {
+		t.Fatal("config apply accepted invalid UTF-8")
+	} else {
+		assertControlFailure(t, err, network.InvalidEncoding, "")
+	}
+	assertGenericConfigUnchanged(t, controllerInstance, state, initialState)
+	for _, invalid := range []network.Config{{Management: "unknown.key=value\n"}, {Version: "generic-config-v1"}} {
+		_, err := client.ApplyConfig(t.Context(), id, invalid)
+		assertControlFailure(t, err, network.InvalidConfig, "")
+	}
+	config := network.Config{
+		Version:    "generic-config-v1",
+		Management: "unknown.management.key=value=with=equals\nunknown.management.trailing=preserve-space \n",
+		System:     "unknown.system.key=quoted\\value\nunknown.system.empty=\n",
+	}
+	version, err := client.ApplyConfig(t.Context(), id, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != config.Version {
+		t.Fatalf("version = %q, want %q", version, config.Version)
+	}
+
+	persisted, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devices []struct {
+		LastSetParam *controller.Reply `json:"last_setparam"`
+	}
+	if err := json.Unmarshal(persisted, &devices); err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].LastSetParam == nil || devices[0].LastSetParam.ConfigVersion != string(config.Version) || devices[0].LastSetParam.ManagementConfig != config.Management || devices[0].LastSetParam.SystemConfig != config.System {
+		t.Fatal("controller did not persist the supplied configuration")
+	}
+
+	reply := typedExchange(t, controllerInstance, id, key, informmodel.Report{Model: "GenericDevice", Version: "1"}, false)
+	if reply.Type != controller.ReplySetparam || reply.ConfigVersion != string(config.Version) || reply.ManagementConfig != config.Management || reply.SystemConfig != config.System {
+		t.Fatal("inform response changed the supplied configuration")
+	}
+
+	managementFile := filepath.Join(directory, "management.cfg")
+	management := "unknown.cli.key=exact value \n"
+	writeTypedFixture(t, managementFile, []byte(management))
+	var output bytes.Buffer
+	if err := run(t.Context(), []string{"apply", "config", "--device", string(id), "--version", "generic-cli-v1", "--management-file", managementFile, "--socket", socket}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var queued queuedVersion
+	if err := json.Unmarshal(output.Bytes(), &queued); err != nil {
+		t.Fatal(err)
+	}
+	if queued.Version != "generic-cli-v1" {
+		t.Fatalf("CLI version = %q", queued.Version)
+	}
+	reply = typedExchange(t, controllerInstance, id, key, informmodel.Report{Model: "GenericDevice", Version: "1"}, false)
+	if reply.ConfigVersion != "generic-cli-v1" || reply.ManagementConfig != management || reply.SystemConfig != "" {
+		t.Fatal("CLI changed configuration file content")
+	}
+	if err := run(t.Context(), []string{"apply", "config", "--device", string(id), "--version", "generic-cli-v2", "--file", managementFile}, io.Discard); err == nil {
+		t.Fatal("config apply accepted a command JSON file")
+	}
+	if err := run(t.Context(), []string{"apply", "config", "--device", string(id), "--version", "generic-cli-v2"}, io.Discard); err == nil {
+		t.Fatal("config apply accepted no configuration files")
+	}
+}
+
+func TestRawConfigSocketEncoding(t *testing.T) {
+	directory := t.TempDir()
+	state := filepath.Join(directory, "state.json")
+	const id network.DeviceID = "02:00:00:00:00:32"
+	const key = "0123456789abcdef0123456789abcdef"
+	controllerInstance := openTypedController(t, state)
+	if err := controllerInstance.Register(string(id), key); err != nil {
+		t.Fatal(err)
+	}
+	socket := startTypedSocket(t, controllerInstance)
+	before, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	for _, body := range [][]byte{
+		append([]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"`), append([]byte{0xff}, []byte(`","management":"key=value","system":""}}`)...)...),
+		[]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"version","management":"\ud800","system":""}}`),
+		[]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"version","management":"key=value","system":"\udc00"}}`),
+		[]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"VERSION":"\ud800","MANAGEMENT":"key=value"}}`),
+		[]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"version","management":"\ud800"},"config":{"version":"version"}}`),
+	} {
+		if status := rawConfigStatus(t, client, body); status != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+		}
+		assertGenericConfigUnchanged(t, controllerInstance, state, before)
+	}
+
+	valid := []byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"version-\ud83d\ude00","management":"literal-�","system":"unicode-雪"}}`)
+	if status := rawConfigStatus(t, client, valid); status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+	persisted, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devices []controller.Device
+	if err := json.Unmarshal(persisted, &devices); err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].LastSetParam == nil || devices[0].LastSetParam.ConfigVersion != "version-😀" || devices[0].LastSetParam.ManagementConfig != "literal-�" || devices[0].LastSetParam.SystemConfig != "unicode-雪" {
+		t.Fatal("valid Unicode configuration changed")
+	}
+	reply := typedExchange(t, controllerInstance, id, key, informmodel.Report{Model: "RawSocketDevice", Version: "1"}, false)
+	if reply.ConfigVersion != "version-😀" || reply.ManagementConfig != "literal-�" || reply.SystemConfig != "unicode-雪" {
+		t.Fatal("valid Unicode configuration changed before delivery")
+	}
+}
+
+func rawConfigStatus(t *testing.T, client *http.Client, body []byte) int {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://local/control", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	return response.StatusCode
+}
+
+func assertGenericConfigUnchanged(t *testing.T, controllerInstance *controller.Controller, state string, expectedState []byte) {
+	t.Helper()
+	actualState, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(actualState, expectedState) {
+		t.Fatal("invalid configuration changed persisted state")
+	}
+	status := controllerInstance.Status()
+	if len(status) != 1 || status[0].Pending != 0 {
+		t.Fatal("invalid configuration changed the command queue")
+	}
+}
+
+func assertControlFailure(t *testing.T, err error, code network.ErrorCode, field string) {
+	t.Helper()
+	failure, ok := errors.AsType[*network.ControlError](err)
+	if !ok || failure.Code != code || failure.Field != field {
+		t.Fatalf("expected safe error %s at %s", code, field)
+	}
+	expected := string(code)
+	if field != "" {
+		expected += ": " + field
+	}
+	if failure.Error() != expected {
+		t.Fatal("error contains unexpected content")
+	}
+}
+
+func writeTypedFixture(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeTypedJSON[T any](t *testing.T, path string, value T) {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTypedFixture(t, path, data)
+}
+
+func openTypedController(t *testing.T, state string) *controller.Controller {
+	t.Helper()
+	c, err := controller.Open(state, "http://192.0.2.1:8080/inform", profile.NewRegistry(ap.New(), switches.New()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func startTypedSocket(t *testing.T, c *controller.Controller) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("", "unifi-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Error(err)
+		}
+	})
+	socket := filepath.Join(directory, "control.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(c.Control), ReadHeaderTimeout: time.Second}
+	go func() {
+		if err := server.Serve(listener); err != http.ErrServerClosed {
+			t.Error(err)
+		}
+	}()
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return socket
+}
+
+func typedExchange(t *testing.T, c *controller.Controller, id network.DeviceID, key string, report informmodel.Report, gcm bool) controller.Reply {
+	t.Helper()
+	if report.EthernetTable.Entries == nil {
+		report.EthernetTable.Entries = []informmodel.Ethernet{}
+	}
+	payload, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac, err := net.ParseMAC(string(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := inform.Packet{MAC: [6]byte(mac), Payload: payload}
+	var encoded []byte
+	if gcm {
+		encoded, err = packet.EncodeGCM(key)
+	} else {
+		encoded, err = packet.Encode(key)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	c.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/inform", bytes.NewReader(encoded)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("inform HTTP status %d", response.Code)
+	}
+	body, err := io.ReadAll(response.Result().Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binary.BigEndian.Uint32(body[4:8]) != 0 || binary.BigEndian.Uint32(body[32:36]) != 1 || (binary.BigEndian.Uint16(body[14:16])&8 != 0) != gcm {
+		t.Fatal("controller framing changed")
+	}
+	decoded, err := inform.Decode(body, key)
+	if err != nil {
+		t.Fatal("reply could not decrypt")
+	}
+	var reply controller.Reply
+	if err := json.Unmarshal(decoded.Payload, &reply); err != nil {
+		t.Fatal(err)
+	}
+	return reply
+}

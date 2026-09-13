@@ -1,0 +1,16 @@
+{
+  "family": "ap",
+  "controller_version": "10.6.101",
+  "controller_image_digest": "sha256:44261037f254f54d5a4ccc88b693b4ef3b939e8948c1640e3882036cd60da5f0",
+  "emitters": [
+    {
+      "device": "device-3",
+      "model": "U7PG2",
+      "emulator_revision": "v0.5.5",
+      "emitter_image_digest": "sha256:57b79b76dc1c9682be3e8861b9bd916680d488ab3b808aeee0c4b02a189925ba",
+      "capability_rationale": "Reported 2.4 GHz and 5 GHz radio inventory."
+    }
+  ],
+  "source": "Real seeded Network Server exchange with capability-selected emulated devices",
+  "sanitization_scheme": "documentation identities and synthetic AES key"
+}

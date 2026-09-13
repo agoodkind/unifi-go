@@ -1,0 +1,11 @@
+{
+  "added": {
+    "switch.port.2.status": "disabled"
+  },
+  "changed": {},
+  "removed": [
+    "switch.port.2.pvid",
+    "switch.vlan.1.port.2.mode",
+    "switch.vlan.2.port.2.mode"
+  ]
+}

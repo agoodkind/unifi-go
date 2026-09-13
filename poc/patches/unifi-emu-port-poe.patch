@@ -1,0 +1,10 @@
+--- a/inform/tables.go
++++ b/inform/tables.go
+@@ -26,6 +26,7 @@
+ 			"port_idx":    p.PortIdx,
+ 			"media":       p.Media,
+ 			"poe_caps":    p.PoECaps,
++			"port_poe":    p.PoECaps != 0,
+ 			"is_uplink":   p.IsUplink,
+ 			"up":          true,
+ 			"speed":       1000,

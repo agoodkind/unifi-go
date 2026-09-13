@@ -1,0 +1,22 @@
+services:
+  inform:
+    build: .
+    command:
+      - serve
+      - --listen=0.0.0.0:8080
+      - --advertise=${INFORM_URL:?Set INFORM_URL to the AP-reachable inform URL}
+      - --state=/state/devices.json
+      - --socket=/runtime/control.sock
+    ports:
+      - target: 8080
+        published: "8080"
+        host_ip: "${INFORM_IPV4_BIND:-0.0.0.0}"
+        protocol: tcp
+      - target: 8080
+        published: "8080"
+        host_ip: "${INFORM_IPV6_BIND:-::}"
+        protocol: tcp
+    volumes:
+      - ./state:/state
+      - ./runs:/runs:ro
+      - ./examples:/examples:ro

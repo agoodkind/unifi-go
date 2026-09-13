@@ -1,0 +1,34 @@
+{
+  "added": {
+    "bridge.2.devname": "br0.20",
+    "bridge.2.fd": "1",
+    "bridge.2.port.1.devname": "ath0",
+    "bridge.2.port.2.devname": "ath1",
+    "bridge.2.port.3.devname": "eth0.20",
+    "bridge.2.stp.status": "disabled",
+    "ebtables.5.cmd": "-t broute -A BROUTING -i ath0 -p 802_1Q -j DROP",
+    "ebtables.6.cmd": "-t broute -A BROUTING -i ath1 -p 802_1Q -j DROP",
+    "ebtables.7.cmd": "-t broute -A BROUTING --vlan-id 20 -p 802_1Q -j DROP",
+    "netconf.5.autoip.status": "disabled",
+    "netconf.5.devname": "br0.20",
+    "netconf.5.ip": "0.0.0.0",
+    "netconf.5.status": "enabled",
+    "netconf.5.up": "enabled",
+    "netconf.6.autoip.status": "disabled",
+    "netconf.6.devname": "eth0.20",
+    "netconf.6.ip": "0.0.0.0",
+    "netconf.6.status": "enabled",
+    "netconf.6.up": "enabled",
+    "vlan.1.devname": "eth0",
+    "vlan.1.id": "20"
+  },
+  "changed": {
+    "aaa.1.br.devname": "br0.20",
+    "aaa.2.br.devname": "br0.20",
+    "vlan.status": "enabled"
+  },
+  "removed": [
+    "bridge.1.port.2.devname",
+    "bridge.1.port.3.devname"
+  ]
+}

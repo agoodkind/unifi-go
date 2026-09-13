@@ -1,0 +1,38 @@
+{
+  "family": "switch",
+  "controller_version": "10.6.101",
+  "controller_image_digest": "sha256:44261037f254f54d5a4ccc88b693b4ef3b939e8948c1640e3882036cd60da5f0",
+  "emitters": [
+    {
+      "device": "device-2",
+      "model": "USF5P",
+      "emulator_revision": "v0.5.5",
+      "emitter_image_digest": "sha256:57b79b76dc1c9682be3e8861b9bd916680d488ab3b808aeee0c4b02a189925ba",
+      "capability_rationale": "Five reported physical ports with PoE capability."
+    },
+    {
+      "device": "device-1",
+      "model": "USL8A",
+      "emulator_revision": "v0.5.5",
+      "emitter_image_digest": "sha256:57b79b76dc1c9682be3e8861b9bd916680d488ab3b808aeee0c4b02a189925ba",
+      "capability_rationale": "Eight reported physical ports without PoE."
+    },
+    {
+      "device": "device-4",
+      "model": "US8P60",
+      "emulator_revision": "v0.5.5",
+      "emitter_image_digest": "sha256:57b79b76dc1c9682be3e8861b9bd916680d488ab3b808aeee0c4b02a189925ba",
+      "capability_rationale": "Unmodified eight-port emulator for PoE comparison."
+    },
+    {
+      "device": "device-5",
+      "model": "US8P60",
+      "emulator_revision": "v0.5.5",
+      "emitter_patch": "poc/patches/unifi-emu-port-poe.patch",
+      "emitter_image_digest": "sha256:058ab5838b8d1cfaca0fe308a9575d987f81c428f8d80a241c81af23e35e0633",
+      "capability_rationale": "Eight-port emulator with port_poe reporting patch to elicit real controller PoE configuration."
+    }
+  ],
+  "source": "Real seeded Network Server exchange with capability-selected emulated devices",
+  "sanitization_scheme": "documentation identities and synthetic AES key"
+}

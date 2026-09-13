@@ -1,0 +1,62 @@
+services:
+  unifi-db:
+    image: mongo:7.0@sha256:b6421fd6d1c5ded6377b397d8983e2f82e2100dc5123332dcfda2065a472be5b
+    container_name: unifi-db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD_FILE: /run/secrets/mongo_root_password
+      MONGO_USER: unifi
+      MONGO_PASS_FILE: /run/secrets/mongo_unifi_password
+      MONGO_DBNAME: unifi
+      MONGO_AUTHSOURCE: admin
+    secrets:
+      - mongo_root_password
+      - mongo_unifi_password
+    volumes:
+      - unifi-db:/data/db
+      - ./init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    restart: unless-stopped
+
+  unifi-network-application:
+    image: lscr.io/linuxserver/unifi-network-application:10.6.101@sha256:3017d2baabbc3f3f123dc1c892794f40c05516ccac0b94b95a7f4a0f7a417c5e
+    container_name: unifi-network-application
+    depends_on:
+      - unifi-db
+    environment:
+      PUID: 501
+      PGID: 20
+      TZ: America/Los_Angeles
+      MONGO_USER: unifi
+      FILE__MONGO_PASS: /run/secrets/mongo_unifi_password
+      MONGO_HOST: unifi-db
+      MONGO_PORT: 27017
+      MONGO_DBNAME: unifi
+      MONGO_AUTHSOURCE: admin
+      MEM_LIMIT: 1024
+      MEM_STARTUP: 1024
+    secrets:
+      - mongo_unifi_password
+    volumes:
+      - unifi-config:/config
+    ports:
+      - "8443:8443"
+      - "8080:8080"
+      - "3478:3478/udp"
+      - "10001:10001/udp"
+      - "1900:1900/udp"
+    restart: unless-stopped
+
+networks:
+  default:
+    enable_ipv4: true
+    enable_ipv6: false
+
+volumes:
+  unifi-config:
+  unifi-db:
+
+secrets:
+  mongo_root_password:
+    file: ./secrets/mongo_root_password
+  mongo_unifi_password:
+    file: ./secrets/mongo_unifi_password

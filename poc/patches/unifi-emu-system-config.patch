@@ -1,0 +1,129 @@
+--- a/inform/session.go
++++ b/inform/session.go
+@@ -128,4 +128,8 @@
+ 		case "usw":
+ 			m["port_table"] = portTable(s.desc)
+ 			m["ethernet_table"] = ethernetTable(s.desc)
++			// Synthetic capability evidence for the isolated test, not physical firmware.
++			if s.desc.Model == "S216150" || s.desc.Model == "S224250" {
++				m["switch_caps"] = map[string]uint64{"vlan_caps": 1}
++			}
+ 		case "uap":
+@@ -147,5 +147,6 @@
+ 	Interval   int    `json:"interval"`
+ 	MgmtCfg    string `json:"mgmt_cfg"`
++	SystemCfg  string `json:"system_cfg"`
+ 	Cfgversion string `json:"cfgversion"`
+ 	Version    string `json:"version"` // upgrade target firmware version
+ }
+@@ -252,5 +253,6 @@
+ func (s *Session) applySetparam(r informResponse) []Effect {
+ 	effects := []Effect{{Kind: EffectMgmtCfg, Text: r.MgmtCfg}}
++	s.applySystemConfig(r.SystemCfg)
+ 
+ 	var cfgvers, authkey, useAESGCM string
+ 	for _, line := range strings.Split(r.MgmtCfg, "\n") {
+--- /dev/null
++++ b/inform/system_config.go
+@@ -0,0 +1,82 @@
++package inform
++
++import (
++	"encoding/json"
++	"fmt"
++	"strconv"
++	"strings"
++)
++
++// applySystemConfig reflects only the tested legacy configuration records.
++// This test-only adapter does not emulate forwarding, power, or clients.
++func (s *Session) applySystemConfig(config string) {
++	values := map[string]string{}
++	for _, line := range strings.Split(config, "\n") {
++		key, value, ok := strings.Cut(line, "=")
++		if ok {
++			values[key] = value
++		}
++	}
++	if s.setstate == nil {
++		s.setstate = map[string]json.RawMessage{}
++	}
++	if s.desc.Type == "usw" && values["switch.port.1.opmode"] == "switch" {
++		ports := portTable(s.desc)
++		for index, port := range s.desc.Ports {
++			prefix := fmt.Sprintf("switch.port.%d.", port.PortIdx)
++			if value, err := strconv.Atoi(values[prefix+"pvid"]); err == nil {
++				ports[index]["native_vlan"] = value
++			}
++			if mode := values[prefix+"poe"]; mode != "" {
++				if mode == "shutdown" {
++					mode = "off"
++				}
++				ports[index]["poe_mode"] = mode
++			}
++			tagged := []int{}
++			for vlanIndex := 1; ; vlanIndex++ {
++				vlanPrefix := fmt.Sprintf("switch.vlan.%d.", vlanIndex)
++				vlan, err := strconv.Atoi(values[vlanPrefix+"id"])
++				if err != nil {
++					break
++				}
++				if values[fmt.Sprintf("%sport.%d.mode", vlanPrefix, port.PortIdx)] == "tagged" {
++					tagged = append(tagged, vlan)
++				}
++			}
++			ports[index]["tagged_vlans"] = tagged
++		}
++		s.setstate["port_table"], _ = json.Marshal(ports)
++	}
++	if s.desc.Type == "uap" && values["radio.1.phyname"] != "" {
++		radios := radioTable(s.desc)
++		for index, radio := range s.desc.Radios {
++			for slot := 1; slot <= len(s.desc.Radios); slot++ {
++				prefix := fmt.Sprintf("radio.%d.", slot)
++				if values[prefix+"phyname"] != radio.Name {
++					continue
++				}
++				if channel, err := strconv.Atoi(values[prefix+"channel"]); err == nil {
++					radios[index]["channel"] = channel
++				}
++				if power, err := strconv.Atoi(values[prefix+"txpower"]); err == nil {
++					radios[index]["tx_power"] = power
++				}
++				mode := values[prefix+"ieee_mode"]
++				if strings.HasSuffix(mode, "20") {
++					radios[index]["ht"] = "20"
++				}
++				if strings.HasSuffix(mode, "40") {
++					radios[index]["ht"] = "40"
++				}
++			}
++		}
++		s.setstate["radio_table"], _ = json.Marshal(radios)
++		statistics := radioTableStats(s.desc)
++		for index := range statistics {
++			statistics[index]["channel"] = radios[index]["channel"]
++			statistics[index]["tx_power"] = radios[index]["tx_power"]
++		}
++		s.setstate["radio_table_stats"], _ = json.Marshal(statistics)
++	}
++}
+--- a/inform/tables.go
++++ b/inform/tables.go
+@@ -62,5 +62,16 @@
+ 			"builtin_ant_gain": r.AntennaGain,
+ 		})
++		// Synthetic capability evidence for the isolated test, not physical firmware.
++		if desc.Model == "U6EXT" {
++			entry := table[len(table)-1]
++			if r.Radio == "ng" {
++				entry["channels"] = []int{6, 11}
++				entry["widths"] = []int{20, 40}
++			} else if r.Radio == "na" {
++				entry["channels"] = []int{44, 157}
++				entry["widths"] = []int{40}
++			}
++		}
+ 	}
+ 	return table
+ }

@@ -1,0 +1,9 @@
+{
+  "added": {
+    "switch.vlan.2.id": "20",
+    "switch.vlan.2.mode": "tagged",
+    "switch.vlan.2.status": "enabled"
+  },
+  "changed": {},
+  "removed": []
+}

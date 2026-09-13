@@ -1,0 +1,6 @@
+{
+  "_type": "setparam",
+  "cfgversion": "template",
+  "mgmt_cfg": "authkey=template\ninform_url=http://127.0.0.1:8080/inform\ncfgversion=template\nuse_aes_gcm=true\n",
+  "system_cfg": "users.status=enabled\nusers.1.status=enabled\nusers.1.name=template\nusers.1.password=template\nsshd.status=enabled\nsshd.1.status=enabled\nsshd.auth.passwd=enabled\n"
+}

@@ -1,0 +1,8 @@
+{
+  "added": {},
+  "changed": {
+    "radio.2.txpower": "15",
+    "radio.2.txpower_mode": "custom"
+  },
+  "removed": []
+}

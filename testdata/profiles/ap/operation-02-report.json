@@ -1,0 +1,97 @@
+{
+  "type": "",
+  "model": "U7PG2",
+  "version": "6.8.2.15592",
+  "mac": "02:00:00:00:10:9c",
+  "ip": "203.0.113.200",
+  "uptime": 898,
+  "cfgversion": "fixture-cfg",
+  "last_error": "",
+  "country_code": null,
+  "countrycode_table": null,
+  "radio_table": [
+    {
+      "name": "wifi-ng",
+      "radio": "ng",
+      "channel": 1,
+      "ht": 20,
+      "channels": null,
+      "widths": null,
+      "min_txpower": 5,
+      "max_txpower": 22,
+      "tx_power": 22,
+      "radio_caps": 0,
+      "radio_caps2": null
+    },
+    {
+      "name": "wifi-na",
+      "radio": "na",
+      "channel": 36,
+      "ht": 40,
+      "channels": null,
+      "widths": null,
+      "min_txpower": 5,
+      "max_txpower": 23,
+      "tx_power": 23,
+      "radio_caps": 0,
+      "radio_caps2": null
+    }
+  ],
+  "radio_table_stats": [
+    {
+      "name": "wifi-ng",
+      "channel": 1,
+      "tx_power": 22,
+      "num_sta": 0,
+      "noise": -95
+    },
+    {
+      "name": "wifi-na",
+      "channel": 36,
+      "tx_power": 23,
+      "num_sta": 0,
+      "noise": -95
+    }
+  ],
+  "vap_table": [],
+  "port_table": [
+    {
+      "port_idx": 1,
+      "ifname": "eth0",
+      "name": "fixture-interface-1",
+      "poe_caps": 0,
+      "port_poe": null,
+      "up": true,
+      "speed": 1000,
+      "full_duplex": true,
+      "rx_bytes": 0,
+      "tx_bytes": 0,
+      "poe_power": null
+    },
+    {
+      "port_idx": 2,
+      "ifname": "eth1",
+      "name": "fixture-interface-2",
+      "poe_caps": 0,
+      "port_poe": null,
+      "up": true,
+      "speed": 1000,
+      "full_duplex": true,
+      "rx_bytes": 0,
+      "tx_bytes": 0,
+      "poe_power": null
+    }
+  ],
+  "ethernet_table": {
+    "Interface": "",
+    "Entries": [
+      {
+        "mac": "02:00:00:00:03:00",
+        "name": "eth0",
+        "num_port": 2
+      }
+    ]
+  },
+  "uplink": null,
+  "switch_caps": null
+}

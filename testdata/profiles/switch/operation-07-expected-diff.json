@@ -1,0 +1,10 @@
+{
+  "added": {
+    "switch.vlan.1.port.2.mode": "untagged",
+    "switch.vlan.2.port.2.mode": "exclude"
+  },
+  "changed": {
+    "switch.port.2.poe": "shutdown"
+  },
+  "removed": []
+}
