@@ -6,8 +6,8 @@ simulates devices and supplies the reused protocol library.
 
 ## Start the controller
 
-Install Docker, Go matching the module version, and Make. Install TShark and patch
-before running capture acceptance.
+Install Docker, Go matching the module version, and Make. Install TShark, mergecap,
+and patch before running capture acceptance.
 
 Set an IPv4 address reachable from the devices, then start the controller:
 
@@ -32,8 +32,8 @@ docker compose exec inform /unifi-go adopt \
 ```
 
 The controller sends `set-adopt` to a default-key device. After the device informs
-with the assigned key, the controller sends the initial configuration. Adoption
-generates and saves device SSH credentials.
+with the assigned key, the controller sends the supplied initial configuration.
+Supply SSH policy explicitly if the device needs SSH access.
 
 Confirm a recent inform before applying a family configuration:
 
@@ -52,8 +52,42 @@ docker compose exec inform /unifi-go import \
     --key-file=/state/inform-key
 ```
 
-Point the device at this controller and wait for its report. Apply the complete
-desired configuration afterward. Omitted wireless networks are not preserved.
+Point the device at this controller and wait for its report.
+
+## Import a configuration baseline
+
+For a missing or unusable typed baseline, import complete management and system
+bodies from an operator-selected configuration. Include the corresponding typed
+identities in `ap` or `switch`. Store the JSON envelope in a mode-0600 file:
+
+```json
+{
+  "config": {
+    "version": "operator-baseline",
+    "management": "complete management configuration text",
+    "system": "complete system configuration text"
+  },
+  "ap": {
+    "networks": [{"name": "Lab", "bands": ["2.4ghz", "5ghz"]}]
+  }
+}
+```
+
+Replace the example bodies with complete configuration text and the identities with
+the selected device's existing resources. For switches, supply `switch.ports` with
+their physical `index` values instead of `ap`.
+
+```sh
+docker compose exec inform /unifi-go baseline-import \
+    --socket=/runtime/control.sock --device="$DEVICE_MAC" --file=/state/baseline.json
+```
+
+Import sends no configuration. Omitted policy preserves the baseline value or its
+absence. A supplied resource collection replaces its typed membership, so retain
+every existing member that should survive. Peers may supply only their identities.
+An omitted collection preserves every member; an empty collection removes its typed
+members. Unknown records survive unless their owning resource is removed.
+New networks and ports require explicit policy; missing required fields are rejected.
 
 ## Configure an access point
 
@@ -71,6 +105,7 @@ Use this configuration for one WPA2 network on virtual LAN (VLAN) 20 and two rad
     "enabled": true,
     "vlan": 20,
     "bands": ["2.4ghz", "5ghz"],
+    "bss_transition": "disabled",
     "security": {"mode": "wpa2-personal", "psk": "/state/wifi-secret"}
   }],
   "radios": [
@@ -88,7 +123,9 @@ Use this configuration for one WPA2 network on virtual LAN (VLAN) 20 and two rad
 
 Choose the country, channels, widths, and power for the device and deployment.
 Explicit channels and widths require capability evidence. Explicit power requires
-reported minimum and maximum bounds. Omit `channel` to select automatically.
+reported minimum and maximum bounds. Set `channel` to null to select automatically;
+omitting it preserves the baseline. Set `vlan` to null for untagged operation.
+Other fields reject null, including legacy `ssh: null`; omit them to preserve policy.
 Save the configuration in the mounted state directory under the filename used below:
 
 ```sh
@@ -96,10 +133,37 @@ docker compose exec inform /unifi-go apply ap \
     --socket=/runtime/control.sock --device="$DEVICE_MAC" --file=/state/ap.json
 ```
 
-The returned version identifies queued configuration. It does not prove the device
-applied it. Typed Apply changes SSH credentials only when an explicit `ssh` object
-supplies `username` and a `password` secret-file reference.
-Later applications without `ssh` and controller restarts preserve that latest account.
+The returned version identifies the compiled configuration. Apply queues nothing
+when the device already reports that version. Wait for a matching reported version
+and inspect the applied device setting before claiming hardware acceptance.
+An explicit `ssh` object changes only its supplied credential fields; omitted fields
+preserve existing credentials.
+
+## Preview a typed change
+
+Preview with the same request file that will be applied. Keep the returned opaque
+token private. The response contains record counts without configuration values;
+the counts include connection and version metadata:
+
+```sh
+umask 077
+docker compose exec inform /unifi-go apply ap \
+    --socket=/runtime/control.sock --device="$DEVICE_MAC" \
+    --file=/state/ap.json --dry-run > state/preview.json
+```
+
+Save only the response's `token` string into a mode-0600 token file in the mounted
+state directory. Apply the unchanged request with that token:
+
+```sh
+docker compose exec inform /unifi-go apply ap \
+    --socket=/runtime/control.sock --device="$DEVICE_MAC" \
+    --file=/state/ap.json --preview-token-file=/state/preview-token
+```
+
+Use `apply switch` for switch previews. Preview does not write state or queue a
+command. If the token expires or the baseline, capabilities, request, or resolved
+secret contents change, preview again before applying.
 
 ## Apply complete configuration
 
@@ -113,6 +177,11 @@ docker compose exec inform /unifi-go apply config \
     --socket=/runtime/control.sock --device="$DEVICE_MAC" --version='config-v1' \
     --management-file=/state/mgmt.cfg --system-file=/state/system.cfg
 ```
+
+Raw Apply replaces the baseline and invalidates typed ownership. Import complete
+bodies and their explicit resource identities again before the next typed change.
+After device drift, deliberately reconcile the supplied typed policy against the
+chosen baseline through full Apply. Reports do not reconstruct missing configuration.
 
 ## Configure a switch
 
@@ -160,8 +229,8 @@ Restart without discarding the mounted state:
 docker compose restart inform
 ```
 
-Device keys, desired configuration, and descriptors reload. Reports and queued
-commands disappear. Fresh informs restore observations. Reapply configuration
+Device keys, full baselines, typed identities, and descriptors reload. Reports and
+queued commands disappear. Fresh informs restore observations. Reapply configuration
 explicitly if a command was pending when the controller restarted.
 
 ## Validate captures

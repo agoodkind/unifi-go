@@ -9,13 +9,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/jamesbraid/unifi-emu/inform"
 
+	"goodkind.io/unifi-go/internal/configmap"
 	"goodkind.io/unifi-go/network"
 )
 
@@ -97,7 +99,7 @@ func TestLiveAPSwitch(t *testing.T) {
 		r.until("adopted inventory", func() bool {
 			var statuses []struct {
 				MAC     string `json:"mac"`
-				Version string `json:"cfgversion"`
+				Version string `json:"reported_config_version"`
 			}
 			if json.Unmarshal(r.tryCLI("status"), &statuses) != nil {
 				return false
@@ -118,6 +120,7 @@ func TestLiveAPSwitch(t *testing.T) {
 	}
 	r.restart(ids, emulators)
 	r.command("docker", "stop", "-t", "5", capture)
+	r.command("mergecap", "-w", filepath.Join(r.dir, "combined.pcap"), filepath.Join(r.dir, "traffic-before-restart.pcap"), filepath.Join(r.dir, "traffic.pcap"))
 	r.verifyCapture(ids, models)
 	r.write("result.txt", []byte("PASS: live patched emulator adoption, typed Apply, observations, restart, encrypted capture\nNo physical forwarding, PoE power, or client association proof.\n"))
 	if os.Getenv("UNIFI_LIVE_CHILD_PHASE") == "" {
@@ -233,7 +236,7 @@ func (r *liveRun) finish() {
 		state, err := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.State.Paused}}", name).CombinedOutput()
 		cancel()
 		if err != nil {
-			if !bytes.Contains(state, []byte("No such")) {
+			if !bytes.Contains(bytes.ToLower(state), []byte("no such")) {
 				r.t.Errorf("inspect isolated cleanup target failed: %v", err)
 			}
 			continue
@@ -261,11 +264,20 @@ func (r *liveRun) prepare() {
 		prefix := filepath.Base(parent)
 		r.command("docker", "tag", prefix+":controller", r.name+":controller")
 		r.command("docker", "tag", prefix+":emulator", r.name+":emulator")
+		binary, err := os.ReadFile(filepath.Join(parent, "live-test"))
+		if err != nil {
+			r.t.Fatal(err)
+		}
+		r.write("live-test", binary)
 		return
 	}
 	r.command("docker", "pull", liveEmulatorImage)
 	r.command("docker", "pull", "nicolaka/netshoot:v0.14")
 	r.command("docker", "build", "-t", r.name+":controller", r.root)
+	cmdTest := exec.CommandContext(r.ctx, "go", "test", "-c", "-o", filepath.Join(r.dir, "live-test"), "./integration")
+	cmdTest.Dir = r.root
+	cmdTest.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
+	r.execute(cmdTest)
 	module := strings.TrimSpace(string(r.command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/jamesbraid/unifi-emu")))
 	source := filepath.Join(r.dir, "emulator-source")
 	if err := os.CopyFS(source, os.DirFS(module)); err != nil {
@@ -279,6 +291,9 @@ func (r *liveRun) prepare() {
 		r.write(name, patch)
 		r.command("patch", "-d", source, "-p1", "-i", filepath.Join(r.dir, name))
 	}
+	// Explicit synthetic family evidence disambiguates the emulator's AP port table.
+	r.write("unifi-emu-family.patch", []byte("--- a/inform/session.go\n+++ b/inform/session.go\n@@ -64,3 +64,4 @@\n \tm := map[string]any{\n \t\t\"mac\":            s.desc.MAC,\n+\t\t\"type\":           s.desc.Type,\n \t\t\"serial\":         s.desc.Serial,\n"))
+	r.command("patch", "-d", source, "-p1", "-i", filepath.Join(r.dir, "unifi-emu-family.patch"))
 	cmd := exec.CommandContext(r.ctx, "go", "build", "-trimpath", "-o", filepath.Join(r.dir, "unifi-emu"), "./cmd/unifi-emu")
 	cmd.Dir = source
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
@@ -343,84 +358,216 @@ func (r *liveRun) models() []liveModel {
 }
 
 func (r *liveRun) configure(models []liveModel, ids []string) {
-	secret := make([]byte, 16)
-	if _, err := rand.Read(secret); err != nil {
-		r.t.Fatal(err)
-	}
-	r.write("wifi-secret", []byte(hex.EncodeToString(secret)))
-	r.write("ap.json", []byte(`{"country_code":840,"networks":[{"name":"E2E-Lab","enabled":true,"vlan":20,"bands":["2.4ghz","5ghz"],"bss_transition":"enabled","security":{"mode":"wpa2-personal","psk":"/state/wifi-secret"}}],"radios":[{"band":"2.4ghz","enabled":true,"channel":6,"width_mhz":20,"power":{"mode":"explicit","dbm":10}},{"band":"5ghz","enabled":true,"channel":44,"width_mhz":40,"power":{"mode":"explicit","dbm":12}}]}`))
-	for index, id := range ids {
-		family, file := "ap", "ap.json"
+	for index := range models {
+		family, fixture := "ap", "operation-05-reply.json"
 		if index > 0 {
-			family, file = "switch", fmt.Sprintf("switch-%d.json", index)
-			config := suppliedSwitchConfig(
-				suppliedSwitchPort(1, true, 20, []network.VLANID{}, network.PoEOff),
-				suppliedSwitchPort(uint16(models[index].Ports[len(models[index].Ports)-1].PortIdx), true, 1, []network.VLANID{20}, ""),
-			)
-			r.writeJSON(file, config)
+			family, fixture = "switch", "operation-08-reply.json"
 		}
-		var queued struct {
-			Version network.ConfigVersion `json:"version"`
+		param := compilerFixture(r.t, family, fixture)
+		param.Management["operator.unmodeled"] = "retain-management"
+		param.System["operator.unmodeled"] = "retain-system"
+		if index == 0 {
+			for _, radio := range models[index].Radios {
+				old := "wifi-na"
+				if radio.Radio == "ng" {
+					old = "wifi-ng"
+				}
+				for key, value := range param.System {
+					if value == old {
+						param.System[key] = radio.Name
+					}
+				}
+			}
+			param.System["radio.1.channel"] = "44"
+			param.System["radio.2.ieee_mode"] = "11nght20"
+			param.System["radio.1.txpower"], param.System["radio.2.txpower"] = "12", "10"
+			// The second captured radio becomes a synthetic peer with absent BSS policy.
+			param.System["wireless.2.ssid"], param.System["aaa.2.ssid"] = "synthetic-peer", "synthetic-peer"
+			delete(param.System, "aaa.2.bss_transition")
+		} else {
+			// Captured switch replies omit these required synthetic port identity records.
+			for port := 2; port <= 5; port++ {
+				prefix := fmt.Sprintf("switch.port.%d.", port)
+				param.System[prefix+"status"] = "enabled"
+				param.System[prefix+"pvid"] = "1"
+			}
 		}
-		if err := json.Unmarshal(r.cli("apply", family, "--device="+id, "--file=/state/"+file), &queued); err != nil {
+		management, err := param.Management.Encode()
+		if err != nil {
 			r.t.Fatal(err)
 		}
-		if queued.Version == "" {
-			r.t.Fatal("Apply returned an empty version")
+		system, err := param.System.Encode()
+		if err != nil {
+			r.t.Fatal(err)
 		}
-		r.until("applied version reported", func() bool { return r.snapshot(id).ReportedConfigVersion == queued.Version })
-		snapshot := r.snapshot(id)
+		baseline := network.BaselineImport{Config: network.Config{Version: "unifi-go-1", Management: management, System: system}}
 		if index == 0 {
-			if snapshot.AP == nil || len(snapshot.AP.Radios) != 2 {
-				r.t.Fatal("public AP inventory is incomplete")
+			baseline.AP = &network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+				{Name: "fixture-wifi", Bands: network.Supplied([]network.RadioBand{network.Band5GHz})},
+				{Name: "synthetic-peer", Bands: network.Supplied([]network.RadioBand{network.Band2GHz})},
+			})}
+		} else {
+			baseline.Switch = &network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{{Index: 2}, {Index: 3}, {Index: 4}, {Index: 5}})}
+		}
+		r.writeJSON(fmt.Sprintf("baseline-%d.json", index), baseline)
+	}
+	r.socketOperations("initial")
+}
+
+func (r *liveRun) socketOperations(phase string) {
+	if err := os.Chmod(filepath.Join(r.dir, "live-test"), 0o700); err != nil {
+		r.t.Fatal(err)
+	}
+	r.command("docker", "exec", "-e", "UNIFI_LIVE_SOCKET_PHASE="+phase, r.controller,
+		"/state/live-test", "-test.run=^TestLiveSocketOperations$", "-test.v", "-test.timeout=4m")
+}
+
+// TestLiveSocketOperations runs the public client inside the isolated controller container.
+func TestLiveSocketOperations(t *testing.T) {
+	phase := os.Getenv("UNIFI_LIVE_SOCKET_PHASE")
+	if phase == "" {
+		t.Skip("isolated container helper")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	client := network.Dial("/runtime/control.sock")
+	devices, err := client.Devices(ctx)
+	if err != nil {
+		t.Fatal("socket inventory failed")
+	}
+	index := 0
+	for _, device := range devices {
+		if device.LastInform.IsZero() {
+			continue
+		}
+		var baseline network.BaselineImport
+		data, err := os.ReadFile(fmt.Sprintf("/state/baseline-%d.json", index))
+		if err != nil || json.Unmarshal(data, &baseline) != nil {
+			t.Fatal("baseline unavailable")
+		}
+		if phase == "initial" {
+			if err := client.ImportBaseline(ctx, device.ID, baseline); err != nil {
+				t.Fatal("baseline import failed", err)
 			}
-			bands := map[network.RadioBand]bool{}
-			if len(snapshot.AP.Clients) != 0 {
-				r.t.Fatal("emulator unexpectedly claims associated clients")
+		}
+		before, err := os.ReadFile("/state/devices.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		apRequest := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+			{Name: "fixture-wifi", BSSTransition: network.Supplied(network.BSSTransitionDisabled)},
+			{Name: "synthetic-peer"},
+		})}
+		switchRequest := network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{
+			{Index: 2, Enabled: network.Supplied(false)}, {Index: 3}, {Index: 4}, {Index: 5},
+		})}
+		if phase == "restart" {
+			apRequest = network.APConfig{Radios: network.Supplied([]network.RadioConfig{{Band: network.Band5GHz, Channel: network.Supplied(uint16(157))}})}
+			switchRequest = network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{
+				{Index: 2}, {Index: 3, Enabled: network.Supplied(false)}, {Index: 4}, {Index: 5},
+			})}
+		}
+		var preview network.ConfigPreview
+		if device.Family == network.FamilyAP {
+			preview, err = client.PreviewAP(ctx, device.ID, apRequest)
+		} else {
+			preview, err = client.PreviewSwitch(ctx, device.ID, switchRequest)
+		}
+		if err != nil {
+			t.Fatal("live preview failed", err)
+		}
+		after, err := os.ReadFile("/state/devices.json")
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatal("preview changed state bytes")
+		}
+		fresh := device.LastInform
+		for {
+			observed, err := client.Device(ctx, device.ID)
+			if err != nil {
+				t.Fatal("preview observation failed")
 			}
-			for _, radio := range snapshot.AP.Radios {
-				if bands[radio.Band] || (radio.Band != network.Band2GHz && radio.Band != network.Band5GHz) {
-					r.t.Fatal("public AP radio bands differ from selected inventory")
+			if observed.LastInform.After(fresh) {
+				if observed.ReportedConfigVersion != device.ReportedConfigVersion {
+					t.Fatal("preview delivered configuration")
 				}
-				bands[radio.Band] = true
-				channel, width, power := uint16(6), network.Width20, 10
-				if radio.Band == network.Band5GHz {
-					channel, width, power = 44, network.Width40, 12
-				}
-				if radio.Channel == nil || *radio.Channel != channel || radio.WidthMHz == nil || *radio.WidthMHz != width || radio.PowerDBm == nil || *radio.PowerDBm != power {
-					r.t.Fatal("AP radio report does not match applied settings")
-				}
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal("preview fresh inform timeout")
+			case <-time.After(time.Second):
+			}
+		}
+		if err := os.WriteFile(fmt.Sprintf("/state/preview-%s-%d.json", phase, index), mustLiveJSON(t, struct {
+			ID         network.DeviceID
+			Start, End time.Time
+		}{device.ID, fresh, time.Now()}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var version network.ConfigVersion
+		if device.Family == network.FamilyAP {
+			version, err = client.ApplyAPPreview(ctx, device.ID, apRequest, preview.Token)
+		} else {
+			version, err = client.ApplySwitchPreview(ctx, device.ID, switchRequest, preview.Token)
+		}
+		if err != nil {
+			t.Fatal("live token apply failed", err)
+		}
+		for {
+			observed, err := client.Device(ctx, device.ID)
+			if err != nil {
+				t.Fatal("apply observation failed")
+			}
+			if observed.ReportedConfigVersion == version {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal("apply version timeout")
+			case <-time.After(time.Second):
+			}
+		}
+		management, err := configmap.Parse(baseline.Config.Management)
+		if err != nil {
+			t.Fatal(err)
+		}
+		system, err := configmap.Parse(baseline.Config.System)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if device.Family == network.FamilyAP {
+			system["aaa.1.bss_transition"] = "disabled"
+			if phase == "restart" {
+				system["radio.1.channel"] = "157"
 			}
 		} else {
-			if snapshot.Switch == nil || len(snapshot.Switch.Ports) != len(models[index].Ports) {
-				r.t.Fatal("public switch inventory is incomplete")
-			}
-			expected := map[uint16]bool{}
-			for _, port := range models[index].Ports {
-				expected[uint16(port.PortIdx)] = true
-			}
-			for _, port := range snapshot.Switch.Ports {
-				if !expected[port.Index] {
-					r.t.Fatal("public switch port indexes differ from selected inventory")
-				}
-				delete(expected, port.Index)
-				if port.Up == nil || !*port.Up || port.SpeedMbps == nil || *port.SpeedMbps != 1000 || port.FullDuplex == nil || !*port.FullDuplex {
-					r.t.Fatal("public switch link state differs from emulator report")
-				}
-				if port.Index == 1 {
-					if port.NativeVLAN == nil || *port.NativeVLAN != 20 || port.TaggedVLANs == nil || len(port.TaggedVLANs) != 0 || port.PoEMode != network.PoEOff {
-						r.t.Fatal("public switch access VLAN or PoE observation differs from patched report")
-					}
-				} else if port.Index == uint16(models[index].Ports[len(models[index].Ports)-1].PortIdx) {
-					if port.NativeVLAN == nil || *port.NativeVLAN != 1 || !slices.Equal(port.TaggedVLANs, []network.VLANID{20}) || port.PoEMode != "" {
-						r.t.Fatal("public switch trunk observation differs from patched report")
-					}
-				} else if port.NativeVLAN != nil || port.PoEMode != "" {
-					r.t.Fatal("unconfigured port acquired an invented observation")
-				}
+			system["switch.port.2.status"] = "disabled"
+			if phase == "restart" {
+				system["switch.port.3.status"] = "disabled"
 			}
 		}
+		expected := struct {
+			ID                 network.DeviceID
+			Version            network.ConfigVersion
+			Management, System configmap.Values
+		}{device.ID, version, management, system}
+		if err := os.WriteFile(fmt.Sprintf("/state/expected-%s-%d.json", phase, index), mustLiveJSON(t, expected), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		index++
 	}
+	if index != 3 {
+		t.Fatal("live adopted inventory does not contain three devices")
+	}
+}
+
+func mustLiveJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func (r *liveRun) restart(ids, emulators []string) {
@@ -433,12 +580,19 @@ func (r *liveRun) restart(ids, emulators []string) {
 		r.t.Fatal(err)
 	}
 	r.write("state-before-restart.json", before)
-	r.write("pending.json", []byte(`{"_type":"setparam","cfgversion":"must-not-replay","mgmt_cfg":"cfgversion=must-not-replay\n","system_cfg":"sshd.status=enabled\n"}`))
+	r.write("pending.json", []byte(`{"_type":"cmd","cmd":"must-not-replay"}`))
 	for _, id := range ids {
 		r.cli("send", "--mac="+id, "--file=/state/pending.json")
 	}
+	// Docker replaces the controller network namespace on restart; reattach capture.
+	r.command("docker", "stop", "-t", "5", r.name+"-capture")
+	if err := os.Rename(filepath.Join(r.dir, "traffic.pcap"), filepath.Join(r.dir, "traffic-before-restart.pcap")); err != nil {
+		r.t.Fatal(err)
+	}
+	r.write("traffic.pcap", nil)
 	r.command("docker", "restart", r.controller)
 	r.until("restarted controller ready", func() bool { return r.tryCLI("status") != nil })
+	r.command("docker", "start", r.name+"-capture")
 	for _, id := range ids {
 		snapshot := r.snapshot(id)
 		if !snapshot.LastInform.IsZero() || snapshot.ReportedConfigVersion != "" {
@@ -475,7 +629,7 @@ func (r *liveRun) restart(ids, emulators []string) {
 		r.t.Fatal("persisted devices missing")
 	}
 	for index, device := range oldState {
-		for _, field := range []string{"key", "desired_ap", "desired_switch", "desired_version"} {
+		for _, field := range []string{"key", "desired_ap", "desired_switch", "desired_version", "baseline"} {
 			if !bytes.Equal(device[field], newState[index][field]) {
 				r.t.Fatal("durable identity or desired state changed")
 			}
@@ -495,6 +649,7 @@ func (r *liveRun) restart(ids, emulators []string) {
 		})
 	}
 	r.write("devices-after.json", r.cli("devices"))
+	r.socketOperations("restart")
 }
 
 func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
@@ -503,30 +658,62 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 		r.t.Fatal(err)
 	}
 	var devices []struct{ MAC, Key string }
-	if err := json.Unmarshal(state, &devices); err != nil {
-		r.t.Fatal(err)
+	if json.Unmarshal(state, &devices) != nil {
+		r.t.Fatal("invalid state")
 	}
 	keys := map[string]string{}
 	for _, device := range devices {
 		keys[device.MAC] = device.Key
 	}
-	output := r.command("tshark", "-r", filepath.Join(r.dir, "traffic.pcap"), "-Y", "http.file_data", "-T", "fields", "-e", "http.file_data")
-	adopted, configured, reflected := map[string]bool{}, map[string]bool{}, map[string]bool{}
-	uplinks := map[string]int{}
-	for index, id := range ids[1:] {
-		uplinks[id] = models[index+1].Ports[len(models[index+1].Ports)-1].PortIdx
+	output := r.command("tshark", "-r", filepath.Join(r.dir, "combined.pcap"), "-Y", "http.file_data", "-T", "fields", "-e", "frame.time_epoch", "-e", "http.file_data")
+	type expectation struct {
+		ID                 network.DeviceID
+		Version            network.ConfigVersion
+		Management, System configmap.Values
 	}
-	secret, err := os.ReadFile(filepath.Join(r.dir, "wifi-secret"))
-	if err != nil {
-		r.t.Fatal(err)
+	type window struct {
+		ID         network.DeviceID
+		Start, End time.Time
 	}
-	count := 0
-	for _, line := range strings.Fields(string(output)) {
-		body, err := hex.DecodeString(strings.ReplaceAll(line, ":", ""))
-		if err != nil {
-			r.t.Fatal("invalid capture hex")
+	var expected []expectation
+	var windows []window
+	for _, phase := range []string{"initial", "restart"} {
+		for index := range models {
+			body, err := os.ReadFile(filepath.Join(r.dir, fmt.Sprintf("expected-%s-%d.json", phase, index)))
+			if err != nil {
+				r.t.Fatal(err)
+			}
+			var item expectation
+			if json.Unmarshal(body, &item) != nil {
+				r.t.Fatal("invalid expectation")
+			}
+			expected = append(expected, item)
+			body, err = os.ReadFile(filepath.Join(r.dir, fmt.Sprintf("preview-%s-%d.json", phase, index)))
+			if err != nil {
+				r.t.Fatal(err)
+			}
+			var period window
+			if json.Unmarshal(body, &period) != nil {
+				r.t.Fatal("invalid preview interval")
+			}
+			windows = append(windows, period)
 		}
-		if len(body) < 40 || !bytes.HasPrefix(body, []byte("TNBU")) {
+	}
+	matched := map[string]bool{}
+	noops := make([]bool, len(windows))
+	adopted := map[string]bool{}
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		stamp, encoded, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		seconds, err := strconv.ParseFloat(stamp, 64)
+		if err != nil {
+			r.t.Fatal("invalid capture time")
+		}
+		body, err := hex.DecodeString(strings.ReplaceAll(encoded, ":", ""))
+		if err != nil || len(body) < 40 || !bytes.HasPrefix(body, []byte("TNBU")) {
 			continue
 		}
 		id := net.HardwareAddr(body[8:14]).String()
@@ -539,84 +726,75 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 		}
 		count++
 		if bytes.Contains(packet.Payload, []byte("must-not-replay")) {
-			r.t.Fatal("pending configuration replayed after restart")
+			r.t.Fatal("queued command replayed")
 		}
 		var payload struct {
-			Type   string `json:"_type"`
-			Cmd    string `json:"cmd"`
-			System string `json:"system_cfg"`
-			Ports  []struct {
-				Index  int    `json:"port_idx"`
-				Native int    `json:"native_vlan"`
-				PoE    string `json:"poe_mode"`
-				Tagged []int  `json:"tagged_vlans"`
-			} `json:"port_table"`
-			Radios []struct {
-				Channel int `json:"channel"`
-			} `json:"radio_table"`
+			Type       string                `json:"_type"`
+			Cmd        string                `json:"cmd"`
+			Version    network.ConfigVersion `json:"cfgversion"`
+			Management string                `json:"mgmt_cfg"`
+			System     string                `json:"system_cfg"`
 		}
 		if json.Unmarshal(packet.Payload, &payload) != nil {
-			r.t.Fatal("invalid captured JSON")
+			r.t.Fatal("invalid capture payload")
 		}
 		if payload.Cmd == "set-adopt" {
 			adopted[id] = true
 		}
-		if payload.Type == "setparam" {
-			values := map[string]string{}
-			for _, record := range strings.Split(payload.System, "\n") {
-				key, value, ok := strings.Cut(record, "=")
-				if ok {
-					values[key] = value
-				}
+		for index, period := range windows {
+			if network.DeviceID(id) != period.ID || seconds <= float64(period.Start.UnixNano())/1e9 || seconds >= float64(period.End.UnixNano())/1e9 {
+				continue
 			}
-			if id == ids[0] {
-				expected := map[string]string{"radio.1.channel": "44", "radio.2.channel": "6", "radio.1.ieee_mode": "11naht40", "radio.2.ieee_mode": "11nght20", "radio.1.txpower": "12", "radio.2.txpower": "10"}
-				for slot := 1; slot <= 2; slot++ {
-					prefix := fmt.Sprintf("aaa.%d.", slot)
-					for suffix, value := range map[string]string{"wpa": "2", "br.devname": "br0.20", "wpa.1.pairwise": "CCMP", "wpa.key.1.mgmt": "WPA-PSK", "wpa.psk": string(secret)} {
-						expected[prefix+suffix] = value
-					}
-				}
-				configured[id] = configured[id] || liveRecordsMatch(values, expected)
-			} else {
-				expected := map[string]string{"switch.port.1.pvid": "20", "switch.port.1.poe": "shutdown", "switch.vlan.1.id": "1", "switch.vlan.2.id": "20", "switch.vlan.2.port.1.mode": "untagged", fmt.Sprintf("switch.port.%d.pvid", uplinks[id]): "1", fmt.Sprintf("switch.vlan.2.port.%d.mode", uplinks[id]): "tagged"}
-				configured[id] = configured[id] || liveRecordsMatch(values, expected)
+			if payload.Type == "setparam" {
+				r.t.Fatal("preview interval delivered setparam")
+			}
+			if payload.Type == "noop" {
+				noops[index] = true
 			}
 		}
-		access, uplink := false, false
-		for _, port := range payload.Ports {
-			if port.Index == 1 && port.Native == 20 && port.PoE == "off" {
-				access = true
-			}
-			if port.Index == uplinks[id] && port.Native == 1 && len(port.Tagged) == 1 && port.Tagged[0] == 20 {
-				uplink = true
-			}
+		if payload.Type != "setparam" {
+			continue
 		}
-		reflected[id] = reflected[id] || (access && uplink)
-		for _, radio := range payload.Radios {
-			if radio.Channel == 44 {
-				reflected[id] = true
+		for _, item := range expected {
+			if network.DeviceID(id) != item.ID || payload.Version != item.Version {
+				continue
 			}
+			management, err := configmap.Parse(payload.Management)
+			if err != nil {
+				r.t.Fatal("invalid delivered management map")
+			}
+			system, err := configmap.Parse(payload.System)
+			if err != nil {
+				r.t.Fatal("invalid delivered system map")
+			}
+			// Typed transport replaces only these connection and version metadata records.
+			if management["cfgversion"] != string(item.Version) || management["authkey"] != keys[id] || management["inform_url"] != "http://controller:8080/inform" {
+				r.t.Fatal("delivered connection metadata differs")
+			}
+			for _, key := range []string{"cfgversion", "authkey", "inform_url"} {
+				delete(management, key)
+				delete(item.Management, key)
+			}
+			if !maps.Equal(management, item.Management) || !maps.Equal(system, item.System) {
+				r.t.Fatal("full delivered maps changed omitted policy")
+			}
+			matched[string(item.ID)+":"+string(item.Version)] = true
 		}
 	}
 	for _, id := range ids {
-		if !adopted[id] || !configured[id] || !reflected[id] {
-			r.t.Fatalf("capture evidence incomplete for synthetic device %s: adoption=%t config=%t reflection=%t", id, adopted[id], configured[id], reflected[id])
+		if !adopted[id] {
+			r.t.Fatal("capture lacks adoption")
 		}
 	}
-	r.writeJSON("capture-summary.json", struct {
-		Messages                       int
-		Adopted, Configured, Reflected map[string]bool
-	}{count, adopted, configured, reflected})
-}
-
-func liveRecordsMatch(values, expected map[string]string) bool {
-	for key, value := range expected {
-		if values[key] != value {
-			return false
+	if len(matched) != len(expected) {
+		r.t.Fatal("capture lacks applied full maps")
+	}
+	for _, seen := range noops {
+		if !seen {
+			r.t.Fatal("capture lacks encrypted preview noop")
 		}
 	}
-	return true
+	r.writeJSON("capture-summary.json", struct{ Messages, AppliedMaps, PreviewNoops int }{count, len(matched), len(noops)})
 }
 
 func (r *liveRun) snapshot(id string) network.DeviceSnapshot {
