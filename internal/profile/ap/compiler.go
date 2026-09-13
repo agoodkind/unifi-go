@@ -161,6 +161,10 @@ func resolveWiFi(values configmap.Values, name string, capability profile.RadioC
 		return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
 	}
 	deviceName := values[prefix+"devname"]
+	owner, err := profile.MatchRecord(values, "wireless.", "devname", deviceName)
+	if err != nil || owner != prefix {
+		return profile.ResourceBinding{}, &network.ControlError{Code: network.BaselineUnusable}
+	}
 	aaa, err := profile.MatchRecord(values, "aaa.", "devname", deviceName)
 	if err != nil || aaa == "" || values[aaa+"ssid"] != name {
 		return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
@@ -178,27 +182,44 @@ func resolveWiFi(values configmap.Values, name string, capability profile.RadioC
 	if err != nil || bridge == "" {
 		return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
 	}
-	for _, member := range profile.RecordPrefixes(values, bridge+"port.") {
-		if values[member+"devname"] == deviceName {
-			prefixes = append(prefixes, member)
-		}
+	member, err := uniqueBridgeMember(values, deviceName)
+	if err != nil || member != "" && !strings.HasPrefix(member, bridge+"port.") {
+		return profile.ResourceBinding{}, &network.ControlError{Code: network.BaselineUnusable}
 	}
-	prefixes = append(prefixes, interfaceFilters(values, deviceName)...)
+	if member != "" {
+		prefixes = append(prefixes, member)
+	}
+	filters, err := interfaceFilters(values, deviceName)
+	if err != nil {
+		return profile.ResourceBinding{}, err
+	}
+	prefixes = append(prefixes, filters...)
 	return profile.ResourceBinding{Kind: "wifi", Identity: name, RadioID: capability.ID, Prefixes: prefixes}, nil
 }
 
-func interfaceFilters(values configmap.Values, deviceName string) []string {
+func interfaceFilters(values configmap.Values, deviceName string) ([]string, error) {
+	wirelessDevices := make(map[string]bool)
+	for _, prefix := range profile.RecordPrefixes(values, "wireless.") {
+		wirelessDevices[values[prefix+"devname"]] = true
+	}
 	var result []string
 	for _, command := range profile.RecordPrefixes(values, "ebtables.") {
 		words := strings.Fields(values[command+"cmd"])
+		interfaces := make(map[string]bool)
 		for index, word := range words {
-			if (word == "--in-interface" || word == "--out-interface") && index+1 < len(words) && words[index+1] == deviceName {
-				result = append(result, command)
-				break
+			if (word == "--in-interface" || word == "--out-interface") && index+1 < len(words) && wirelessDevices[words[index+1]] {
+				interfaces[words[index+1]] = true
 			}
 		}
+		if !interfaces[deviceName] {
+			continue
+		}
+		if len(interfaces) != 1 {
+			return nil, &network.ControlError{Code: network.BaselineUnusable}
+		}
+		result = append(result, command)
 	}
-	return result
+	return result, nil
 }
 
 func verifyBindings(stored, resolved []profile.ResourceBinding) error {

@@ -342,6 +342,7 @@ func (c *Controller) Queue(mac string, command Reply) error {
 			c.devices[mac] = previous
 			return &network.ControlError{Code: network.PersistenceFailed, Field: ""}
 		}
+		delete(c.awaiting, mac)
 	}
 	c.queues[mac] = append(c.queues[mac], command)
 	return nil

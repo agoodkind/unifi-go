@@ -331,8 +331,14 @@ func TestTypedControlIntegration(t *testing.T) {
 		}
 		tokenFile := filepath.Join(directory, family+".token")
 		writeTypedFixture(t, tokenFile, []byte(string(preview.Token)+"\n"))
-		if _, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", configFile, "--socket", socket, "--preview-token-file", tokenFile).CombinedOutput(); err != nil {
+		tokenApplyOutput, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", configFile, "--socket", socket, "--preview-token-file", tokenFile).CombinedOutput()
+		if err != nil {
 			t.Fatal("fresh executable token application failed")
+		}
+		for _, forbidden := range []string{secret, secretPath, key, storedHash, storedPlaintext, "desired_ap", "ssh_password"} {
+			if strings.Contains(string(tokenApplyOutput), forbidden) {
+				t.Fatal("token application output exposed credentials")
+			}
 		}
 		if _, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", configFile, "--socket", socket, "--dry-run", "--preview-token-file", tokenFile).CombinedOutput(); err == nil {
 			t.Fatal("fresh executable accepted conflicting preview flags")

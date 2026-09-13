@@ -83,6 +83,7 @@ func testPreviewTransaction(t *testing.T) {
 	t.Run("representation and restart", testPreviewRepresentationRestart)
 	t.Run("reported candidate", testPreviewReportedCandidate)
 	t.Run("unrequested SSH policy", testPreviewUnrequestedSSH)
+	t.Run("transport failure", testPreviewTransportFailure)
 	const key = "0123456789abcdef0123456789abcdef" // gitleaks:allow
 	const id network.DeviceID = "02:00:00:00:00:61"
 	directory := t.TempDir()
@@ -257,6 +258,23 @@ func testPreviewStaleInputs(t *testing.T) {
 				t.Fatal("stale preview delivered configuration")
 			}
 		})
+	}
+}
+
+func testPreviewTransportFailure(t *testing.T) {
+	fixture := newPreviewFixture(t)
+	preview, err := fixture.client.PreviewAP(t.Context(), previewTestID, fixture.config)
+	if err != nil {
+		t.Fatal("preview failed")
+	}
+
+	fixture.client = network.Dial(filepath.Join(t.TempDir(), "missing.sock"))
+	version, err := fixture.client.ApplyAPPreview(t.Context(), previewTestID, fixture.config, preview.Token)
+	if err == nil {
+		t.Fatal("transport failure was accepted")
+	}
+	if version != "" {
+		t.Fatalf("version = %q after transport failure", version)
 	}
 }
 

@@ -33,7 +33,7 @@ func (registry Registry) CompileAP(descriptor DeviceDescriptor, input Compilatio
 	}
 	param, err := registry.ap.Compile(descriptor, input, config, secrets)
 	if err != nil {
-		slog.Error("access point configuration compilation failed", "error", err)
+		slog.Error("access point configuration compilation failed", "err", &network.ControlError{Code: network.InvalidConfig})
 		return Compilation{}, fmt.Errorf("compile access point: %w", err)
 	}
 	return param, nil
@@ -49,7 +49,7 @@ func (registry Registry) CompileSwitch(descriptor DeviceDescriptor, input Compil
 	}
 	param, err := registry.switches.Compile(descriptor, input, config, secrets)
 	if err != nil {
-		slog.Error("switch configuration compilation failed", "error", err)
+		slog.Error("switch configuration compilation failed", "err", &network.ControlError{Code: network.InvalidConfig})
 		return Compilation{}, fmt.Errorf("compile switch: %w", err)
 	}
 	return param, nil

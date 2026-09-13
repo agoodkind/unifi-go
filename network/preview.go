@@ -29,7 +29,10 @@ func (client *Client) ApplyAPPreview(ctx context.Context, id DeviceID, config AP
 		return "", &ControlError{Code: PreviewStale}
 	}
 	response, err := client.call(ctx, controlRequest{Operation: "apply-ap", Device: id, AP: &config, PreviewToken: token})
-	return response.Version, err
+	if err != nil {
+		return "", err
+	}
+	return response.Version, nil
 }
 
 // ApplySwitchPreview applies switch policy only when its preview still matches.
@@ -38,7 +41,10 @@ func (client *Client) ApplySwitchPreview(ctx context.Context, id DeviceID, confi
 		return "", &ControlError{Code: PreviewStale}
 	}
 	response, err := client.call(ctx, controlRequest{Operation: "apply-switch", Device: id, Switch: &config, PreviewToken: token})
-	return response.Version, err
+	if err != nil {
+		return "", err
+	}
+	return response.Version, nil
 }
 
 func (client *Client) preview(ctx context.Context, request controlRequest) (ConfigPreview, error) {
