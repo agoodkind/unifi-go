@@ -468,6 +468,12 @@ func addWiFi(values configmap.Values, descriptor profile.DeviceDescriptor, bindi
 		if err := requireWiFiPolicy(wifi); err != nil {
 			return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, err
 		}
+	} else {
+		refreshed, err := refreshWiFiBinding(values, descriptor, *source)
+		if err != nil {
+			return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, err
+		}
+		source = &refreshed
 	}
 	wireless, aaa := profile.NextRecord(values, "wireless."), profile.NextRecord(values, "aaa.")
 	deviceName := availableInterface(values, capability.Interface)
@@ -626,11 +632,6 @@ func removeRadioInterface(values configmap.Values, radio, parent, deviceName str
 		}
 		replacement := values[prefix+"devname"]
 		values[radio+"devname"] = replacement
-		for _, virtual := range profile.RecordPrefixes(values, radio+"virtual.") {
-			if values[virtual+"devname"] == replacement {
-				profile.DeleteRecord(values, virtual)
-			}
-		}
 		return
 	}
 }
@@ -785,21 +786,45 @@ func reproducedRadioSetting(descriptor profile.DeviceDescriptor, requested netwo
 }
 
 func removeRadios(values configmap.Values, bindings []profile.ResourceBinding, effective, request network.APConfig) error {
-	if request.Radios.Present {
-		for _, binding := range bindings {
-			if binding.Kind != "radio" {
-				continue
-			}
-			if !slices.ContainsFunc(effective.Radios.Value, func(radio network.RadioConfig) bool { return string(radio.Band) == binding.Identity }) {
-				for _, wifi := range effective.Networks.Value {
-					if slices.Contains(wifi.Bands.Value, network.RadioBand(binding.Identity)) {
-						return fmt.Errorf("radios: removed radio still has a WLAN")
-					}
-				}
-				profile.DeleteRecord(values, binding.Prefixes[0])
+	if !request.Radios.Present {
+		return nil
+	}
+	for _, binding := range bindings {
+		if binding.Kind != "radio" {
+			continue
+		}
+		if slices.ContainsFunc(effective.Radios.Value, func(radio network.RadioConfig) bool { return string(radio.Band) == binding.Identity }) {
+			continue
+		}
+		if radioHasWireless(values, binding.Prefixes[0]) {
+			return fmt.Errorf("radios: removed radio still has a WLAN")
+		}
+		for _, wifi := range effective.Networks.Value {
+			if slices.Contains(wifi.Bands.Value, network.RadioBand(binding.Identity)) {
+				return fmt.Errorf("radios: removed radio still has a WLAN")
 			}
 		}
+		profile.DeleteRecord(values, binding.Prefixes[0])
 	}
 
 	return nil
+}
+
+func radioHasWireless(values configmap.Values, radioPrefix string) bool {
+	parent := values[radioPrefix+"phyname"]
+	for _, prefix := range profile.RecordPrefixes(values, "wireless.") {
+		if values[prefix+"parent"] == parent {
+			return true
+		}
+	}
+	return false
+}
+
+func refreshWiFiBinding(values configmap.Values, descriptor profile.DeviceDescriptor, binding profile.ResourceBinding) (profile.ResourceBinding, error) {
+	for _, radio := range descriptor.Radios {
+		if radio.ID == binding.RadioID {
+			return resolveWiFi(values, binding.Identity, radio)
+		}
+	}
+	return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
 }

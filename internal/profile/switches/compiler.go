@@ -141,6 +141,7 @@ func overlayPort(values configmap.Values, request, effective network.SwitchPortC
 		return nil
 	}
 	native, err := strconv.ParseUint(values[prefix+"pvid"], 10, 16)
+	oldNative := native
 	if request.NativeVLAN.Present {
 		native, err = uint64(request.NativeVLAN.Value), nil
 	}
@@ -158,6 +159,9 @@ func overlayPort(values configmap.Values, request, effective network.SwitchPortC
 		id, err := strconv.ParseUint(values[vlan+"id"], 10, 16)
 		if err != nil {
 			return &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+		}
+		if !request.TaggedVLANs.Present && id != oldNative && id != native {
+			continue
 		}
 		mode := "exclude"
 		if id == native {

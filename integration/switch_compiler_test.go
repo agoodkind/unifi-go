@@ -194,6 +194,24 @@ func TestSwitchCompilerFromNetworkServerFixture(t *testing.T) {
 		want["switch.port.2.status"] = "disabled"
 		assertComposition(t, result.Param, baseline.Management, want)
 	})
+	t.Run("native VLAN preserves unrelated membership mode", func(t *testing.T) {
+		custom := input
+		custom.Baseline.System = before.Clone()
+		custom.Baseline.System["switch.vlan.3.id"] = "30"
+		custom.Baseline.System["switch.vlan.3.mode"] = "tagged"
+		custom.Baseline.System["switch.vlan.3.status"] = "enabled"
+		custom.Baseline.System["switch.vlan.3.port.2.mode"] = "operator-mode"
+		req := network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{{Index: 2, NativeVLAN: network.Supplied(network.VLANID(1))}, {Index: 3}, {Index: 4}, {Index: 5}})}
+		result, err := registry.CompileSwitch(descriptor, custom, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := custom.Baseline.System.Clone()
+		want["switch.port.2.pvid"] = "1"
+		want["switch.vlan.1.port.2.mode"] = "untagged"
+		want["switch.vlan.2.port.2.mode"] = "exclude"
+		assertComposition(t, result.Param, baseline.Management, want)
+	})
 	snapshot, err := switches.New().Decode(report)
 	if err != nil {
 		t.Fatal(err)

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"goodkind.io/unifi-go/internal/configmap"
@@ -287,6 +288,68 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 		result.Param.Management["operator.unmodeled"] = "changed"
 		if config.Networks.Value[0].Bands.Value[0] != network.Band5GHz || baseline.Management["operator.unmodeled"] != "retain-management" {
 			t.Fatal("result aliases nested input")
+		}
+	})
+	t.Run("radio removal rejects unprojected WLAN", func(t *testing.T) {
+		prior := network.APConfig{Radios: network.Supplied([]network.RadioConfig{{Band: network.Band2GHz}})}
+		unprojected := profile.CompilationInput{Baseline: baseline, AP: &prior}
+		req := network.APConfig{Radios: network.Supplied([]network.RadioConfig{})}
+		if _, err := registry.CompileAP(descriptor, unprojected, req, nil); err == nil {
+			t.Fatal("radio removal accepted retained unprojected WLAN references")
+		}
+		if !maps.Equal(baseline.System, before) {
+			t.Fatal("rejected radio removal mutated baseline")
+		}
+	})
+	t.Run("primary removal preserves retained virtual subtree", func(t *testing.T) {
+		retained := input
+		retained.Baseline.System = before.Clone()
+		virtual := "radio.2.virtual.9."
+		retained.Baseline.System[virtual+"devname"] = "ath2"
+		retained.Baseline.System[virtual+"status"] = "enabled"
+		retained.Baseline.System[virtual+"operator.unmodeled"] = "retain-virtual"
+		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "fixture-wifi"}, {Name: "guest"}})}
+		result, err := registry.CompileAP(descriptor, retained, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Param.System["radio.2.devname"] != "ath2" {
+			t.Fatal("primary reference did not move to retained interface")
+		}
+		for key, value := range retained.Baseline.System {
+			if strings.HasPrefix(key, virtual) && result.Param.System[key] != value {
+				t.Fatal("primary promotion erased retained virtual-radio policy")
+			}
+		}
+	})
+	t.Run("VLAN move and band addition preserve member policy", func(t *testing.T) {
+		moved := input
+		moved.Baseline.System = before.Clone()
+		moved.Baseline.System["bridge.2.port.2.operator.unmodeled"] = "retain-member"
+		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "fixture-wifi"}, {Name: "legacy", VLAN: network.Cleared[network.VLANID](), Bands: network.Supplied([]network.RadioBand{network.Band2GHz, network.Band5GHz})}, {Name: "guest"}})}
+		result, err := registry.CompileAP(descriptor, moved, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		members := 0
+		for _, binding := range result.Bindings {
+			if binding.Kind != "wifi" || binding.Identity != "legacy" {
+				continue
+			}
+			if result.Param.System[binding.Prefixes[1]+"br.devname"] != "br0" {
+				t.Fatal("added band retained the obsolete VLAN")
+			}
+			for _, prefix := range binding.Prefixes {
+				if strings.HasPrefix(prefix, "bridge.") {
+					members++
+					if result.Param.System[prefix+"operator.unmodeled"] != "retain-member" {
+						t.Fatal("combined VLAN move and band addition lost member policy")
+					}
+				}
+			}
+		}
+		if members != 2 {
+			t.Fatal("combined request did not bind both WLAN members")
 		}
 	})
 	snapshot, err := ap.New().Decode(report)
