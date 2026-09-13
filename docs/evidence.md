@@ -103,29 +103,46 @@ It does not generate clients or simulate forwarding or electrical power.
 Results from this derivative are
 patched-emulator evidence.
 
-The September 13 live flow used a U6EXT AP, an S216150 switch reporting 18 ports,
-and an S224250 switch reporting 26 ports. Each completed set-adopt. The public client
-imported complete reference bodies and explicit projections through the actual
-controller socket, then previewed and applied one policy change with an opaque token.
+The September 13 live flow used one dual-radio AP and two switch inventories reporting
+different port counts. It later added and fully configured a second eligible AP.
+Each device completed set-adopt. The public client imported complete reference bodies
+and explicit projections through the actual controller socket. It previewed and
+applied policy through the same transaction used by the executable resource commands.
 
-The combined recording contains 100 decrypted messages. Six preview intervals
-returned encrypted noops. Six delivered management/system map pairs matched their
-complete expected contents before and after restart. Unknown records and omitted
-policy survived, including an AP peer whose BSS Transition key remained absent.
+The first AP copied a dual-radio WiFi network through `wifi add` without a device
+selector. The decrypted reply retained both radio targets, distinct source and copied
+credentials, and unchanged radio policy. A second mutation stopped while the copied
+configuration was pending. Later `wifi set`, `radio set`, and `port set` changes reached
+matching reports. An injected mismatched report version stopped the next mutation
+without changing state or queueing work. A deliberate full Apply restored ownership.
+The per-network legacy BSS Transition disable and peer settings survived every change.
 
-Restart validation paused the emulators, queued a marked command, and restarted
-the controller. Registering another synthetic identity forced the restarted process
-to save its loaded device records. Keys, complete baselines, bindings, and desired
-configuration survived that rewrite; observations and queues did not survive restart. Fresh informs restored
-snapshots without replaying the marked command. An unrelated second change in each
-family retained the first change. The recorder reattached after the controller
-restarted; both recordings remain preserved alongside their combined capture.
+The combined recording contains 254 decrypted messages. Seven intervals returned
+encrypted noops. Ten delivered management and system map pairs matched expectations
+derived from the original imported maps plus only the requested resource changes.
+Those expectations never read the controller's compiled or persisted maps. Unknown
+records and omitted policy survived. Adding the second AP made omitted-device
+selection fail without choosing either AP.
+
+Restart validation paused the emulators and queued a typed radio change without its
+matching authenticated report. Keys, complete baselines, bindings, desired
+configuration, and the pending desired version survived restart. Observations, the
+queue, and acknowledgement state did not. Two fresh informs received no replay. A
+deliberate reapply of the persisted desired configuration succeeded before the device
+reported that version, which proves the old acknowledgement state cleared. After the
+matching report, a new radio mutation also succeeded. An unrelated second change in
+each family retained the first change. The recorder reattached after the controller
+restarted; both recordings remain beside their combined capture.
 Private evidence preserves captures, exact image identities, patch copies,
 operation results, and a SHA-256 manifest.
 
 Subprocess checks sent SIGINT after resource creation and SIGTERM while emulators
 were paused. Both subprocesses failed through cleanup, finalized captures, preserved
 manifests, and left no generated containers or network.
+
+The required physical temporary WiFi removal and re-addition was not run because that
+specific disruptive action still requires operator approval. Existing read-only
+physical evidence remains separate from the emulator acceptance.
 
 ## Automated fixture and socket validation
 

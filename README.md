@@ -89,7 +89,44 @@ An omitted collection preserves every member; an empty collection removes its ty
 members. Unknown records survive unless their owning resource is removed.
 New networks and ports require explicit policy; missing required fields are rejected.
 
-## Configure an access point
+## Add or change one WiFi network
+
+Use the resource commands for ordinary WiFi changes. First list the non-secret
+desired networks:
+
+```sh
+docker compose exec inform /unifi-go wifi list \
+    --socket=/runtime/control.sock --device="$DEVICE_MAC"
+```
+
+Create owner-only, one-line name files and an owner-only password file in the mounted
+state directory. Copy one existing network's complete policy, change only its name
+and password, and omit `--device` only when exactly one access point is eligible:
+
+```sh
+docker compose exec inform /unifi-go wifi add \
+    --socket=/runtime/control.sock \
+    --name-file=/state/new-wifi-name \
+    --password-file=/state/new-wifi-password \
+    --copy-from-file=/state/source-wifi-name
+```
+
+To disable Basic Service Set (BSS) Transition for one legacy network, save a WiFi
+resource with the same name and `"bss_transition":"disabled"`. Apply it without
+changing peer networks:
+
+```sh
+docker compose exec inform /unifi-go wifi set \
+    --socket=/runtime/control.sock --device="$DEVICE_MAC" \
+    --current-name-file=/state/legacy-wifi-name --file=/state/legacy-wifi.json
+```
+
+Use one active controller for each device. A resource change stops while another
+configuration is pending or when the reported version has drifted. Select controller
+ownership and run a deliberate full Apply to reconcile drift. Resource list output
+omits secrets.
+
+## Reconcile an access point
 
 Create a private configuration file in the mounted state directory. Store the WiFi
 password separately without a trailing newline and restrict both files to mode 0600.

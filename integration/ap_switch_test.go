@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 	"github.com/jamesbraid/unifi-emu/inform"
 
 	"goodkind.io/unifi-go/internal/configmap"
+	"goodkind.io/unifi-go/internal/controller"
 	"goodkind.io/unifi-go/network"
 )
 
@@ -36,6 +38,7 @@ type liveRun struct {
 	root, dir, name, controller string
 	commands                    int
 	interrupted                 context.Context
+	oracles                     map[network.DeviceID]liveExpectation
 }
 
 type liveModel struct {
@@ -43,6 +46,17 @@ type liveModel struct {
 	Type   string         `json:"type"`
 	Ports  []inform.Port  `json:"ports"`
 	Radios []inform.Radio `json:"radios"`
+}
+
+func liveFiveGHzRadio(t *testing.T, model liveModel) string {
+	t.Helper()
+	for _, radio := range model.Radios {
+		if radio.Radio == "na" {
+			return radio.Name
+		}
+	}
+	t.Fatal("selected AP lacks a 5 GHz radio")
+	return ""
 }
 
 // TestLiveAPSwitch runs actual containers; ordinary checks explicitly skip it.
@@ -65,7 +79,7 @@ func TestLiveAPSwitch(t *testing.T) {
 	t.Cleanup(stop)
 	ctx, cancel := context.WithTimeout(signalContext, 12*time.Minute)
 	defer cancel()
-	r := &liveRun{t: t, ctx: ctx, root: root, dir: dir, name: filepath.Base(dir), interrupted: signalContext}
+	r := &liveRun{t: t, ctx: ctx, root: root, dir: dir, name: filepath.Base(dir), interrupted: signalContext, oracles: make(map[network.DeviceID]liveExpectation)}
 	r.controller = r.name + "-controller"
 	t.Logf("private evidence: %s", dir)
 	t.Cleanup(r.finish)
@@ -113,12 +127,18 @@ func TestLiveAPSwitch(t *testing.T) {
 		})
 	}
 	r.configure(models, ids)
+	r.interruptWhilePaused(emulators)
+	r.resourceFlow(models, ids, emulators)
 	r.write("devices-before.json", r.cli("devices"))
 	r.cli("clients", "--device="+ids[0])
 	for _, id := range ids[1:] {
 		r.cli("ports", "--device="+id)
 	}
-	r.restart(ids, emulators)
+	r.restart(models, ids, emulators)
+	secondID, secondEmulator := r.addSecondAP(models[0], len(ids))
+	ids = append(ids, secondID)
+	emulators = append(emulators, secondEmulator)
+	r.assertAmbiguousAPSelection()
 	r.command("docker", "stop", "-t", "5", capture)
 	r.command("mergecap", "-w", filepath.Join(r.dir, "combined.pcap"), filepath.Join(r.dir, "traffic-before-restart.pcap"), filepath.Join(r.dir, "traffic.pcap"))
 	r.verifyCapture(ids, models)
@@ -126,6 +146,16 @@ func TestLiveAPSwitch(t *testing.T) {
 	if os.Getenv("UNIFI_LIVE_CHILD_PHASE") == "" {
 		r.verifyInterruptions()
 	}
+}
+
+func (r *liveRun) interruptWhilePaused(emulators []string) {
+	if os.Getenv("UNIFI_LIVE_CHILD_PHASE") != "paused" {
+		return
+	}
+	for _, name := range emulators {
+		r.command("docker", "pause", name)
+	}
+	r.interruptCheckpoint("paused")
 }
 
 func (r *liveRun) interruptCheckpoint(phase string) {
@@ -208,7 +238,7 @@ func (r *liveRun) verifyInterruptions() {
 			r.t.Fatal("interrupted capture was not finalized")
 		}
 		name := filepath.Base(childDir)
-		for _, suffix := range []string{"-controller", "-capture", "-device-0", "-device-1", "-device-2"} {
+		for _, suffix := range []string{"-controller", "-capture", "-device-0", "-device-1", "-device-2", "-device-3"} {
 			if len(bytes.TrimSpace(r.command("docker", "ps", "-a", "--filter", "name=^/"+name+suffix+"$", "--format", "{{.Names}}"))) != 0 {
 				r.t.Fatal("interrupted container remains")
 			}
@@ -230,7 +260,7 @@ func (r *liveRun) finish() {
 	if r.t.Failed() {
 		r.write("result.txt", []byte("FAIL: live run failed or was interrupted; partial evidence preserved\n"))
 	}
-	for _, suffix := range []string{"-device-0", "-device-1", "-device-2", "-capture", "-controller"} {
+	for _, suffix := range []string{"-device-0", "-device-1", "-device-2", "-device-3", "-capture", "-controller"} {
 		name := r.name + suffix
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		state, err := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.State.Paused}}", name).CombinedOutput()
@@ -381,9 +411,18 @@ func (r *liveRun) configure(models []liveModel, ids []string) {
 			param.System["radio.1.channel"] = "44"
 			param.System["radio.2.ieee_mode"] = "11nght20"
 			param.System["radio.1.txpower"], param.System["radio.2.txpower"] = "12", "10"
-			// The second captured radio becomes a synthetic peer with absent BSS policy.
-			param.System["wireless.2.ssid"], param.System["aaa.2.ssid"] = "synthetic-peer", "synthetic-peer"
-			delete(param.System, "aaa.2.bss_transition")
+			// The added records create synthetic legacy policy without changing the captured dual-radio WLAN.
+			for key, value := range param.System.Clone() {
+				for _, pair := range [][2]string{{"wireless.2.", "wireless.3."}, {"aaa.2.", "aaa.3."}, {"netconf.4.", "netconf.7."}} {
+					if strings.HasPrefix(key, pair[0]) {
+						param.System[pair[1]+strings.TrimPrefix(key, pair[0])] = value
+					}
+				}
+			}
+			param.System["wireless.3.ssid"], param.System["aaa.3.ssid"] = "synthetic-legacy", "synthetic-legacy"
+			param.System["wireless.3.devname"], param.System["aaa.3.devname"], param.System["netconf.7.devname"] = "ath2", "ath2", "ath2"
+			param.System["bridge.2.port.4.devname"] = "ath2"
+			param.System["aaa.3.bss_transition"] = "disabled"
 		} else {
 			// Captured switch replies omit these required synthetic port identity records.
 			for port := 2; port <= 5; port++ {
@@ -402,24 +441,449 @@ func (r *liveRun) configure(models []liveModel, ids []string) {
 		}
 		baseline := network.BaselineImport{Config: network.Config{Version: "unifi-go-1", Management: management, System: system}}
 		if index == 0 {
+			radioIDs := make([]network.RadioID, 0, len(models[index].Radios))
+			radios := make([]network.RadioConfig, 0, len(models[index].Radios))
+			var legacyRadio network.RadioID
+			for _, radio := range models[index].Radios {
+				band := network.Band5GHz
+				if radio.Radio == "ng" {
+					band = network.Band2GHz
+					legacyRadio = network.RadioID(radio.Name)
+				}
+				radioIDs = append(radioIDs, network.RadioID(radio.Name))
+				radios = append(radios, network.RadioConfig{ID: network.RadioID(radio.Name), Band: band})
+			}
 			baseline.AP = &network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
-				{Name: "fixture-wifi", Bands: network.Supplied([]network.RadioBand{network.Band5GHz})},
-				{Name: "synthetic-peer", Bands: network.Supplied([]network.RadioBand{network.Band2GHz})},
-			})}
+				{Name: "fixture-wifi", RadioIDs: network.Supplied(radioIDs)},
+				{Name: "synthetic-legacy", RadioIDs: network.Supplied([]network.RadioID{legacyRadio})},
+			}), Radios: network.Supplied(radios)}
 		} else {
 			baseline.Switch = &network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{{Index: 2}, {Index: 3}, {Index: 4}, {Index: 5}})}
 		}
 		r.writeJSON(fmt.Sprintf("baseline-%d.json", index), baseline)
 	}
-	r.socketOperations("initial")
+	r.loadOracleBaselines(ids)
+	r.socketOperations("initial", models, ids)
 }
 
-func (r *liveRun) socketOperations(phase string) {
+func (r *liveRun) resourceFlow(models []liveModel, ids, emulators []string) {
+	const sourceName = "fixture-wifi"
+	const destinationName = "resource-copy"
+	apID := ids[0]
+	beforeAdd := r.oracle(apID)
+	r.write("resource-name", []byte(destinationName+"\n"))
+	r.write("resource-source", []byte(sourceName+"\n"))
+	password := make([]byte, 24)
+	if _, err := rand.Read(password); err != nil {
+		r.t.Fatal(err)
+	}
+	r.write("resource-password", []byte(hex.EncodeToString(password)))
+	r.command("docker", "pause", emulators[0])
+	added := decodeLiveQueuedVersion(r.t, r.cli("wifi", "add", "--name-file=/state/resource-name", "--password-file=/state/resource-password", "--copy-from-file=/state/resource-source"))
+	r.oracleAddWiFi(apID, models[0], sourceName, destinationName, hex.EncodeToString(password))
+	afterAdd := r.recordOracle("resource-add", apID, added)
+	assertLiveWiFiCopy(r.t, beforeAdd.System, afterAdd.System, sourceName, destinationName)
+	r.writeJSON("resource-set.json", network.WiFiNetwork{Name: destinationName, BSSTransition: network.Supplied(network.BSSTransitionDisabled)})
+	stateBeforePending := r.readState()
+	output, err := r.cliResult("wifi", "set", "--current-name="+destinationName, "--file=/state/resource-set.json")
+	if err == nil || !bytes.Contains(output, []byte(string(network.ConfigurationPending))) {
+		r.t.Fatal("second resource mutation was not rejected while configuration was pending")
+	}
+	if !bytes.Equal(stateBeforePending, r.readState()) || r.pending(apID) != 1 {
+		r.t.Fatal("pending resource rejection changed state or queue")
+	}
+	r.command("docker", "unpause", emulators[0])
+	r.waitVersion(apID, added)
+
+	setVersion := decodeLiveQueuedVersion(r.t, r.cli("wifi", "set", "--device="+apID, "--current-name="+destinationName, "--file=/state/resource-set.json"))
+	r.oracleSetBSS(apID, destinationName, string(network.BSSTransitionDisabled))
+	afterSet := r.recordOracle("resource-wifi-set", apID, setVersion)
+	assertLiveBSSPolicy(r.t, afterSet.System, sourceName, destinationName, "synthetic-legacy")
+	r.waitVersion(apID, setVersion)
+
+	var fiveGHzRadio network.RadioID
+	for _, radio := range models[0].Radios {
+		if radio.Radio == "na" {
+			fiveGHzRadio = network.RadioID(radio.Name)
+		}
+	}
+	if fiveGHzRadio == "" {
+		r.t.Fatal("selected AP lacks a 5 GHz radio")
+	}
+	r.writeJSON("resource-radio.json", network.RadioConfig{ID: fiveGHzRadio, Channel: network.Supplied(uint16(157))})
+	radioVersion := decodeLiveQueuedVersion(r.t, r.cli("radio", "set", "--device="+apID, "--file=/state/resource-radio.json"))
+	r.oracleSetRadio(apID, string(fiveGHzRadio), 157)
+	r.recordOracle("resource-radio-set", apID, radioVersion)
+	r.waitVersion(apID, radioVersion)
+
+	r.writeJSON("resource-port.json", network.SwitchPortConfig{Index: 3, Enabled: network.Supplied(false)})
+	portVersion := decodeLiveQueuedVersion(r.t, r.cli("port", "set", "--device="+ids[1], "--file=/state/resource-port.json"))
+	r.oracleSetPort(ids[1], 3, false)
+	r.recordOracle("resource-port-set", ids[1], portVersion)
+	r.waitVersion(ids[1], portVersion)
+
+	r.writeJSON("synthetic-drift.json", network.Command{Name: "synthetic-set-report-version", Parameters: map[string]json.RawMessage{
+		"cfgversion": json.RawMessage(`"synthetic-drift"`),
+	}})
+	r.cli("command", "--device="+apID, "--file=/state/synthetic-drift.json")
+	r.waitVersion(apID, "synthetic-drift")
+	stateBeforeDrift := r.readState()
+	r.writeJSON("resource-drift-radio.json", network.RadioConfig{ID: fiveGHzRadio, Channel: network.Supplied(uint16(44))})
+	output, err = r.cliResult("radio", "set", "--device="+apID, "--file=/state/resource-drift-radio.json")
+	if err == nil || !bytes.Contains(output, []byte(string(network.ConfigurationDrift))) {
+		r.t.Fatal("resource mutation was not rejected after reported drift")
+	}
+	if !bytes.Equal(stateBeforeDrift, r.readState()) || r.pending(apID) != 0 {
+		r.t.Fatal("drift rejection changed state or queue")
+	}
+	current := r.persistedDevice(apID)
+	if current.DesiredAP == nil {
+		r.t.Fatal("persisted AP projection is unavailable for reconciliation")
+	}
+	r.writeJSON("resource-reconcile-ap.json", current.DesiredAP)
+	reconciled := decodeLiveQueuedVersion(r.t, r.cli("apply", "ap", "--device="+apID, "--file=/state/resource-reconcile-ap.json"))
+	if reconciled != radioVersion {
+		r.t.Fatal("full reconciliation changed unchanged desired policy")
+	}
+	r.waitVersion(apID, reconciled)
+}
+
+func decodeLiveQueuedVersion(t *testing.T, body []byte) network.ConfigVersion {
+	t.Helper()
+	var queued struct {
+		Version network.ConfigVersion `json:"version"`
+	}
+	if err := json.Unmarshal(body, &queued); err != nil || queued.Version == "" {
+		t.Fatal("resource command omitted a queued version")
+	}
+	return queued.Version
+}
+
+func (r *liveRun) readState() []byte {
+	body, err := os.ReadFile(filepath.Join(r.dir, "devices.json"))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return body
+}
+
+func (r *liveRun) persistedDevice(id string) controller.Device {
+	var devices []controller.Device
+	if err := json.Unmarshal(r.readState(), &devices); err != nil {
+		r.t.Fatal("invalid persisted controller state")
+	}
+	for _, device := range devices {
+		if device.MAC == id {
+			return device
+		}
+	}
+	r.t.Fatal("persisted device unavailable")
+	return controller.Device{}
+}
+
+func (r *liveRun) loadOracleBaselines(ids []string) {
+	for index, id := range ids {
+		r.loadOracleBaseline(index, id)
+	}
+}
+
+func (r *liveRun) loadOracleBaseline(index int, id string) {
+	body, err := os.ReadFile(filepath.Join(r.dir, fmt.Sprintf("baseline-%d.json", index)))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	var baseline network.BaselineImport
+	if err := json.Unmarshal(body, &baseline); err != nil {
+		r.t.Fatal("invalid oracle baseline")
+	}
+	management, err := configmap.Parse(baseline.Config.Management)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	system, err := configmap.Parse(baseline.Config.System)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	deviceID := network.DeviceID(id)
+	r.oracles[deviceID] = liveExpectation{ID: deviceID, Management: management, System: system}
+}
+
+func (r *liveRun) oracle(id string) liveExpectation {
+	expected, exists := r.oracles[network.DeviceID(id)]
+	if !exists {
+		r.t.Fatal("independent baseline oracle unavailable")
+	}
+	expected.Management = expected.Management.Clone()
+	expected.System = expected.System.Clone()
+	return expected
+}
+
+func (r *liveRun) saveOracle(expected liveExpectation) {
+	r.oracles[expected.ID] = liveExpectation{
+		ID: expected.ID, Version: expected.Version,
+		Management: expected.Management.Clone(), System: expected.System.Clone(),
+	}
+}
+
+func (r *liveRun) recordOracle(label, id string, version network.ConfigVersion) liveExpectation {
+	expected := r.oracle(id)
+	expected.Version = version
+	r.saveOracle(expected)
+	r.writeJSON("expected-"+label+".json", expected)
+	return expected
+}
+
+func (r *liveRun) oracleSetBSS(id, name, value string) {
+	expected := r.oracle(id)
+	count := 0
+	for _, prefix := range oracleRecordPrefixes(expected.System, "aaa.") {
+		if expected.System[prefix+"ssid"] == name {
+			expected.System[prefix+"bss_transition"] = value
+			count++
+		}
+	}
+	if count == 0 {
+		r.t.Fatal("oracle WiFi authentication record unavailable")
+	}
+	r.saveOracle(expected)
+}
+
+func (r *liveRun) oracleSetRadio(id, radioID string, channel uint16) {
+	expected := r.oracle(id)
+	prefix := oracleMatchRecord(r.t, expected.System, "radio.", "phyname", radioID)
+	expected.System[prefix+"channel"] = strconv.Itoa(int(channel))
+	r.saveOracle(expected)
+}
+
+func (r *liveRun) oracleSetPort(id string, index uint16, enabled bool) {
+	expected := r.oracle(id)
+	status := "disabled"
+	if enabled {
+		status = "enabled"
+	}
+	expected.System[fmt.Sprintf("switch.port.%d.status", index)] = status
+	r.saveOracle(expected)
+}
+
+func (r *liveRun) oracleAddWiFi(id string, model liveModel, sourceName, destinationName, password string) {
+	expected := r.oracle(id)
+	radios := slices.Clone(model.Radios)
+	slices.SortFunc(radios, func(left, right inform.Radio) int { return strings.Compare(left.Name, right.Name) })
+	for _, radio := range radios {
+		sourceWireless := ""
+		for _, prefix := range oracleRecordPrefixes(expected.System, "wireless.") {
+			if expected.System[prefix+"ssid"] == sourceName && expected.System[prefix+"parent"] == radio.Name {
+				if sourceWireless != "" {
+					r.t.Fatal("oracle source WiFi is ambiguous")
+				}
+				sourceWireless = prefix
+			}
+		}
+		if sourceWireless == "" {
+			r.t.Fatal("oracle source WiFi is unavailable")
+		}
+		oldDevice := expected.System[sourceWireless+"devname"]
+		sourceAAA := oracleMatchRecord(r.t, expected.System, "aaa.", "devname", oldDevice)
+		wireless := oracleNextRecord(expected.System, "wireless.")
+		aaa := oracleNextRecord(expected.System, "aaa.")
+		deviceName := oracleAvailableInterface(expected.System, radio.Name)
+		references := map[string]string{oldDevice: deviceName, radio.Name: radio.Name}
+		oracleCopyRecord(expected.System, sourceWireless, wireless, references)
+		oracleCopyRecord(expected.System, sourceAAA, aaa, references)
+
+		if netconf := oracleOptionalMatchRecord(r.t, expected.System, "netconf.", "devname", oldDevice); netconf != "" {
+			oracleCopyRecord(expected.System, netconf, oracleNextRecord(expected.System, "netconf."), references)
+		}
+		bridgeMember := oracleBridgeMember(r.t, expected.System, oldDevice)
+		if bridgeMember != "" {
+			head, _, _ := strings.Cut(bridgeMember, "port.")
+			oracleCopyRecord(expected.System, bridgeMember, oracleNextRecord(expected.System, head+"port."), references)
+		}
+		for _, filter := range oracleRecordPrefixes(expected.System, "ebtables.") {
+			if !oracleCommandReferences(expected.System[filter+"cmd"], oldDevice) {
+				continue
+			}
+			target := oracleNextRecord(expected.System, "ebtables.")
+			oracleCopyRecord(expected.System, filter, target, references)
+			expected.System[target+"cmd"] = strings.ReplaceAll(expected.System[target+"cmd"], oldDevice, deviceName)
+		}
+
+		expected.System[wireless+"ssid"], expected.System[aaa+"ssid"] = destinationName, destinationName
+		expected.System[wireless+"devname"], expected.System[aaa+"devname"] = deviceName, deviceName
+		expected.System[wireless+"parent"], expected.System[aaa+"wpa.psk"] = radio.Name, password
+		radioPrefix := oracleMatchRecord(r.t, expected.System, "radio.", "phyname", radio.Name)
+		virtual := oracleNextRecord(expected.System, radioPrefix+"virtual.")
+		expected.System[virtual+"devname"], expected.System[virtual+"mode"], expected.System[virtual+"status"] = deviceName, "master", "enabled"
+	}
+	r.saveOracle(expected)
+}
+
+func oracleRecordPrefixes(values configmap.Values, namespace string) []string {
+	var prefixes []string
+	for key := range values {
+		suffix, found := strings.CutPrefix(key, namespace)
+		if !found {
+			continue
+		}
+		number, _, found := strings.Cut(suffix, ".")
+		if !found {
+			continue
+		}
+		index, err := strconv.Atoi(number)
+		if err == nil && index > 0 {
+			prefixes = append(prefixes, namespace+number+".")
+		}
+	}
+	slices.Sort(prefixes)
+	return slices.Compact(prefixes)
+}
+
+func oracleNextRecord(values configmap.Values, namespace string) string {
+	prefixes := oracleRecordPrefixes(values, namespace)
+	for index := 1; ; index++ {
+		candidate := fmt.Sprintf("%s%d.", namespace, index)
+		if !slices.Contains(prefixes, candidate) {
+			return candidate
+		}
+	}
+}
+
+func oracleCopyRecord(values configmap.Values, source, destination string, references map[string]string) {
+	before := values.Clone()
+	for key, value := range before {
+		suffix, found := strings.CutPrefix(key, source)
+		if !found {
+			continue
+		}
+		if suffix == "devname" || suffix == "parent" || suffix == "ssid" || suffix == "br.devname" {
+			if replacement, exists := references[value]; exists {
+				value = replacement
+			}
+		}
+		values[destination+suffix] = value
+	}
+}
+
+func oracleOptionalMatchRecord(t *testing.T, values configmap.Values, namespace, field, value string) string {
+	t.Helper()
+	match := ""
+	for _, prefix := range oracleRecordPrefixes(values, namespace) {
+		if values[prefix+field] != value {
+			continue
+		}
+		if match != "" {
+			t.Fatal("oracle record is ambiguous")
+		}
+		match = prefix
+	}
+	return match
+}
+
+func oracleMatchRecord(t *testing.T, values configmap.Values, namespace, field, value string) string {
+	t.Helper()
+	match := oracleOptionalMatchRecord(t, values, namespace, field, value)
+	if match == "" {
+		t.Fatal("oracle record is unavailable")
+	}
+	return match
+}
+
+func oracleBridgeMember(t *testing.T, values configmap.Values, deviceName string) string {
+	t.Helper()
+	match := ""
+	for _, bridge := range oracleRecordPrefixes(values, "bridge.") {
+		for _, member := range oracleRecordPrefixes(values, bridge+"port.") {
+			if values[member+"devname"] != deviceName {
+				continue
+			}
+			if match != "" {
+				t.Fatal("oracle bridge member is ambiguous")
+			}
+			match = member
+		}
+	}
+	return match
+}
+
+func oracleAvailableInterface(values configmap.Values, physical string) string {
+	for index := 0; ; index++ {
+		candidate := fmt.Sprintf("ath%d", index)
+		suffix := strings.TrimPrefix(physical, "wifi")
+		if suffix != physical && suffix != "" {
+			if _, err := strconv.ParseUint(suffix, 10, 32); err == nil {
+				candidate = fmt.Sprintf("%sap%d", physical, index)
+			}
+		}
+		used := false
+		for key, value := range values {
+			if strings.HasSuffix(key, ".devname") && value == candidate {
+				used = true
+				break
+			}
+		}
+		if !used {
+			return candidate
+		}
+	}
+}
+
+func oracleCommandReferences(command, deviceName string) bool {
+	return slices.Contains(strings.Fields(command), deviceName)
+}
+
+func (r *liveRun) waitVersion(id string, version network.ConfigVersion) {
+	r.until("reported configuration version", func() bool {
+		return r.snapshot(id).ReportedConfigVersion == version
+	})
+}
+
+func (r *liveRun) pending(id string) int {
+	return r.status(id).Pending
+}
+
+func (r *liveRun) status(id string) controller.Status {
+	var statuses []controller.Status
+	if err := json.Unmarshal(r.cli("status"), &statuses); err != nil {
+		r.t.Fatal("invalid status response")
+	}
+	for _, status := range statuses {
+		if status.MAC == id {
+			return status
+		}
+	}
+	r.t.Fatal("device status unavailable")
+	return controller.Status{}
+}
+
+func (r *liveRun) socketOperations(phase string, models []liveModel, ids []string) {
 	if err := os.Chmod(filepath.Join(r.dir, "live-test"), 0o700); err != nil {
 		r.t.Fatal(err)
 	}
 	r.command("docker", "exec", "-e", "UNIFI_LIVE_SOCKET_PHASE="+phase, r.controller,
 		"/state/live-test", "-test.run=^TestLiveSocketOperations$", "-test.v", "-test.timeout=4m")
+	for index, id := range ids {
+		var applied struct {
+			ID      network.DeviceID
+			Version network.ConfigVersion
+		}
+		body, err := os.ReadFile(filepath.Join(r.dir, fmt.Sprintf("applied-%s-%d.json", phase, index)))
+		if err != nil || json.Unmarshal(body, &applied) != nil || applied.ID != network.DeviceID(id) || applied.Version == "" {
+			r.t.Fatal("live applied result unavailable")
+		}
+		if phase == "initial" {
+			if models[index].Type == "uap" {
+				r.oracleSetBSS(id, "fixture-wifi", string(network.BSSTransitionEnabled))
+				r.oracleSetBSS(id, "synthetic-legacy", string(network.BSSTransitionDisabled))
+			} else {
+				r.oracleSetPort(id, 2, false)
+			}
+		} else if models[index].Type == "uap" {
+			r.oracleSetRadio(id, liveFiveGHzRadio(r.t, models[index]), 44)
+		} else {
+			r.oracleSetPort(id, 4, false)
+		}
+		r.recordOracle(fmt.Sprintf("%s-%d", phase, index), id, applied.Version)
+	}
 }
 
 // TestLiveSocketOperations runs the public client inside the isolated controller container.
@@ -455,17 +919,30 @@ func TestLiveSocketOperations(t *testing.T) {
 			t.Fatal(err)
 		}
 		apRequest := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
-			{Name: "fixture-wifi", BSSTransition: network.Supplied(network.BSSTransitionDisabled)},
-			{Name: "synthetic-peer"},
+			{Name: "fixture-wifi", BSSTransition: network.Supplied(network.BSSTransitionEnabled)},
+			{Name: "synthetic-legacy", BSSTransition: network.Supplied(network.BSSTransitionDisabled)},
 		})}
 		switchRequest := network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{
 			{Index: 2, Enabled: network.Supplied(false)}, {Index: 3}, {Index: 4}, {Index: 5},
 		})}
 		if phase == "restart" {
-			apRequest = network.APConfig{Radios: network.Supplied([]network.RadioConfig{{Band: network.Band5GHz, Channel: network.Supplied(uint16(157))}})}
-			switchRequest = network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{
-				{Index: 2}, {Index: 3, Enabled: network.Supplied(false)}, {Index: 4}, {Index: 5},
-			})}
+			persisted := liveDeviceFromState(t, "/state/devices.json", device.ID)
+			if device.Family == network.FamilyAP && persisted.DesiredAP != nil {
+				apRequest = persisted.DesiredAP.Clone()
+				for radioIndex := range apRequest.Radios.Value {
+					if apRequest.Radios.Value[radioIndex].Band == network.Band5GHz {
+						apRequest.Radios.Value[radioIndex].Channel = network.Supplied(uint16(44))
+					}
+				}
+			}
+			if device.Family == network.FamilySwitch && persisted.DesiredSwitch != nil {
+				switchRequest = persisted.DesiredSwitch.Clone()
+				for portIndex := range switchRequest.Ports.Value {
+					if switchRequest.Ports.Value[portIndex].Index == 4 {
+						switchRequest.Ports.Value[portIndex].Enabled = network.Supplied(false)
+					}
+				}
+			}
 		}
 		var preview network.ConfigPreview
 		if device.Family == network.FamilyAP {
@@ -533,31 +1010,10 @@ func TestLiveSocketOperations(t *testing.T) {
 			case <-time.After(time.Second):
 			}
 		}
-		management, err := configmap.Parse(baseline.Config.Management)
-		if err != nil {
-			t.Fatal(err)
-		}
-		system, err := configmap.Parse(baseline.Config.System)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if device.Family == network.FamilyAP {
-			system["aaa.1.bss_transition"] = "disabled"
-			if phase == "restart" {
-				system["radio.1.channel"] = "157"
-			}
-		} else {
-			system["switch.port.2.status"] = "disabled"
-			if phase == "restart" {
-				system["switch.port.3.status"] = "disabled"
-			}
-		}
-		expected := struct {
-			ID                 network.DeviceID
-			Version            network.ConfigVersion
-			Management, System configmap.Values
-		}{device.ID, version, management, system}
-		if err := os.WriteFile(fmt.Sprintf("/state/expected-%s-%d.json", phase, index), mustLiveJSON(t, expected), 0o600); err != nil {
+		if err := os.WriteFile(fmt.Sprintf("/state/applied-%s-%d.json", phase, index), mustLiveJSON(t, struct {
+			ID      network.DeviceID
+			Version network.ConfigVersion
+		}{device.ID, version}), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		index++
@@ -565,6 +1021,31 @@ func TestLiveSocketOperations(t *testing.T) {
 	if index != 3 {
 		t.Fatal("live adopted inventory does not contain three devices")
 	}
+}
+
+type liveExpectation struct {
+	ID                 network.DeviceID
+	Version            network.ConfigVersion
+	Management, System configmap.Values
+}
+
+func liveDeviceFromState(t *testing.T, path string, id network.DeviceID) controller.Device {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devices []controller.Device
+	if err := json.Unmarshal(body, &devices); err != nil {
+		t.Fatal("invalid persisted controller state")
+	}
+	for _, device := range devices {
+		if network.DeviceID(device.MAC) == id {
+			return device
+		}
+	}
+	t.Fatal("persisted device unavailable")
+	return controller.Device{}
 }
 
 func mustLiveJSON(t *testing.T, value any) []byte {
@@ -576,20 +1057,26 @@ func mustLiveJSON(t *testing.T, value any) []byte {
 	return data
 }
 
-func (r *liveRun) restart(ids, emulators []string) {
+func (r *liveRun) restart(models []liveModel, ids, emulators []string) {
 	for _, name := range emulators {
 		r.command("docker", "pause", name)
 	}
-	r.interruptCheckpoint("paused")
+	apID := ids[0]
+	reportedBeforeRestart := r.snapshot(apID).ReportedConfigVersion
+	pendingRadioID := liveFiveGHzRadio(r.t, models[0])
+	r.writeJSON("restart-pending-radio.json", network.RadioConfig{ID: network.RadioID(pendingRadioID), Channel: network.Supplied(uint16(44))})
+	pendingVersion := decodeLiveQueuedVersion(r.t, r.cli("radio", "set", "--device="+apID, "--file=/state/restart-pending-radio.json"))
+	r.oracleSetRadio(apID, pendingRadioID, 44)
+	pendingStatus := r.status(apID)
+	if pendingStatus.Pending != 1 || pendingStatus.DesiredConfigVersion != pendingVersion || pendingStatus.ReportedConfigVersion != reportedBeforeRestart {
+		r.t.Fatal("typed configuration was not pending before restart")
+	}
+	r.writeJSON("restart-pending-status.json", pendingStatus)
 	before, err := os.ReadFile(filepath.Join(r.dir, "devices.json"))
 	if err != nil {
 		r.t.Fatal(err)
 	}
 	r.write("state-before-restart.json", before)
-	r.write("pending.json", []byte(`{"_type":"cmd","cmd":"must-not-replay"}`))
-	for _, id := range ids {
-		r.cli("send", "--mac="+id, "--file=/state/pending.json")
-	}
 	// Docker replaces the controller network namespace on restart; reattach capture.
 	r.command("docker", "stop", "-t", "5", r.name+"-capture")
 	if err := os.Rename(filepath.Join(r.dir, "traffic.pcap"), filepath.Join(r.dir, "traffic-before-restart.pcap")); err != nil {
@@ -605,15 +1092,17 @@ func (r *liveRun) restart(ids, emulators []string) {
 			r.t.Fatal("observations survived restart")
 		}
 	}
-	var status []struct {
-		Pending int `json:"pending"`
-	}
-	if err := json.Unmarshal(r.cli("status"), &status); err != nil {
+	var statuses []controller.Status
+	if err := json.Unmarshal(r.cli("status"), &statuses); err != nil {
 		r.t.Fatal(err)
 	}
-	for _, device := range status {
+	r.writeJSON("restart-cleared-status.json", statuses)
+	for _, device := range statuses {
 		if device.Pending != 0 {
 			r.t.Fatal("queue survived restart")
+		}
+		if device.MAC == apID && device.DesiredConfigVersion != pendingVersion {
+			r.t.Fatal("pending desired configuration did not survive restart")
 		}
 	}
 	// Import forces the restarted process to serialize its in-memory devices.
@@ -644,7 +1133,27 @@ func (r *liveRun) restart(ids, emulators []string) {
 	for _, name := range emulators {
 		r.command("docker", "unpause", name)
 	}
+	clearedWindowStart := time.Now()
+	r.until("first AP snapshot after restart", func() bool {
+		snapshot := r.snapshot(apID)
+		return snapshot.LastInform.After(clearedWindowStart) && snapshot.ReportedConfigVersion == reportedBeforeRestart
+	})
+	firstInform := r.snapshot(apID).LastInform
+	r.until("second AP snapshot after restart", func() bool {
+		return r.snapshot(apID).LastInform.After(firstInform)
+	})
+	secondSnapshot := r.snapshot(apID)
+	if secondSnapshot.ReportedConfigVersion != reportedBeforeRestart {
+		r.t.Fatal("typed configuration queue replayed after restart")
+	}
+	r.writeJSON("restart-cleared-window.json", struct {
+		ID                 network.DeviceID
+		Start, Inform, End time.Time
+	}{network.DeviceID(apID), clearedWindowStart, firstInform, time.Now()})
 	for index, id := range ids {
+		if id == apID {
+			continue
+		}
 		var version network.ConfigVersion
 		if err := json.Unmarshal(oldState[index]["desired_version"], &version); err != nil {
 			r.t.Fatal(err)
@@ -654,8 +1163,167 @@ func (r *liveRun) restart(ids, emulators []string) {
 			return !snapshot.LastInform.IsZero() && snapshot.ReportedConfigVersion == version
 		})
 	}
+	persistedAP := r.persistedDevice(apID).DesiredAP
+	if persistedAP == nil {
+		r.t.Fatal("restarted desired AP configuration is unavailable")
+	}
+	r.writeJSON("restart-requeue-ap.json", persistedAP)
+	requeuedVersion := decodeLiveQueuedVersion(r.t, r.cli("apply", "ap", "--device="+apID, "--file=/state/restart-requeue-ap.json"))
+	if requeuedVersion != pendingVersion || r.pending(apID) != 1 {
+		r.t.Fatal("restart did not clear typed awaiting state for deliberate reconciliation")
+	}
+	r.recordOracle("resource-restart-requeue", apID, requeuedVersion)
+	r.waitVersion(apID, requeuedVersion)
+	r.writeJSON("restart-followup-radio.json", network.RadioConfig{ID: network.RadioID(pendingRadioID), Channel: network.Supplied(uint16(157))})
+	followupVersion := decodeLiveQueuedVersion(r.t, r.cli("radio", "set", "--device="+apID, "--file=/state/restart-followup-radio.json"))
+	r.oracleSetRadio(apID, pendingRadioID, 157)
+	r.recordOracle("resource-restart-followup", apID, followupVersion)
+	r.waitVersion(apID, followupVersion)
 	r.write("devices-after.json", r.cli("devices"))
-	r.socketOperations("restart")
+	r.socketOperations("restart", models, ids)
+}
+
+func (r *liveRun) addSecondAP(model liveModel, index int) (string, string) {
+	// The restart probe occupies the next synthetic identity without an emulator.
+	id := fmt.Sprintf("02:00:00:00:08:%02x", index+2)
+	emulator := fmt.Sprintf("%s-device-%d", r.name, index)
+	r.cli("adopt", "--mac="+id, "--file=/state/adopt.json")
+	r.command("docker", "run", "-d", "--name", emulator, "--network", r.name, r.name+":emulator",
+		"-inform", "http://controller:8080/inform", "-model", model.Model, "-mac", id,
+		"-ip", fmt.Sprintf("192.0.2.%d", index+10), "-name", fmt.Sprintf("test-device-%d", index))
+	r.until("second AP adoption", func() bool {
+		snapshot := r.snapshot(id)
+		return snapshot.Family == network.FamilyAP && snapshot.ReportedConfigVersion == "unifi-go-1"
+	})
+	baseline, err := os.ReadFile(filepath.Join(r.dir, "baseline-0.json"))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	r.write("baseline-3.json", baseline)
+	r.loadOracleBaseline(3, id)
+	r.write("second-ap-id", []byte(id))
+	r.command("docker", "exec", r.controller, "/state/live-test", "-test.run=^TestLiveSecondAP$", "-test.v", "-test.timeout=4m")
+	var applied struct {
+		ID      network.DeviceID
+		Version network.ConfigVersion
+	}
+	body, err := os.ReadFile(filepath.Join(r.dir, "applied-second-ap.json"))
+	if err != nil || json.Unmarshal(body, &applied) != nil || applied.ID != network.DeviceID(id) || applied.Version == "" {
+		r.t.Fatal("second AP applied result unavailable")
+	}
+	r.recordOracle("second-ap", id, applied.Version)
+	r.waitVersion(id, applied.Version)
+	return id, emulator
+}
+
+// TestLiveSecondAP configures the synthetic second AP through the public client.
+func TestLiveSecondAP(t *testing.T) {
+	idBody, err := os.ReadFile("/state/second-ap-id")
+	if err != nil {
+		t.Skip("isolated container helper")
+	}
+	var baseline network.BaselineImport
+	body, err := os.ReadFile("/state/baseline-3.json")
+	if err != nil || json.Unmarshal(body, &baseline) != nil || baseline.AP == nil {
+		t.Fatal("second AP baseline unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	client := network.Dial("/runtime/control.sock")
+	id := network.DeviceID(idBody)
+	if err := client.ImportBaseline(ctx, id, baseline); err != nil {
+		t.Fatal("second AP baseline import failed", err)
+	}
+	version, err := client.ApplyAP(ctx, id, baseline.AP.Clone())
+	if err != nil {
+		t.Fatal("second AP full configuration failed", err)
+	}
+	if err := os.WriteFile("/state/applied-second-ap.json", mustLiveJSON(t, struct {
+		ID      network.DeviceID
+		Version network.ConfigVersion
+	}{id, version}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (r *liveRun) assertAmbiguousAPSelection() {
+	before := r.readState()
+	output, err := r.cliResult("wifi", "list")
+	if err == nil || !bytes.Contains(output, []byte(string(network.AmbiguousDevice))) {
+		r.t.Fatal("omitted device selected one of multiple access points")
+	}
+	if !bytes.Equal(before, r.readState()) {
+		r.t.Fatal("ambiguous device selection changed controller state")
+	}
+}
+
+func assertLiveWiFiCopy(t *testing.T, before, after configmap.Values, source, destination string) {
+	t.Helper()
+	sourceWireless := liveRecordPrefixes(after, "wireless.", source)
+	destinationWireless := liveRecordPrefixes(after, "wireless.", destination)
+	sourceAuth := liveRecordPrefixes(after, "aaa.", source)
+	destinationAuth := liveRecordPrefixes(after, "aaa.", destination)
+	if len(sourceWireless) != 2 || len(destinationWireless) != 2 || len(sourceAuth) != 2 || len(destinationAuth) != 2 {
+		t.Fatal("dual-radio WiFi copy did not retain both wireless and authentication records")
+	}
+	if !maps.Equal(liveRecordFieldSet(after, sourceWireless, "parent"), liveRecordFieldSet(after, destinationWireless, "parent")) {
+		t.Fatal("WiFi copy changed radio targets")
+	}
+	sourcePSKs := liveRecordFieldSet(after, sourceAuth, "wpa.psk")
+	destinationPSKs := liveRecordFieldSet(after, destinationAuth, "wpa.psk")
+	if len(sourcePSKs) != 1 || len(destinationPSKs) != 1 || maps.Equal(sourcePSKs, destinationPSKs) {
+		t.Fatal("WiFi copy did not retain distinct source and destination credentials")
+	}
+	for key, value := range before {
+		if strings.HasPrefix(key, "radio.") && after[key] != value {
+			t.Fatal("WiFi copy changed radio policy")
+		}
+	}
+	for _, test := range []struct {
+		name, want string
+	}{{source, "enabled"}, {destination, "enabled"}, {"synthetic-legacy", "disabled"}} {
+		assertLiveNamedBSS(t, after, test.name, test.want)
+	}
+}
+
+func assertLiveBSSPolicy(t *testing.T, values configmap.Values, enabled, disabled, legacy string) {
+	t.Helper()
+	for _, test := range []struct {
+		name, want string
+	}{{enabled, "enabled"}, {disabled, "disabled"}, {legacy, "disabled"}} {
+		assertLiveNamedBSS(t, values, test.name, test.want)
+	}
+}
+
+func assertLiveNamedBSS(t *testing.T, values configmap.Values, name, want string) {
+	t.Helper()
+	prefixes := liveRecordPrefixes(values, "aaa.", name)
+	if len(prefixes) == 0 {
+		t.Fatal("WiFi authentication policy is missing")
+	}
+	for _, prefix := range prefixes {
+		if values[prefix+"bss_transition"] != want {
+			t.Fatal("per-network BSS Transition policy changed")
+		}
+	}
+}
+
+func liveRecordPrefixes(values configmap.Values, namespace, name string) []string {
+	var prefixes []string
+	for key, value := range values {
+		if strings.HasPrefix(key, namespace) && strings.HasSuffix(key, ".ssid") && value == name {
+			prefixes = append(prefixes, strings.TrimSuffix(key, "ssid"))
+		}
+	}
+	return prefixes
+}
+
+func liveRecordFieldSet(values configmap.Values, prefixes []string, field string) map[string]bool {
+	result := make(map[string]bool)
+	for _, prefix := range prefixes {
+		result[values[prefix+field]] = true
+	}
+	return result
 }
 
 func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
@@ -672,16 +1340,11 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 		keys[device.MAC] = device.Key
 	}
 	output := r.command("tshark", "-r", filepath.Join(r.dir, "combined.pcap"), "-Y", "http.file_data", "-T", "fields", "-e", "frame.time_epoch", "-e", "http.file_data")
-	type expectation struct {
-		ID                 network.DeviceID
-		Version            network.ConfigVersion
-		Management, System configmap.Values
-	}
 	type window struct {
 		ID                 network.DeviceID
 		Start, Inform, End time.Time
 	}
-	var expected []expectation
+	var expected []liveExpectation
 	var windows []window
 	for _, phase := range []string{"initial", "restart"} {
 		for index := range models {
@@ -689,7 +1352,7 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 			if err != nil {
 				r.t.Fatal(err)
 			}
-			var item expectation
+			var item liveExpectation
 			if json.Unmarshal(body, &item) != nil {
 				r.t.Fatal("invalid expectation")
 			}
@@ -707,6 +1370,46 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 			}
 			windows = append(windows, period)
 		}
+	}
+	body, err := os.ReadFile(filepath.Join(r.dir, "restart-cleared-window.json"))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	var cleared window
+	if json.Unmarshal(body, &cleared) != nil || !cleared.Inform.After(cleared.Start) || !cleared.End.After(cleared.Inform) {
+		r.t.Fatal("restart queue-clear interval is invalid")
+	}
+	windows = append(windows, cleared)
+	resourceExpectations, err := filepath.Glob(filepath.Join(r.dir, "expected-resource-*.json"))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	secondExpectations, err := filepath.Glob(filepath.Join(r.dir, "expected-second-ap.json"))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	for _, path := range append(resourceExpectations, secondExpectations...) {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			r.t.Fatal(err)
+		}
+		var item liveExpectation
+		if err := json.Unmarshal(body, &item); err != nil {
+			r.t.Fatal("invalid resource capture expectation")
+		}
+		expected = append(expected, item)
+	}
+	uniqueExpected := make(map[string]liveExpectation)
+	for _, item := range expected {
+		key := string(item.ID) + ":" + string(item.Version)
+		if previous, exists := uniqueExpected[key]; exists && (!maps.Equal(previous.Management, item.Management) || !maps.Equal(previous.System, item.System)) {
+			r.t.Fatal("one expected version has conflicting configuration maps")
+		}
+		uniqueExpected[key] = item
+	}
+	expected = expected[:0]
+	for _, item := range uniqueExpected {
+		expected = append(expected, item)
 	}
 	matched := map[string]bool{}
 	noops := make([]bool, len(windows))
@@ -726,17 +1429,6 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 			continue
 		}
 		id := net.HardwareAddr(body[8:14]).String()
-		packet, err := inform.Decode(body, keys[id])
-		if err != nil {
-			packet, err = inform.Decode(body, inform.DefaultKey)
-		}
-		if err != nil {
-			r.t.Fatal("captured encrypted packet did not decrypt")
-		}
-		count++
-		if bytes.Contains(packet.Payload, []byte("must-not-replay")) {
-			r.t.Fatal("queued command replayed")
-		}
 		var payload struct {
 			Type       string                `json:"_type"`
 			Cmd        string                `json:"cmd"`
@@ -744,8 +1436,22 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 			Management string                `json:"mgmt_cfg"`
 			System     string                `json:"system_cfg"`
 		}
-		if json.Unmarshal(packet.Payload, &payload) != nil {
-			r.t.Fatal("invalid capture payload")
+		var packet *inform.Packet
+		decoded := false
+		for _, key := range []string{keys[id], inform.DefaultKey} {
+			candidate, err := inform.Decode(body, key)
+			if err == nil && json.Unmarshal(candidate.Payload, &payload) == nil {
+				packet = candidate
+				decoded = true
+				break
+			}
+		}
+		if !decoded {
+			r.t.Fatal("captured encrypted packet did not decrypt to a valid payload")
+		}
+		count++
+		if bytes.Contains(packet.Payload, []byte("must-not-replay")) {
+			r.t.Fatal("queued command replayed")
 		}
 		if payload.Cmd == "set-adopt" {
 			adopted[id] = true
@@ -819,6 +1525,12 @@ func (r *liveRun) cli(args ...string) []byte {
 	return r.command("docker", append([]string{"exec", r.controller, "/unifi-go"}, append(args, "--socket=/runtime/control.sock")...)...)
 }
 
+func (r *liveRun) cliResult(args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(r.ctx, "docker", append([]string{"exec", r.controller, "/unifi-go"}, append(args, "--socket=/runtime/control.sock")...)...)
+	cmd.Dir = r.root
+	return r.executeResult(cmd)
+}
+
 func (r *liveRun) tryCLI(args ...string) []byte {
 	cmd := exec.CommandContext(r.ctx, "docker", append([]string{"exec", r.controller, "/unifi-go"}, append(args, "--socket=/runtime/control.sock")...)...)
 	output, err := cmd.Output()
@@ -850,6 +1562,14 @@ func (r *liveRun) command(name string, args ...string) []byte {
 }
 
 func (r *liveRun) execute(cmd *exec.Cmd) []byte {
+	output, err := r.executeResult(cmd)
+	if err != nil {
+		r.t.Fatalf("%s failed; private command-%03d.log: %v", filepath.Base(cmd.Path), r.commands, err)
+	}
+	return output
+}
+
+func (r *liveRun) executeResult(cmd *exec.Cmd) ([]byte, error) {
 	output, err := cmd.CombinedOutput()
 	r.commands++
 	exitCode := -1
@@ -861,10 +1581,7 @@ func (r *liveRun) execute(cmd *exec.Cmd) []byte {
 		ExitCode int
 	}{cmd.Args, exitCode})
 	r.write(fmt.Sprintf("command-%03d.log", r.commands), output)
-	if err != nil {
-		r.t.Fatalf("%s failed; private command-%03d.log: %v", filepath.Base(cmd.Path), r.commands, err)
-	}
-	return output
+	return output, err
 }
 
 func (r *liveRun) summarizeLogs(name string) {
