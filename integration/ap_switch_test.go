@@ -1073,6 +1073,10 @@ func (r *liveRun) restart(models []liveModel, ids, emulators []string) {
 		return pendingStatus.Pending == 1 && pendingStatus.DesiredConfigVersion == pendingVersion && pendingStatus.ReportedConfigVersion == reportedBeforeRestart
 	})
 	r.writeJSON("restart-pending-status.json", pendingStatus)
+	r.write("pending.json", []byte(`{"_type":"cmd","cmd":"must-not-replay"}`))
+	for _, id := range ids {
+		r.cli("send", "--mac="+id, "--file=/state/pending.json")
+	}
 	before, err := os.ReadFile(filepath.Join(r.dir, "devices.json"))
 	if err != nil {
 		r.t.Fatal(err)
@@ -1385,9 +1389,15 @@ func (r *liveRun) verifyCapture(ids []string, models []liveModel) {
 	if err != nil {
 		r.t.Fatal(err)
 	}
+	if len(resourceExpectations) == 0 {
+		r.t.Fatal("expected-resource capture expectations are missing")
+	}
 	secondExpectations, err := filepath.Glob(filepath.Join(r.dir, "expected-second-ap.json"))
 	if err != nil {
 		r.t.Fatal(err)
+	}
+	if len(secondExpectations) == 0 {
+		r.t.Fatal("expected-second-ap capture expectation is missing")
 	}
 	for _, path := range append(resourceExpectations, secondExpectations...) {
 		body, err := os.ReadFile(path)
