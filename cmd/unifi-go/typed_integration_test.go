@@ -481,6 +481,7 @@ func TestTypedControlIntegration(t *testing.T) {
 	if migrated[0].LastSetParam == nil || migrated[0].LastSetParam.ManagementConfig != legacyManagement || migrated[0].LastSetParam.SystemConfig != legacySystem || migrated[0].Baseline == nil || migrated[0].Baseline.Config.Management != legacyManagement || migrated[0].Baseline.Config.System != legacySystem || migrated[0].Baseline.TypedReady {
 		t.Fatal("legacy baseline migration changed exact bodies or claimed typed ownership")
 	}
+	testTypedBSSPersistence(t, ctx, directory, key, secretPath)
 }
 
 func typedAPFixture(secretPath string) network.APConfig {
@@ -1020,6 +1021,211 @@ func typedSeedBaseline(t *testing.T, family network.DeviceFamily, version networ
 		t.Fatal(err)
 	}
 	return &controller.ConfigurationBaseline{SchemaVersion: 1, TypedReady: true, Config: network.Config{Version: version, Management: management, System: system}}
+}
+
+func testTypedBSSPersistence(t *testing.T, ctx context.Context, directory, key, secretPath string) {
+	t.Helper()
+	const id network.DeviceID = "02:00:00:00:00:15"
+	const baselineVersion network.ConfigVersion = "bss-baseline"
+	state := filepath.Join(directory, "bss-persistence.json")
+	config, baseline := typedBSSFixture(t, secretPath, baselineVersion)
+	writeTypedJSON(t, state, []controller.Device{{
+		MAC:            string(id),
+		Key:            key,
+		Family:         network.FamilyAP,
+		DesiredAP:      &config,
+		DesiredVersion: baselineVersion,
+		LastSetParam: &controller.Reply{
+			Type:             controller.ReplySetparam,
+			ConfigVersion:    string(baselineVersion),
+			ManagementConfig: baseline.Config.Management,
+			SystemConfig:     baseline.Config.System,
+		},
+		Baseline: baseline,
+	}})
+	controllerInstance := openTypedController(t, state)
+	client := network.Dial(startTypedSocket(t, controllerInstance))
+	report := informmodel.Report{
+		Type:    "uap",
+		Model:   "BSSFixtureAP",
+		Version: "1",
+		RadioTable: []informmodel.Radio{
+			{Name: "wifi0", Radio: "ng", Widths: []informmodel.Uint16Scalar{20}},
+			{Name: "wifi1", Radio: "na", Widths: []informmodel.Uint16Scalar{40}},
+		},
+		PortTable: []informmodel.Port{{Index: 1, Interface: "eth0"}},
+	}
+	if reply := typedExchange(t, controllerInstance, id, key, report, false); reply.Type != controller.ReplyNoop {
+		t.Fatal("loaded BSS fixture replayed configuration")
+	}
+
+	unchanged, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+		{Name: "fixture-legacy", BSSTransition: network.Supplied(network.BSSTransitionMode("automatic"))},
+		{Name: "fixture-enabled"},
+		{Name: "fixture-disabled"},
+		{Name: "fixture-absent"},
+	})}
+	_, err = client.ApplyAP(ctx, id, invalid)
+	assertControlFailure(t, err, network.InvalidConfig, "networks[0].bss_transition")
+	afterInvalid, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterInvalid, unchanged) || controllerInstance.Status()[0].Pending != 0 {
+		t.Fatal("invalid BSS Transition changed baseline, projection, or queue")
+	}
+
+	disableLegacy := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+		{Name: "fixture-enabled"},
+		{Name: "fixture-legacy", BSSTransition: network.Supplied(network.BSSTransitionDisabled)},
+		{Name: "fixture-absent"},
+		{Name: "fixture-disabled"},
+	})}
+	disabledVersion, err := client.ApplyAP(ctx, id, disableLegacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledReply := typedExchange(t, controllerInstance, id, key, report, false)
+	if disabledReply.Type != controller.ReplySetparam || disabledReply.ConfigVersion != string(disabledVersion) {
+		t.Fatal("typed legacy-network disable was not delivered")
+	}
+	assertBSSFixtureValues(t, disabledReply.SystemConfig)
+	report.ConfigVersion = string(disabledVersion)
+	if reply := typedExchange(t, controllerInstance, id, key, report, false); reply.Type != controller.ReplyNoop {
+		t.Fatal("matching BSS fixture inform received a command")
+	}
+
+	reloaded := openTypedController(t, state)
+	restarted := network.Dial(startTypedSocket(t, reloaded))
+	if reply := typedExchange(t, reloaded, id, key, report, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("BSS fixture command survived restart")
+	}
+	unrelated := network.APConfig{CountryCode: network.Supplied(uint16(124))}
+	unrelatedVersion, err := restarted.ApplyAP(ctx, id, unrelated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedReply := typedExchange(t, reloaded, id, key, report, true)
+	if unrelatedReply.Type != controller.ReplySetparam || unrelatedReply.ConfigVersion != string(unrelatedVersion) {
+		t.Fatal("unrelated typed request was not delivered")
+	}
+	assertBSSFixtureValues(t, unrelatedReply.SystemConfig)
+
+	persisted, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devices []controller.Device
+	if err := json.Unmarshal(persisted, &devices); err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].LastSetParam == nil || devices[0].Baseline == nil || !devices[0].Baseline.TypedReady {
+		t.Fatal("BSS fixture persisted state is incomplete")
+	}
+	if devices[0].LastSetParam.SystemConfig != unrelatedReply.SystemConfig || devices[0].Baseline.Config.System != unrelatedReply.SystemConfig {
+		t.Fatal("last complete persisted body differs from the delivered reply")
+	}
+	assertBSSFixtureValues(t, devices[0].Baseline.Config.System)
+}
+
+func typedBSSFixture(t *testing.T, secretPath string, version network.ConfigVersion) (network.APConfig, *controller.ConfigurationBaseline) {
+	t.Helper()
+	baseline := typedSeedBaseline(t, network.FamilyAP, version)
+	system, err := configmap.Parse(baseline.Config.System)
+	if err != nil {
+		t.Fatal(err)
+	}
+	system["radio.1.phyname"], system["radio.1.devname"] = "wifi1", "ath1"
+	system["radio.2.phyname"], system["radio.2.devname"] = "wifi0", "ath0"
+	type fixtureWLAN struct {
+		index      string
+		name       string
+		parent     string
+		deviceName string
+		bss        string
+		bssPresent bool
+		bands      []network.RadioBand
+	}
+	wlans := []fixtureWLAN{
+		{index: "1", name: "fixture-legacy", parent: "wifi0", deviceName: "ath0", bss: "enabled", bssPresent: true, bands: []network.RadioBand{network.Band2GHz, network.Band5GHz}},
+		{index: "2", name: "fixture-legacy", parent: "wifi1", deviceName: "ath1", bss: "enabled", bssPresent: true},
+		{index: "3", name: "fixture-enabled", parent: "wifi0", deviceName: "ath2", bss: "enabled", bssPresent: true, bands: []network.RadioBand{network.Band2GHz}},
+		{index: "4", name: "fixture-disabled", parent: "wifi0", deviceName: "ath3", bss: "disabled", bssPresent: true, bands: []network.RadioBand{network.Band2GHz}},
+		{index: "5", name: "fixture-absent", parent: "wifi0", deviceName: "ath4", bands: []network.RadioBand{network.Band2GHz}},
+	}
+	var networks []network.WiFiNetwork
+	var bindings []profile.ResourceBinding
+	for _, wlan := range wlans {
+		wireless := "wireless." + wlan.index + "."
+		aaa := "aaa." + wlan.index + "."
+		netconf := "netconf." + wlan.index + "0."
+		member := "bridge.1.port." + wlan.index + "0."
+		system[wireless+"ssid"], system[wireless+"parent"], system[wireless+"devname"], system[wireless+"status"] = wlan.name, wlan.parent, wlan.deviceName, "enabled"
+		system[aaa+"ssid"], system[aaa+"devname"], system[aaa+"status"], system[aaa+"br.devname"] = wlan.name, wlan.deviceName, "enabled", "br0"
+		system[aaa+"wpa"], system[aaa+"wpa.1.pairwise"], system[aaa+"wpa.key.1.mgmt"], system[aaa+"wpa.psk"] = "2", "CCMP", "WPA-PSK", "fixture-passphrase"
+		system[netconf+"devname"], system[netconf+"status"], system[netconf+"up"] = wlan.deviceName, "enabled", "disabled"
+		system[member+"devname"] = wlan.deviceName
+		if wlan.bssPresent {
+			system[aaa+"bss_transition"] = wlan.bss
+		}
+		radioID := "ng"
+		if wlan.parent == "wifi1" {
+			radioID = "na"
+		}
+		bindings = append(bindings, profile.ResourceBinding{Kind: "wifi", Identity: wlan.name, RadioID: radioID, Prefixes: []string{wireless, aaa, netconf, member}})
+		if len(wlan.bands) == 0 {
+			continue
+		}
+		bss := network.Optional[network.BSSTransitionMode]{}
+		if wlan.bssPresent {
+			bss = network.Supplied(network.BSSTransitionMode(wlan.bss))
+		}
+		networks = append(networks, network.WiFiNetwork{
+			Name: wlan.name, Enabled: network.Supplied(true), VLAN: network.Cleared[network.VLANID](),
+			Bands: network.Supplied(wlan.bands), BSSTransition: bss,
+			Security: network.Supplied(network.WiFiSecurity{
+				Mode: network.Supplied(network.WPA2Personal), PSK: network.Supplied(network.SecretFile(secretPath)),
+			}),
+		})
+	}
+	systemBody, err := system.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline.Config.System = systemBody
+	baseline.Bindings = bindings
+	config := network.APConfig{
+		CountryCode: network.Supplied(uint16(840)),
+		Radios: network.Supplied([]network.RadioConfig{
+			{Band: network.Band2GHz, Enabled: network.Supplied(true), Channel: network.Cleared[uint16](), WidthMHz: network.Supplied(network.Width20), Power: network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerAuto)})},
+			{Band: network.Band5GHz, Enabled: network.Supplied(true), Channel: network.Cleared[uint16](), WidthMHz: network.Supplied(network.Width40), Power: network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerAuto)})},
+		}),
+		Networks: network.Supplied(networks),
+	}
+	return config, baseline
+}
+
+func assertBSSFixtureValues(t *testing.T, body string) {
+	t.Helper()
+	values, err := configmap.Parse(body)
+	if err != nil {
+		t.Fatal("BSS fixture body is invalid")
+	}
+	for _, prefix := range []string{"aaa.1.", "aaa.2."} {
+		if values[prefix+"bss_transition"] != "disabled" {
+			t.Fatal("fixture-legacy BSS Transition is not disabled")
+		}
+	}
+	if values["aaa.3.bss_transition"] != "enabled" || values["aaa.4.bss_transition"] != "disabled" {
+		t.Fatal("peer BSS Transition changed")
+	}
+	if _, exists := values["aaa.5.bss_transition"]; exists {
+		t.Fatal("absent peer BSS Transition acquired a default")
+	}
 }
 
 func TestTypedApplyRequiresUsableBaseline(t *testing.T) {

@@ -101,6 +101,20 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 	}
 	expected := before.Clone()
 	expected["wireless.2.status"], expected["aaa.2.status"] = "disabled", "disabled"
+	for _, binding := range compiled.Bindings {
+		if binding.Kind != "wifi" {
+			continue
+		}
+		key := binding.Prefixes[1] + "bss_transition"
+		if binding.Identity == "legacy" && compiled.Param.System[key] != before[key] {
+			t.Fatal("disabled peer BSS Transition changed")
+		}
+		if binding.Identity == "guest" {
+			if _, exists := compiled.Param.System[key]; exists {
+				t.Fatal("omitted BSS Transition acquired a default")
+			}
+		}
+	}
 	assertComposition(t, compiled.Param, baseline.Management, expected)
 	if !maps.Equal(before, baseline.System) || config.Networks.Value[1].Enabled.Present {
 		t.Fatal("compilation mutated input")
@@ -125,6 +139,116 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertComposition(t, result.Param, baseline.Management, before)
+	})
+	t.Run("BSS transition changes only the selected WLAN", func(t *testing.T) {
+		bssBaseline := profile.SetParam{Management: baseline.Management.Clone(), System: before.Clone()}
+		copyRecord := func(source, target string) {
+			for key, value := range bssBaseline.System.Clone() {
+				if strings.HasPrefix(key, source) {
+					bssBaseline.System[target+strings.TrimPrefix(key, source)] = value
+				}
+			}
+		}
+		copyRecord("wireless.1.", "wireless.4.")
+		copyRecord("aaa.1.", "aaa.4.")
+		copyRecord("netconf.3.", "netconf.8.")
+		bssBaseline.System["wireless.4.ssid"], bssBaseline.System["aaa.4.ssid"] = "legacy", "legacy"
+		bssBaseline.System["wireless.4.devname"], bssBaseline.System["aaa.4.devname"], bssBaseline.System["netconf.8.devname"] = "ath3", "ath3", "ath3"
+		bssBaseline.System["bridge.2.port.5.devname"] = "ath3"
+		copyRecord("wireless.3.", "wireless.5.")
+		copyRecord("aaa.3.", "aaa.5.")
+		copyRecord("netconf.7.", "netconf.9.")
+		bssBaseline.System["wireless.5.ssid"], bssBaseline.System["aaa.5.ssid"] = "disabled-peer", "disabled-peer"
+		bssBaseline.System["wireless.5.devname"], bssBaseline.System["aaa.5.devname"], bssBaseline.System["netconf.9.devname"] = "ath4", "ath4", "ath4"
+		bssBaseline.System["bridge.2.port.6.devname"] = "ath4"
+		bssBaseline.System["aaa.2.bss_transition"], bssBaseline.System["aaa.4.bss_transition"] = "enabled", "enabled"
+		bssBaseline.System["aaa.5.bss_transition"] = "disabled"
+
+		bssConfig := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+			{Name: "fixture-wifi", Bands: network.Supplied([]network.RadioBand{network.Band5GHz})},
+			{Name: "legacy", Bands: network.Supplied([]network.RadioBand{network.Band2GHz, network.Band5GHz})},
+			{Name: "guest", Bands: network.Supplied([]network.RadioBand{network.Band2GHz})},
+			{Name: "disabled-peer", Bands: network.Supplied([]network.RadioBand{network.Band2GHz})},
+		})}
+		bssRequest := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+			{Name: "guest"},
+			{Name: "disabled-peer"},
+			{Name: "legacy", BSSTransition: network.Supplied(network.BSSTransitionDisabled)},
+			{Name: "fixture-wifi"},
+		})}
+		result, err := registry.CompileAP(descriptor, profile.CompilationInput{Baseline: bssBaseline, AP: &bssConfig}, bssRequest, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		aaaPrefixes := func(identity string) []string {
+			var prefixes []string
+			for _, binding := range result.Bindings {
+				if binding.Kind == "wifi" && binding.Identity == identity {
+					prefixes = append(prefixes, binding.Prefixes[1])
+				}
+			}
+			return prefixes
+		}
+		legacyAAAPrefixes := aaaPrefixes("legacy")
+		if len(legacyAAAPrefixes) != 2 {
+			t.Fatal("legacy network did not retain both radio bindings")
+		}
+		for _, prefix := range legacyAAAPrefixes {
+			if result.Param.System[prefix+"bss_transition"] != "disabled" {
+				t.Fatal("legacy network retained BSS Transition")
+			}
+		}
+		for _, identity := range []string{"fixture-wifi", "disabled-peer", "guest"} {
+			for _, prefix := range aaaPrefixes(identity) {
+				key := prefix + "bss_transition"
+				beforeValue, beforeExists := bssBaseline.System[key]
+				afterValue, afterExists := result.Param.System[key]
+				if beforeValue != afterValue || beforeExists != afterExists {
+					t.Fatal("peer BSS Transition changed")
+				}
+			}
+		}
+
+		managementBody, err := result.Param.Management.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		systemBody, err := result.Param.System.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		loadedManagement, err := configmap.Parse(managementBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		loadedSystem, err := configmap.Parse(systemBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		unrelated := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+			{Name: "fixture-wifi"},
+			{Name: "legacy", Enabled: network.Supplied(false)},
+			{Name: "disabled-peer"},
+			{Name: "guest"},
+		})}
+		repeated, err := registry.CompileAP(descriptor, profile.CompilationInput{
+			Baseline: profile.SetParam{Version: result.Param.Version, Management: loadedManagement, System: loadedSystem},
+			AP:       result.AP,
+			Bindings: result.Bindings,
+		}, unrelated, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, identity := range []string{"legacy", "fixture-wifi", "disabled-peer", "guest"} {
+			for _, prefix := range aaaPrefixes(identity) {
+				key := prefix + "bss_transition"
+				want, wantExists := result.Param.System[key]
+				got, gotExists := repeated.Param.System[key]
+				if got != want || gotExists != wantExists {
+					t.Fatal("omitted BSS Transition changed after baseline reload")
+				}
+			}
+		}
 	})
 	t.Run("clear VLAN and channel", func(t *testing.T) {
 		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "fixture-wifi"}, {Name: "legacy", VLAN: network.Cleared[network.VLANID]()}, {Name: "guest"}}), Radios: network.Supplied([]network.RadioConfig{{Band: network.Band2GHz, Channel: network.Cleared[uint16]()}})}
