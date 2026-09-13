@@ -69,6 +69,7 @@ func TestPersistedBaselineRejectsIncompleteResourceIdentity(t *testing.T) {
 	}
 
 	for name, device := range tests {
+		device := device
 		t.Run(name, func(t *testing.T) {
 			state := filepath.Join(t.TempDir(), "state.json")
 			writeTypedJSON(t, state, []controller.Device{device})
