@@ -166,7 +166,7 @@ func (c *Controller) commitCompiledLocked(device Device, compilation profile.Com
 		c.devices[device.MAC] = previous
 		return "", &network.ControlError{Code: network.PersistenceFailed, Field: ""}
 	}
-	if previous.DesiredVersion != param.Version || c.reports[device.MAC].ConfigVersion != string(param.Version) {
+	if c.reports[device.MAC].ConfigVersion != string(param.Version) {
 		c.queues[device.MAC] = append(c.queues[device.MAC], command)
 		c.awaiting[device.MAC] = param.Version
 	}

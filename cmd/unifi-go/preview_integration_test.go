@@ -81,6 +81,7 @@ func testPreviewTransaction(t *testing.T) {
 	t.Run("concurrent callers", testPreviewConcurrentCallers)
 	t.Run("persistence rollback", testPreviewPersistenceRollback)
 	t.Run("representation and restart", testPreviewRepresentationRestart)
+	t.Run("reported candidate", testPreviewReportedCandidate)
 	t.Run("unrequested SSH policy", testPreviewUnrequestedSSH)
 	const key = "0123456789abcdef0123456789abcdef" // gitleaks:allow
 	const id network.DeviceID = "02:00:00:00:00:61"
@@ -142,6 +143,45 @@ func testPreviewTransaction(t *testing.T) {
 	unchanged, err := client.PreviewAP(t.Context(), id, config)
 	if err != nil || unchanged.Added != 0 || unchanged.Changed != 0 || unchanged.Removed != 0 {
 		t.Fatal("unchanged preview reported record changes")
+	}
+}
+
+func testPreviewReportedCandidate(t *testing.T) {
+	fixture := newPreviewFixture(t)
+	reportedVersion, err := fixture.client.ApplyAP(t.Context(), previewTestID, fixture.config)
+	if err != nil {
+		t.Fatal("initial apply failed")
+	}
+	typedExchange(t, fixture.controller, previewTestID, previewTestKey, fixture.report, true)
+	fixture.report.ConfigVersion = string(reportedVersion)
+	typedExchange(t, fixture.controller, previewTestID, previewTestKey, fixture.report, true)
+	fixture.config.Networks.Value[0].BSSTransition = network.Supplied(network.BSSTransitionDisabled)
+	desiredVersion, err := fixture.client.ApplyAP(t.Context(), previewTestID, fixture.config)
+	if err != nil || desiredVersion == reportedVersion {
+		t.Fatal("fixture did not establish a different desired configuration")
+	}
+	fixture.controller = openTypedController(t, fixture.state)
+	fixture.client = network.Dial(startTypedSocket(t, fixture.controller))
+	if reply := typedExchange(t, fixture.controller, previewTestID, previewTestKey, fixture.report, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("restart replayed pending work")
+	}
+	before := previewStateBytes(t, fixture.state)
+	fixture.config.Networks.Value[0].BSSTransition = network.Supplied(network.BSSTransitionEnabled)
+	version, err := fixture.client.ApplyAP(t.Context(), previewTestID, fixture.config)
+	if err != nil || version != reportedVersion || fixture.controller.Status()[0].Pending != 0 {
+		t.Fatal("matching reported candidate was queued because persisted desired differed")
+	}
+	device := previewPersistedDevice(t, fixture.state)
+	if bytes.Equal(before, previewStateBytes(t, fixture.state)) || device.DesiredVersion != reportedVersion || device.Baseline.Config.Version != reportedVersion || device.DesiredAP.Networks.Value[0].BSSTransition.Value != network.BSSTransitionEnabled {
+		t.Fatal("matching reported candidate was not persisted")
+	}
+	fixture.config.Networks.Value[0].BSSTransition = network.Supplied(network.BSSTransitionDisabled)
+	if _, err := fixture.client.ApplyAP(t.Context(), previewTestID, fixture.config); err != nil || fixture.controller.Status()[0].Pending != 1 {
+		t.Fatal("matching reported candidate left awaiting state")
+	}
+	reply := typedExchange(t, fixture.controller, previewTestID, previewTestKey, fixture.report, true)
+	if reply.Type != controller.ReplySetparam || reply.ConfigVersion != string(desiredVersion) || !strings.Contains(reply.SystemConfig, "aaa.1.bss_transition=disabled") {
+		t.Fatal("subsequent changed candidate was not delivered")
 	}
 }
 
