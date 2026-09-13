@@ -2,13 +2,14 @@ package integration_test
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/GehirnInc/crypt/sha512_crypt"
-
+	"goodkind.io/unifi-go/internal/configmap"
 	"goodkind.io/unifi-go/internal/informmodel"
 	"goodkind.io/unifi-go/internal/profile"
 	"goodkind.io/unifi-go/internal/profile/ap"
@@ -19,6 +20,32 @@ type fileSecrets struct{}
 
 func (fileSecrets) ReadSecret(path network.SecretFile) ([]byte, error) {
 	return os.ReadFile(string(path))
+}
+
+func compilerFixture(t *testing.T, family, name string) profile.SetParam {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("..", "testdata", "profiles", family, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Management configmap.Values
+		System     configmap.Values
+	}
+	if err := json.Unmarshal(body, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	return profile.SetParam{Management: fixture.Management, System: fixture.System}
+}
+
+func assertComposition(t *testing.T, actual profile.SetParam, management, system configmap.Values) {
+	t.Helper()
+	if !maps.Equal(actual.Management, management) || !maps.Equal(actual.System, system) {
+		t.Fatal("complete composed maps differ from requested changes")
+	}
+	if actual.Version == "" {
+		t.Fatal("configuration version is missing")
+	}
 }
 
 func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
@@ -36,221 +63,419 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	unsupportedProtocol := descriptor
-	unsupportedProtocol.Protocol.PayloadVersion = 2
-	if ap.New().Supports(unsupportedProtocol) {
-		t.Fatal("unverified payload protocol was accepted")
-	}
-	secretPath := filepath.Join(t.TempDir(), "psk")
-	if err := os.WriteFile(secretPath, []byte("fixture-passphrase"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	vlan := network.VLANID(20)
-	secondVLAN := network.VLANID(30)
-	config := network.APConfig{
-		CountryCode: 840,
-		Networks: []network.WiFiNetwork{{
-			Name: "fixture-wifi", Enabled: true, VLAN: &vlan,
-			Bands:    []network.RadioBand{network.Band2GHz, network.Band5GHz},
-			Security: network.WiFiSecurity{Mode: network.WPA2Personal, PSK: network.SecretFile(secretPath)},
-		}, {
-			Name: "fixture-iot", Enabled: true, VLAN: &secondVLAN,
-			Bands:    []network.RadioBand{network.Band2GHz},
-			Security: network.WiFiSecurity{Mode: network.WPA2Personal, PSK: network.SecretFile(secretPath)},
-		}},
-		Radios: []network.RadioConfig{
-			{Band: network.Band2GHz, Enabled: true, WidthMHz: network.Width20, Power: network.PowerConfig{Mode: network.PowerAuto}},
-			{Band: network.Band5GHz, Enabled: true, WidthMHz: network.Width40, Power: network.PowerConfig{Mode: network.PowerAuto}},
-		},
-		SSH: &network.SSHConfig{Username: "fixture-user", Password: network.SecretFile(secretPath)},
-	}
-	compiled, err := ap.New().Compile(descriptor, config, fileSecrets{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	physicalProtocol := descriptor
-	physicalProtocol.Protocol.PacketVersion = 0
-	versionZero, err := ap.New().Compile(physicalProtocol, config, fileSecrets{})
-	if err != nil || versionZero.Version != compiled.Version {
-		t.Fatal("verified physical packet version 0 changed or rejected AP compilation")
-	}
-	unsupportedProtocol.Protocol.PacketVersion, unsupportedProtocol.Protocol.PayloadVersion = 2, 1
-	if _, err := ap.New().Compile(unsupportedProtocol, config, fileSecrets{}); err == nil {
-		t.Fatal("unverified packet version 2 allowed AP compilation")
-	}
-	if compiled.Version == "" || compiled.System["radio.1.phyname"] != "wifi-na" || compiled.System["radio.2.phyname"] != "wifi-ng" {
-		t.Fatal("compiled radio identity or version is incorrect")
-	}
-	if compiled.System["radio.1.devname"] != "ath0" || compiled.System["wireless.1.devname"] != "ath0" {
-		t.Fatal("emulator-shaped interfaces did not retain ath VAP names")
-	}
-	if compiled.System["aaa.1.wpa.psk"] != "fixture-passphrase" || compiled.System["vlan.1.id"] != "20" || compiled.System["bridge.2.devname"] != "br0.20" {
-		t.Fatal("compiled WPA2 VLAN behavior is incorrect")
-	}
-	if compiled.System["wireless.2.devname"] == compiled.System["wireless.3.devname"] || compiled.System["aaa.2.br.devname"] != "br0.20" || compiled.System["aaa.3.br.devname"] != "br0.30" {
-		t.Fatal("compiled VAP interfaces or VLAN bridges are not distinct")
-	}
-	if compiled.System["netconf.3.devname"] != "ath0" || compiled.System["netconf.5.devname"] != "ath2" {
-		t.Fatal("compiled VAP netconf records are incomplete")
-	}
-	if compiled.System["connectivity.status"] != "disabled" || compiled.System["connectivity.uplink_eth"] != "" || compiled.System["connectivity.uplink_bridge"] != "" || compiled.System["dhcpc.1.devname"] != "br0" || compiled.System["iptables.status"] != "disabled" || compiled.System["system.timezone"] != "UTC0" {
-		t.Fatal("compiled generic AP subsystem defaults are incomplete")
-	}
-	if compiled.System["ntpclient.status"] != "disabled" || compiled.System["switch.jumboframes"] != "disabled" || compiled.System["switch.jumboframes.status"] != "" {
-		t.Fatal("compiled NTP or jumbo-frame defaults are incorrect")
-	}
-	if compiled.System["wireless.2.beacon_rate"] != "1000" || compiled.System["wireless.1.dtim_period"] != "3" || compiled.System["ebtables.1.cmd"] == "" {
-		t.Fatal("compiled band or VAP defaults are incomplete")
-	}
-	if len(compiled.System["aaa.1.iapp_key"]) != 32 || !strings.HasPrefix(compiled.System["users.1.password"], "$6$") {
-		t.Fatal("compiled credential encodings are incorrect")
-	}
-	if err := sha512_crypt.New().Verify(compiled.System["users.1.password"], []byte("fixture-passphrase")); err != nil {
-		t.Fatal("compiled SSH password hash does not verify")
-	}
-	repeated, err := ap.New().Compile(descriptor, config, fileSecrets{})
-	if err != nil || repeated.Version != compiled.Version || repeated.System["users.1.password"] != compiled.System["users.1.password"] {
-		t.Fatal("repeated compilation is not deterministic")
-	}
-	unused := config
-	unused.Networks = config.Networks[1:]
-	unused.Radios = append([]network.RadioConfig(nil), config.Radios...)
-	unused.Radios[0].WidthMHz = network.Width40
-	unusedChannel := uint16(6)
-	unused.Radios[0].Channel = &unusedChannel
-	unused.Radios[1].Enabled = false
-	unusedCompiled, err := ap.New().Compile(descriptor, unused, fileSecrets{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if unusedCompiled.System["radio.1.devname"] == unusedCompiled.System["radio.2.devname"] || unusedCompiled.System["radio.1.devname"] == unusedCompiled.System["wireless.1.devname"] || unusedCompiled.System["radio.2.devname"] != unusedCompiled.System["wireless.1.devname"] {
-		t.Fatal("unused radio and VAP interfaces are not unique")
-	}
-	if unusedCompiled.System["radio.1.cwm.mode"] != "0" || unusedCompiled.System["radio.2.cwm.mode"] != "1" {
-		t.Fatal("band-specific 40 MHz encoding is incorrect")
-	}
-	physicalDescriptor := descriptor
-	var uplinkReport informmodel.Report
-	if err := json.Unmarshal([]byte(`{"type":"uap","uplink":"eth1","radio_table":[{"name":"wifi0","radio":"ng"}],"port_table":[{"port_idx":1,"ifname":"eth0"},{"port_idx":2,"ifname":"eth1"}]}`), &uplinkReport); err != nil {
-		t.Fatal(err)
-	}
-	uplinkDescriptor, err := profile.Describe(uplinkReport)
-	if err != nil || uplinkDescriptor.UplinkInterface != "eth1" {
-		t.Fatal("descriptor did not preserve the reported uplink")
-	}
-	physicalDescriptor.Radios = append([]profile.RadioCapability(nil), descriptor.Radios...)
-	physicalDescriptor.Radios[0].Interface = "wifi0"
-	physicalDescriptor.Radios[1].Interface = "wifi1"
-	physicalDescriptor.UplinkInterface = "eth1"
-	physicalDescriptor.Ports = []profile.PortCapability{
-		{Index: 1, Interface: "eth0", VLAN: nil, PoEModes: nil},
-		{Index: 2, Interface: "eth1", VLAN: nil, PoEModes: nil},
-	}
-	physicalConfig := config
-	physicalConfig.Networks = config.Networks[:1]
-	physicalCompiled, err := ap.New().Compile(physicalDescriptor, physicalConfig, fileSecrets{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if physicalCompiled.System["radio.1.devname"] != "wifi0ap0" || physicalCompiled.System["wireless.1.devname"] != "wifi0ap0" || physicalCompiled.System["radio.2.devname"] != "wifi1ap1" || physicalCompiled.System["wireless.2.devname"] != "wifi1ap1" {
-		t.Fatal("physical-shaped interfaces did not use phy-derived VAP names")
-	}
-	if physicalCompiled.System["connectivity.status"] != "enabled" || physicalCompiled.System["connectivity.uplink_eth"] != "eth1" {
-		t.Fatal("physical connectivity did not use the reported uplink")
-	}
-	physicalMultiCompiled, err := ap.New().Compile(physicalDescriptor, config, fileSecrets{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if physicalMultiCompiled.System["radio.1.virtual.1.devname"] != "wifi0ap1" || physicalMultiCompiled.System["radio.1.virtual.1.mode"] != "master" || physicalMultiCompiled.System["radio.2.devname"] != "wifi1ap2" {
-		t.Fatal("physical multi-VAP radio mappings are incomplete")
-	}
-	badDescriptor := descriptor
-	badDescriptor.Radios = append([]profile.RadioCapability(nil), descriptor.Radios...)
-	badDescriptor.Radios[0].Interface = "bad\ninterface"
-	if _, err := ap.New().Compile(badDescriptor, config, fileSecrets{}); err == nil {
-		t.Fatal("newline in a reported interface was accepted")
-	}
-	for _, pair := range []struct {
-		band    network.RadioBand
-		channel uint16
-		width   network.ChannelWidthMHz
-	}{
-		{network.Band2GHz, 0, network.Width20},
-		{network.Band2GHz, 6, network.Width20},
-		{network.Band2GHz, 11, network.Width20},
-		{network.Band2GHz, 6, network.Width40},
-		{network.Band5GHz, 0, network.Width40},
-		{network.Band5GHz, 44, network.Width40},
-		{network.Band5GHz, 157, network.Width40},
-	} {
-		requested := network.RadioConfig{Band: pair.band, Enabled: true, WidthMHz: pair.width, Power: network.PowerConfig{Mode: network.PowerAuto}}
-		if pair.channel != 0 {
-			requested.Channel = &pair.channel
-		}
-		if _, err := ap.New().Compile(descriptor, network.APConfig{CountryCode: 840, Radios: []network.RadioConfig{requested}}, nil); err != nil {
-			t.Fatalf("reproduced channel/width pair was rejected: %s/%d/%d", pair.band, pair.channel, pair.width)
+	baseline := compilerFixture(t, "ap", "operation-05-reply.json")
+	baseline.System["locale.timezone"] = "operator-zone"
+	baseline.System["operator.unmodeled"] = "retain"
+	baseline.System["sshd.status"] = "disabled"
+	baseline.Management["operator.unmodeled"] = "retain-management"
+	// Split the captured WLAN and add one named synthetic WLAN with distinct retained policy.
+	baseline.System["wireless.2.ssid"], baseline.System["aaa.2.ssid"] = "legacy", "legacy"
+	baseline.System["aaa.1.bss_transition"], baseline.System["aaa.2.bss_transition"] = "enabled", "disabled"
+	for key, value := range baseline.System.Clone() {
+		for _, pair := range [][2]string{{"wireless.2.", "wireless.3."}, {"aaa.2.", "aaa.3."}, {"netconf.4.", "netconf.7."}} {
+			if len(key) >= len(pair[0]) && key[:len(pair[0])] == pair[0] {
+				baseline.System[pair[1]+key[len(pair[0]):]] = value
+			}
 		}
 	}
-	unverifiedChannel := uint16(11)
-	unverifiedPair := network.APConfig{CountryCode: 840, Radios: []network.RadioConfig{{Band: network.Band2GHz, Enabled: true, Channel: &unverifiedChannel, WidthMHz: network.Width40, Power: network.PowerConfig{Mode: network.PowerAuto}}}}
-	if _, err := ap.New().Compile(descriptor, unverifiedPair, nil); err == nil {
-		t.Fatal("unreproduced channel 11 at 40 MHz was accepted without reported capability evidence")
+	baseline.System["wireless.3.ssid"], baseline.System["aaa.3.ssid"] = "guest", "guest"
+	baseline.System["wireless.3.devname"], baseline.System["aaa.3.devname"], baseline.System["netconf.7.devname"] = "ath2", "ath2", "ath2"
+	baseline.System["bridge.2.port.4.devname"] = "ath2"
+	delete(baseline.System, "aaa.3.bss_transition")
+	baseline.System["wireless.2.operator.unmodeled"] = "legacy-only"
+	baseline.System["aaa.2.wpa.key.1.mgmt"] = "UNSUPPORTED-UNCHANGED"
+	config := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+		{Name: "fixture-wifi", Bands: network.Supplied([]network.RadioBand{network.Band5GHz})},
+		{Name: "legacy", Bands: network.Supplied([]network.RadioBand{network.Band2GHz})},
+		{Name: "guest", Bands: network.Supplied([]network.RadioBand{network.Band2GHz})},
+	})}
+	input := profile.CompilationInput{Baseline: baseline, AP: &config}
+	registry := profile.NewRegistry(ap.New(), nil)
+	request := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+		{Name: "guest"}, {Name: "legacy", Enabled: network.Supplied(false)}, {Name: "fixture-wifi"},
+	})}
+	before := baseline.System.Clone()
+	compiled, err := registry.CompileAP(descriptor, input, request, nil)
+	if err != nil {
+		t.Fatal("baseline composition failed", err)
 	}
-	unverifiedPair.Radios[0].Channel = nil
-	if _, err := ap.New().Compile(descriptor, unverifiedPair, nil); err == nil {
-		t.Fatal("unreproduced automatic channel at 40 MHz was accepted without reported width evidence")
+	expected := before.Clone()
+	expected["wireless.2.status"], expected["aaa.2.status"] = "disabled", "disabled"
+	for _, binding := range compiled.Bindings {
+		if binding.Kind != "wifi" {
+			continue
+		}
+		key := binding.Prefixes[1] + "bss_transition"
+		if binding.Identity == "legacy" && compiled.Param.System[key] != before[key] {
+			t.Fatal("disabled peer BSS Transition changed")
+		}
+		if binding.Identity == "guest" {
+			if _, exists := compiled.Param.System[key]; exists {
+				t.Fatal("omitted BSS Transition acquired a default")
+			}
+		}
 	}
-	reportedPair := descriptor
-	reportedPair.Radios = []profile.RadioCapability{{ID: "ng", Interface: "wifi0", Band: network.Band2GHz, Channels: []uint16{11}, Widths: []network.ChannelWidthMHz{network.Width40}}}
-	unverifiedPair.Radios[0].Channel = &unverifiedChannel
-	if _, err := ap.New().Compile(reportedPair, unverifiedPair, nil); err != nil {
-		t.Fatal("explicit reported channel/width evidence was restricted by the physical exception")
+	assertComposition(t, compiled.Param, baseline.Management, expected)
+	if !maps.Equal(before, baseline.System) || config.Networks.Value[1].Enabled.Present {
+		t.Fatal("compilation mutated input")
 	}
-	radioOnly := network.APConfig{CountryCode: 840, Radios: []network.RadioConfig{config.Radios[0]}}
-	unfamiliar := descriptor
-	unfamiliar.Model, unfamiliar.Firmware = "UnfamiliarAP", "1"
-	unfamiliar.Radios = []profile.RadioCapability{{ID: "ng", Interface: "wifi0", Band: network.Band2GHz, Widths: []network.ChannelWidthMHz{network.Width20}}}
-	if _, err := ap.New().Compile(unfamiliar, radioOnly, nil); err != nil {
-		t.Fatal("automatic channel required an explicit channel list")
+	if compiled.AP == nil || compiled.Switch != nil || len(compiled.Bindings) != 3 {
+		t.Fatal("projection or bindings are incomplete")
 	}
-	channel := uint16(6)
-	radioOnly.Radios[0].Channel = &channel
-	if _, err := ap.New().Compile(unfamiliar, radioOnly, nil); err == nil {
-		t.Fatal("explicit channel without evidence was accepted")
+	repeated, err := registry.CompileAP(descriptor, profile.CompilationInput{Baseline: compiled.Param, AP: compiled.AP, Bindings: compiled.Bindings}, request, nil)
+	if err != nil || repeated.Param.Version != compiled.Param.Version || !reflect.DeepEqual(repeated.Bindings, compiled.Bindings) {
+		t.Fatal("repeated overlay changed stable identity")
 	}
-	unfamiliar.Radios[0].Channels = []uint16{6}
-	unfamiliar.Radios[0].Widths = nil
-	if _, err := ap.New().Compile(unfamiliar, radioOnly, nil); err == nil {
-		t.Fatal("explicit width without evidence was accepted")
+	changedInput := input
+	changedInput.Baseline.System = baseline.System.Clone()
+	changedInput.Baseline.System["operator.unmodeled"] = "changed"
+	changed, err := registry.CompileAP(descriptor, changedInput, request, nil)
+	if err != nil || changed.Param.Version == compiled.Param.Version {
+		t.Fatal("unknown retained policy was excluded from version")
 	}
-	unfamiliar.Radios[0].Widths = []network.ChannelWidthMHz{network.Width20}
-	power := 10
-	radioOnly.Radios[0].Power = network.PowerConfig{Mode: network.PowerExplicit, DBm: &power}
-	if _, err := ap.New().Compile(unfamiliar, radioOnly, nil); err == nil {
-		t.Fatal("explicit power without bounds was accepted")
-	}
-	minimum, maximum := 0, 20
-	unfamiliar.Radios[0].MinPowerDBm, unfamiliar.Radios[0].MaxPowerDBm = &minimum, &maximum
-	if _, err := ap.New().Compile(unfamiliar, radioOnly, nil); err != nil {
-		t.Fatal("unfamiliar model with explicit capability evidence was rejected")
-	}
-	var extraRadios informmodel.Report
-	if err := json.Unmarshal([]byte(`{"type":"uap","radio_table":[{"name":"six","radio":"6g"},{"name":"five-a","radio":"na"},{"name":"five-b","radio":"na"}]}`), &extraRadios); err != nil {
-		t.Fatal(err)
-	}
-	extraDescriptor, err := profile.Describe(extraRadios)
-	if err != nil || len(extraDescriptor.Radios) != 3 || extraDescriptor.Radios[0].Band != "" {
-		t.Fatal("unknown radio inventory was not preserved")
-	}
-	unfamiliar.Radios = append(unfamiliar.Radios, extraDescriptor.Radios...)
-	if _, err := ap.New().Compile(unfamiliar, radioOnly, nil); err != nil {
-		t.Fatal("unrequested radio inventory blocked a supported setting")
-	}
-	unfamiliar.Radios = append(unfamiliar.Radios, unfamiliar.Radios[0])
-	if _, err := ap.New().Compile(unfamiliar, radioOnly, nil); err == nil {
-		t.Fatal("ambiguous requested radio was accepted")
-	}
+	t.Run("omitted collections", func(t *testing.T) {
+		result, err := registry.CompileAP(descriptor, input, network.APConfig{}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertComposition(t, result.Param, baseline.Management, before)
+	})
+	t.Run("BSS transition changes only the selected WLAN", func(t *testing.T) {
+		bssBaseline := profile.SetParam{Management: baseline.Management.Clone(), System: before.Clone()}
+		copyRecord := func(source, target string) {
+			for key, value := range bssBaseline.System.Clone() {
+				if strings.HasPrefix(key, source) {
+					bssBaseline.System[target+strings.TrimPrefix(key, source)] = value
+				}
+			}
+		}
+		copyRecord("wireless.1.", "wireless.4.")
+		copyRecord("aaa.1.", "aaa.4.")
+		copyRecord("netconf.3.", "netconf.8.")
+		bssBaseline.System["wireless.4.ssid"], bssBaseline.System["aaa.4.ssid"] = "legacy", "legacy"
+		bssBaseline.System["wireless.4.devname"], bssBaseline.System["aaa.4.devname"], bssBaseline.System["netconf.8.devname"] = "ath3", "ath3", "ath3"
+		bssBaseline.System["bridge.2.port.5.devname"] = "ath3"
+		copyRecord("wireless.3.", "wireless.5.")
+		copyRecord("aaa.3.", "aaa.5.")
+		copyRecord("netconf.7.", "netconf.9.")
+		bssBaseline.System["wireless.5.ssid"], bssBaseline.System["aaa.5.ssid"] = "disabled-peer", "disabled-peer"
+		bssBaseline.System["wireless.5.devname"], bssBaseline.System["aaa.5.devname"], bssBaseline.System["netconf.9.devname"] = "ath4", "ath4", "ath4"
+		bssBaseline.System["bridge.2.port.6.devname"] = "ath4"
+		bssBaseline.System["aaa.2.bss_transition"], bssBaseline.System["aaa.4.bss_transition"] = "enabled", "enabled"
+		bssBaseline.System["aaa.5.bss_transition"] = "disabled"
+
+		bssConfig := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+			{Name: "fixture-wifi", Bands: network.Supplied([]network.RadioBand{network.Band5GHz})},
+			{Name: "legacy", Bands: network.Supplied([]network.RadioBand{network.Band2GHz, network.Band5GHz})},
+			{Name: "guest", Bands: network.Supplied([]network.RadioBand{network.Band2GHz})},
+			{Name: "disabled-peer", Bands: network.Supplied([]network.RadioBand{network.Band2GHz})},
+		})}
+		bssRequest := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+			{Name: "guest"},
+			{Name: "disabled-peer"},
+			{Name: "legacy", BSSTransition: network.Supplied(network.BSSTransitionDisabled)},
+			{Name: "fixture-wifi"},
+		})}
+		result, err := registry.CompileAP(descriptor, profile.CompilationInput{Baseline: bssBaseline, AP: &bssConfig}, bssRequest, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		aaaPrefixes := func(identity string) []string {
+			var prefixes []string
+			for _, binding := range result.Bindings {
+				if binding.Kind == "wifi" && binding.Identity == identity {
+					prefixes = append(prefixes, binding.Prefixes[1])
+				}
+			}
+			return prefixes
+		}
+		legacyAAAPrefixes := aaaPrefixes("legacy")
+		if len(legacyAAAPrefixes) != 2 {
+			t.Fatal("legacy network did not retain both radio bindings")
+		}
+		for _, prefix := range legacyAAAPrefixes {
+			if result.Param.System[prefix+"bss_transition"] != "disabled" {
+				t.Fatal("legacy network retained BSS Transition")
+			}
+		}
+		for _, identity := range []string{"fixture-wifi", "disabled-peer", "guest"} {
+			for _, prefix := range aaaPrefixes(identity) {
+				key := prefix + "bss_transition"
+				beforeValue, beforeExists := bssBaseline.System[key]
+				afterValue, afterExists := result.Param.System[key]
+				if beforeValue != afterValue || beforeExists != afterExists {
+					t.Fatal("peer BSS Transition changed")
+				}
+			}
+		}
+
+		managementBody, err := result.Param.Management.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		systemBody, err := result.Param.System.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		loadedManagement, err := configmap.Parse(managementBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		loadedSystem, err := configmap.Parse(systemBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		unrelated := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+			{Name: "fixture-wifi"},
+			{Name: "legacy", Enabled: network.Supplied(false)},
+			{Name: "disabled-peer"},
+			{Name: "guest"},
+		})}
+		repeated, err := registry.CompileAP(descriptor, profile.CompilationInput{
+			Baseline: profile.SetParam{Version: result.Param.Version, Management: loadedManagement, System: loadedSystem},
+			AP:       result.AP,
+			Bindings: result.Bindings,
+		}, unrelated, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, identity := range []string{"legacy", "fixture-wifi", "disabled-peer", "guest"} {
+			for _, prefix := range aaaPrefixes(identity) {
+				key := prefix + "bss_transition"
+				want, wantExists := result.Param.System[key]
+				got, gotExists := repeated.Param.System[key]
+				if got != want || gotExists != wantExists {
+					t.Fatal("omitted BSS Transition changed after baseline reload")
+				}
+			}
+		}
+	})
+	t.Run("clear VLAN and channel", func(t *testing.T) {
+		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "fixture-wifi"}, {Name: "legacy", VLAN: network.Cleared[network.VLANID]()}, {Name: "guest"}}), Radios: network.Supplied([]network.RadioConfig{{Band: network.Band2GHz, Channel: network.Cleared[uint16]()}})}
+		result, err := registry.CompileAP(descriptor, input, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := before.Clone()
+		want["aaa.2.br.devname"] = "br0"
+		want["radio.2.channel"] = "auto"
+		delete(want, "bridge.2.port.2.devname")
+		want["bridge.1.port.2.devname"] = "ath1"
+		assertComposition(t, result.Param, baseline.Management, want)
+	})
+	t.Run("remove typed members only", func(t *testing.T) {
+		result, err := registry.CompileAP(descriptor, input, network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{})}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Param.System["operator.unmodeled"] != "retain" || result.Param.System["wireless.2.operator.unmodeled"] != "" || result.Param.System["wireless.1.ssid"] != "" || result.Param.System["radio.1.phyname"] == "" {
+			t.Fatal("resource removal lost ownership boundaries")
+		}
+	})
+	t.Run("ambiguous identity", func(t *testing.T) {
+		bad := input
+		bad.Baseline.System = before.Clone()
+		bad.Baseline.System["wireless.4.ssid"], bad.Baseline.System["wireless.4.parent"], bad.Baseline.System["wireless.4.devname"] = "legacy", "wifi-ng", "ath9"
+		if _, err := registry.CompileAP(descriptor, bad, request, nil); err == nil {
+			t.Fatal("duplicate identity was accepted")
+		}
+	})
+	t.Run("capabilities apply only to requested setting", func(t *testing.T) {
+		unfamiliar := descriptor
+		unfamiliar.Model, unfamiliar.Firmware = "UNRECOGNIZED", "1"
+		result, err := registry.CompileAP(unfamiliar, input, request, nil)
+		if err != nil {
+			t.Fatal("unrecognized model rejected unchanged capability policy")
+		}
+		assertComposition(t, result.Param, baseline.Management, expected)
+		req := network.APConfig{Radios: network.Supplied([]network.RadioConfig{{Band: network.Band2GHz, Channel: network.Supplied(uint16(6))}})}
+		if _, err := registry.CompileAP(unfamiliar, input, req, nil); err == nil {
+			t.Fatal("missing channel evidence accepted")
+		}
+		unfamiliar.Radios = append([]profile.RadioCapability(nil), descriptor.Radios...)
+		for index := range unfamiliar.Radios {
+			unfamiliar.Radios[index].Channels = []uint16{6}
+		}
+		if _, err := registry.CompileAP(unfamiliar, input, req, nil); err != nil {
+			t.Fatal("reported channel rejected", err)
+		}
+	})
+	t.Run("new WLAN requires policy", func(t *testing.T) {
+		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "new"}})}
+		if _, err := registry.CompileAP(descriptor, input, req, nil); err == nil {
+			t.Fatal("new resource used hidden policy")
+		}
+	})
+
+	t.Run("add explicit WLAN", func(t *testing.T) {
+		secretPath := filepath.Join(t.TempDir(), "psk")
+		if err := os.WriteFile(secretPath, []byte("fixture-passphrase"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		newWiFi := network.WiFiNetwork{Name: "new", Enabled: network.Supplied(true), VLAN: network.Cleared[network.VLANID](), Bands: network.Supplied([]network.RadioBand{network.Band2GHz}), BSSTransition: network.Supplied(network.BSSTransitionDisabled), Security: network.Supplied(network.WiFiSecurity{Mode: network.Supplied(network.WPA2Personal), PSK: network.Supplied(network.SecretFile(secretPath))})}
+		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "guest"}, {Name: "legacy"}, {Name: "fixture-wifi"}, newWiFi})}
+		result, err := registry.CompileAP(descriptor, input, req, fileSecrets{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for key, value := range before {
+			if result.Param.System[key] != value {
+				t.Fatal("addition changed retained record")
+			}
+		}
+		if result.Param.System["wireless.4.ssid"] != "new" || result.Param.System["aaa.4.bss_transition"] != "disabled" || result.Param.System["aaa.4.wpa.psk"] != "fixture-passphrase" {
+			t.Fatal("new explicit policy is missing")
+		}
+		if _, exists := result.Param.System["wireless.4.dtim_period"]; exists {
+			t.Fatal("new WLAN selected omitted rate policy")
+		}
+	})
+	t.Run("band addition copies owned unknown records", func(t *testing.T) {
+		copyInput := input
+		copyInput.Baseline.System = before.Clone()
+		copyInput.Baseline.System["netconf.4.operator.unmodeled"] = "copy-interface"
+		copyInput.Baseline.System["bridge.2.port.2.operator.unmodeled"] = "copy-member"
+		copyInput.Baseline.System["ebtables.99.cmd"] = "-t nat -A PREROUTING --in-interface ath1 -j DROP"
+		copyInput.Baseline.System["ebtables.99.operator.unmodeled"] = "copy-filter"
+		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "guest"}, {Name: "legacy", Bands: network.Supplied([]network.RadioBand{network.Band2GHz, network.Band5GHz})}, {Name: "fixture-wifi"}})}
+		result, err := registry.CompileAP(descriptor, copyInput, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for key, value := range copyInput.Baseline.System {
+			if result.Param.System[key] != value {
+				t.Fatal("band addition changed retained record")
+			}
+		}
+		var target profile.ResourceBinding
+		for _, binding := range result.Bindings {
+			if binding.Kind == "wifi" && binding.Identity == "legacy" && binding.Prefixes[0] != "wireless.2." {
+				target = binding
+			}
+		}
+		if len(target.Prefixes) < 4 {
+			t.Fatal("band copy omitted owned references")
+		}
+		if result.Param.System[target.Prefixes[0]+"operator.unmodeled"] != "legacy-only" || result.Param.System[target.Prefixes[1]+"wpa.key.1.mgmt"] != "UNSUPPORTED-UNCHANGED" {
+			t.Fatal("band copy lost untyped WLAN policy")
+		}
+		copied := map[string]bool{}
+		for _, prefix := range target.Prefixes {
+			if value := result.Param.System[prefix+"operator.unmodeled"]; value != "" {
+				copied[value] = true
+			}
+		}
+		if !copied["copy-interface"] || !copied["copy-member"] || !copied["copy-filter"] {
+			t.Fatal("band copy lost unknown owned records")
+		}
+	})
+	t.Run("partial SSH preserves service policy", func(t *testing.T) {
+		result, err := registry.CompileAP(descriptor, input, network.APConfig{SSH: network.Supplied(network.SSHConfig{Username: network.Supplied("renamed")})}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := before.Clone()
+		want["users.1.name"] = "renamed"
+		assertComposition(t, result.Param, baseline.Management, want)
+	})
+
+	t.Run("VLAN move retains unknown membership policy", func(t *testing.T) {
+		moved := input
+		moved.Baseline.System = before.Clone()
+		moved.Baseline.System["bridge.2.port.2.operator.unmodeled"] = "retain-member"
+		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "fixture-wifi"}, {Name: "legacy", VLAN: network.Cleared[network.VLANID]()}, {Name: "guest"}})}
+		result, err := registry.CompileAP(descriptor, moved, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Param.System["bridge.1.port.2.operator.unmodeled"] != "retain-member" {
+			t.Fatal("VLAN move lost unknown member policy")
+		}
+	})
+	t.Run("move WLAN between radios", func(t *testing.T) {
+		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "fixture-wifi"}, {Name: "legacy", Bands: network.Supplied([]network.RadioBand{network.Band5GHz})}, {Name: "guest"}})}
+		result, err := registry.CompileAP(descriptor, input, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Param.System["wireless.2.ssid"] != "" || result.Param.System["wireless.4.operator.unmodeled"] != "legacy-only" || result.Param.System["wireless.4.parent"] != "wifi-na" {
+			t.Fatal("radio move lost identity or unknown records")
+		}
+	})
+	t.Run("result owns nested slices", func(t *testing.T) {
+		result, err := registry.CompileAP(descriptor, input, network.APConfig{}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result.AP.Networks.Value[0].Bands.Value[0] = network.Band2GHz
+		result.Bindings[0].Prefixes[0] = "changed"
+		result.Param.Management["operator.unmodeled"] = "changed"
+		if config.Networks.Value[0].Bands.Value[0] != network.Band5GHz || baseline.Management["operator.unmodeled"] != "retain-management" {
+			t.Fatal("result aliases nested input")
+		}
+	})
+	t.Run("radio removal rejects unprojected WLAN", func(t *testing.T) {
+		prior := network.APConfig{Radios: network.Supplied([]network.RadioConfig{{Band: network.Band2GHz}})}
+		unprojected := profile.CompilationInput{Baseline: baseline, AP: &prior}
+		req := network.APConfig{Radios: network.Supplied([]network.RadioConfig{})}
+		if _, err := registry.CompileAP(descriptor, unprojected, req, nil); err == nil {
+			t.Fatal("radio removal accepted retained unprojected WLAN references")
+		}
+		if !maps.Equal(baseline.System, before) {
+			t.Fatal("rejected radio removal mutated baseline")
+		}
+	})
+	t.Run("primary removal preserves retained virtual subtree", func(t *testing.T) {
+		retained := input
+		retained.Baseline.System = before.Clone()
+		virtual := "radio.2.virtual.9."
+		retained.Baseline.System[virtual+"devname"] = "ath2"
+		retained.Baseline.System[virtual+"status"] = "enabled"
+		retained.Baseline.System[virtual+"operator.unmodeled"] = "retain-virtual"
+		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "fixture-wifi"}, {Name: "guest"}})}
+		result, err := registry.CompileAP(descriptor, retained, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Param.System["radio.2.devname"] != "ath2" {
+			t.Fatal("primary reference did not move to retained interface")
+		}
+		for key, value := range retained.Baseline.System {
+			if strings.HasPrefix(key, virtual) && result.Param.System[key] != value {
+				t.Fatal("primary promotion erased retained virtual-radio policy")
+			}
+		}
+	})
+	t.Run("VLAN move and band addition preserve member policy", func(t *testing.T) {
+		moved := input
+		moved.Baseline.System = before.Clone()
+		moved.Baseline.System["bridge.2.port.2.operator.unmodeled"] = "retain-member"
+		req := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{{Name: "fixture-wifi"}, {Name: "legacy", VLAN: network.Cleared[network.VLANID](), Bands: network.Supplied([]network.RadioBand{network.Band2GHz, network.Band5GHz})}, {Name: "guest"}})}
+		result, err := registry.CompileAP(descriptor, moved, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		members := 0
+		for _, binding := range result.Bindings {
+			if binding.Kind != "wifi" || binding.Identity != "legacy" {
+				continue
+			}
+			if result.Param.System[binding.Prefixes[1]+"br.devname"] != "br0" {
+				t.Fatal("added band retained the obsolete VLAN")
+			}
+			for _, prefix := range binding.Prefixes {
+				if strings.HasPrefix(prefix, "bridge.") {
+					members++
+					if result.Param.System[prefix+"operator.unmodeled"] != "retain-member" {
+						t.Fatal("combined VLAN move and band addition lost member policy")
+					}
+				}
+			}
+		}
+		if members != 2 {
+			t.Fatal("combined request did not bind both WLAN members")
+		}
+	})
 	snapshot, err := ap.New().Decode(report)
 	if err != nil {
 		t.Fatal(err)

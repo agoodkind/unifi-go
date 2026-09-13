@@ -2,15 +2,12 @@
 package ap
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
-
-	"github.com/GehirnInc/crypt/sha512_crypt"
 
 	"goodkind.io/unifi-go/internal/configmap"
 	"goodkind.io/unifi-go/internal/profile"
@@ -26,223 +23,521 @@ func (compiler) Supports(descriptor profile.DeviceDescriptor) bool {
 	return descriptor.Family == network.FamilyAP && descriptor.Protocol.PacketVersion <= 1 && descriptor.Protocol.PayloadVersion == 1 && descriptor.Protocol.SystemConfig && descriptor.Protocol.ManagementConfig
 }
 
-func (compiler) Compile(descriptor profile.DeviceDescriptor, config network.APConfig, secrets profile.SecretReader) (profile.SetParam, error) {
+func (compiler) Compile(descriptor profile.DeviceDescriptor, input profile.CompilationInput, request network.APConfig, secrets profile.SecretReader) (profile.Compilation, error) {
 	if !New().Supports(descriptor) {
-		return profile.SetParam{}, fmt.Errorf("unsupported access point configuration protocol")
+		return profile.Compilation{}, fmt.Errorf("unsupported access point configuration protocol")
 	}
-	if err := config.Validate(); err != nil {
-		slog.Error("access point configuration validation failed", "error", err)
-		return profile.SetParam{}, fmt.Errorf("validate access point configuration: %w", err)
+	if err := request.Validate(); err != nil {
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose access point: %w", err)
 	}
-	if secrets == nil && (len(config.Networks) > 0 || config.SSH != nil) {
-		return profile.SetParam{}, fmt.Errorf("secret reader is required")
+	if input.Switch != nil {
+		return profile.Compilation{}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
 	}
-	if len(descriptor.Radios) == 0 {
-		return profile.SetParam{}, fmt.Errorf("no reported radios")
-	}
-	physical, err := reportedRadios(descriptor, config.Radios)
+	param, err := profile.CloneBaseline(input)
 	if err != nil {
-		return profile.SetParam{}, err
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose access point: %w", err)
 	}
-	if err := validateDescriptorValues(descriptor, physical); err != nil {
-		return profile.SetParam{}, err
-	}
-
-	system := baseSystem()
-	bridgeMembers := wiredInterfaces(descriptor)
-	writeSystemDefaults(system, descriptor, config.CountryCode)
-	configuredRadios, err := writeConfiguredRadios(system, config, physical, descriptor)
+	prior := profile.MergeAP(input.AP, network.APConfig{})
+	effective := profile.MergeAP(input.AP, request)
+	bindings, err := resolveBindings(param.System, descriptor, prior)
 	if err != nil {
-		return profile.SetParam{}, err
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose access point: %w", err)
 	}
-	vlanMembers, wirelessBridgeMembers, err := writeNetworks(system, config.Networks, configuredRadios, physical, secrets, 2+len(wiredInterfaces(descriptor)))
+	if err := verifyBindings(input.Bindings, bindings); err != nil {
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose access point: %w", err)
+	}
+	if request.CountryCode.Present {
+		param.System["radio.countrycode"] = strconv.Itoa(int(request.CountryCode.Value))
+		for _, prefix := range profile.RecordPrefixes(param.System, "radio.") {
+			param.System[prefix+"countrycode"] = strconv.Itoa(int(request.CountryCode.Value))
+		}
+	}
+	for _, radio := range request.Radios.Value {
+		if err := overlayRadio(param.System, descriptor, radio, effective); err != nil {
+			slog.Warn("configuration composition failed")
+			return profile.Compilation{}, fmt.Errorf("compose access point: %w", err)
+		}
+	}
+	if err := overlayNetworks(param.System, descriptor, bindings, effective, request, secrets); err != nil {
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose access point: %w", err)
+	}
+	if err := removeMembers(param.System, descriptor, bindings, effective, request); err != nil {
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose access point: %w", err)
+	}
+	if request.SSH.Present {
+		if err := profile.WriteSSH(param.System, request.SSH.Value, secrets); err != nil {
+			slog.Warn("configuration composition failed")
+			return profile.Compilation{}, fmt.Errorf("compose access point: %w", err)
+		}
+	}
+	bindings, err = resolveBindings(param.System, descriptor, effective)
 	if err != nil {
-		return profile.SetParam{}, err
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose access point: %w", err)
 	}
-	bridgeMembers = append(bridgeMembers, wirelessBridgeMembers...)
-	writeBridge(system, 1, "br0", bridgeMembers)
-	writeNetconf(system, 1, "br0", true)
-	for wiredIndex, wired := range wiredInterfaces(descriptor) {
-		writeNetconf(system, wiredIndex+2, wired, true)
-	}
-	writeVLANs(system, descriptor, vlanMembers, configuredVAPCount(config.Networks))
-	if err := writeSSH(system, config.SSH, secrets); err != nil {
-		return profile.SetParam{}, err
-	}
-	param := profile.SetParam{Version: "", Management: configmap.Values{}, System: system}
-	version, err := profile.CanonicalVersion(param)
+	param.Version, err = profile.CanonicalVersion(param)
 	if err != nil {
-		return profile.SetParam{}, fmt.Errorf("derive configuration version: %w", err)
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose access point: %w", err)
 	}
-	param.Version = version
-	return param, nil
+	return profile.Compilation{Param: param, AP: &effective, Switch: nil, Bindings: profile.CloneBindings(bindings)}, nil
 }
 
-func reportedRadios(descriptor profile.DeviceDescriptor, requested []network.RadioConfig) (map[network.RadioBand]profile.RadioCapability, error) {
-	physical := make(map[network.RadioBand]profile.RadioCapability, len(descriptor.Radios))
-	for _, radio := range descriptor.Radios {
-		if !slices.ContainsFunc(requested, func(config network.RadioConfig) bool { return config.Band == radio.Band }) {
+func radioCapability(descriptor profile.DeviceDescriptor, band network.RadioBand) (profile.RadioCapability, error) {
+	var result profile.RadioCapability
+	found := false
+	for _, capability := range descriptor.Radios {
+		if capability.Band != band {
 			continue
 		}
-		if radio.Interface == "" {
-			return nil, fmt.Errorf("radio %q lacks band or interface", radio.ID)
+		if found || capability.ID == "" || capability.Interface == "" || strings.ContainsAny(capability.Interface, "\r\n") {
+			return result, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
 		}
-		if _, exists := physical[radio.Band]; exists {
-			return nil, fmt.Errorf("multiple reported radios for band %q", radio.Band)
-		}
-		physical[radio.Band] = radio
+		result, found = capability, true
 	}
-	return physical, nil
+	if !found {
+		return result, fmt.Errorf("radios: no reported radio for requested band")
+	}
+	return result, nil
 }
 
-// This compatibility evidence is limited to reproduced settings on this firmware.
-// Model identity never admits a device or supplies power bounds.
-func reproducedRadioSetting(descriptor profile.DeviceDescriptor, requested network.RadioConfig) bool {
-	if descriptor.Model != "U7PG2" || descriptor.Firmware != "6.8.2.15592" {
-		return false
-	}
-	channel := uint16(0)
-	if requested.Channel != nil {
-		channel = *requested.Channel
-	}
-	switch requested.Band {
-	case network.Band2GHz:
-		if requested.WidthMHz == network.Width20 {
-			return channel == 0 || channel == 6 || channel == 11
-		}
-		return requested.WidthMHz == network.Width40 && channel == 6
-	case network.Band5GHz:
-		return requested.WidthMHz == network.Width40 && (channel == 0 || channel == 44 || channel == 157)
-	default:
-		return false
-	}
-}
-
-func writeConfiguredRadios(values configmap.Values, config network.APConfig, physical map[network.RadioBand]profile.RadioCapability, descriptor profile.DeviceDescriptor) (map[network.RadioBand]int, error) {
-	configured := make(map[network.RadioBand]int, len(config.Radios))
-	requestedRadios := append([]network.RadioConfig(nil), config.Radios...)
-	slices.SortFunc(requestedRadios, func(left network.RadioConfig, right network.RadioConfig) int {
-		return strings.Compare(physical[left.Band].Interface, physical[right.Band].Interface)
-	})
-	nextVAPIndex := 0
-	for index, requested := range requestedRadios {
-		reported, exists := physical[requested.Band]
-		if !exists {
-			return nil, fmt.Errorf("radios[%d].band: no reported radio for %q", index, requested.Band)
-		}
-		if err := validateRadioCapability(requested, reported, index, descriptor); err != nil {
-			return nil, err
-		}
-		deviceName := virtualInterface(reported.Interface, nextVAPIndex)
-		configured[requested.Band] = nextVAPIndex
-		writeRadio(values, index+1, deviceName, reported.Interface, config.CountryCode, requested)
-		vapCount := 0
-		for _, wifi := range config.Networks {
-			if slices.Contains(wifi.Bands, requested.Band) {
-				vapCount++
-			}
-		}
-		if vapCount == 0 {
-			vapCount = 1
-		}
-		if strings.HasPrefix(deviceName, reported.Interface+"ap") {
-			writePhysicalVirtualRadios(values, index+1, reported.Interface, nextVAPIndex, vapCount)
-		}
-		nextVAPIndex += vapCount
-	}
-	return configured, nil
-}
-
-func writeNetworks(values configmap.Values, networks []network.WiFiNetwork, configured map[network.RadioBand]int, physical map[network.RadioBand]profile.RadioCapability, secrets profile.SecretReader, netconfStart int) (map[network.VLANID][]string, []string, error) {
-	vlans := make(map[network.VLANID][]string)
-	var untagged []string
-	psks, err := readNetworkPSKs(networks, secrets)
-	if err != nil {
-		return nil, nil, err
-	}
-	bands := make([]network.RadioBand, 0, len(configured))
-	for band := range configured {
-		bands = append(bands, band)
-	}
-	slices.SortFunc(bands, func(left network.RadioBand, right network.RadioBand) int {
-		return strings.Compare(physical[left].Interface, physical[right].Interface)
-	})
-	wirelessIndex := 0
-	for _, band := range bands {
-		deviceIndex := configured[band]
-		for networkIndex, wifi := range networks {
-			if !slices.Contains(wifi.Bands, band) {
-				continue
-			}
-			deviceName := virtualInterface(physical[band].Interface, deviceIndex)
-			deviceIndex++
-			wirelessIndex++
-			bridgeName := "br0"
-			if wifi.VLAN != nil {
-				bridgeName = fmt.Sprintf("br0.%d", *wifi.VLAN)
-				vlans[*wifi.VLAN] = append(vlans[*wifi.VLAN], deviceName)
-			} else {
-				untagged = append(untagged, deviceName)
-			}
-			writeWireless(values, wirelessIndex, deviceName, physical[band].Interface, bridgeName, band, wifi, psks[networkIndex])
-			writeVAPEbtables(values, wirelessIndex, deviceName)
-			writeNetconf(values, netconfStart+wirelessIndex-1, deviceName, false)
-		}
-	}
-	return vlans, untagged, nil
-}
-
-func readNetworkPSKs(networks []network.WiFiNetwork, secrets profile.SecretReader) ([]string, error) {
-	psks := make([]string, len(networks))
-	for index, wifi := range networks {
-		if strings.ContainsAny(wifi.Name, "\r\n") {
-			return nil, fmt.Errorf("networks[%d].name: contains newline", index)
-		}
-		secret, err := secrets.ReadSecret(wifi.Security.PSK)
+func resolveBindings(values configmap.Values, descriptor profile.DeviceDescriptor, config network.APConfig) ([]profile.ResourceBinding, error) {
+	var result []profile.ResourceBinding
+	for _, radio := range config.Radios.Value {
+		capability, err := radioCapability(descriptor, radio.Band)
 		if err != nil {
-			slog.Error("wireless secret read failed", "network_index", index, "error", err)
-			return nil, fmt.Errorf("networks[%d].security.psk: %w", index, err)
+			slog.Warn("configuration composition failed")
+			return nil, fmt.Errorf("resolve access point: %w", err)
 		}
-		psks[index] = string(secret)
-		if err := validatePSK(psks[index]); err != nil {
-			return nil, fmt.Errorf("networks[%d].security.psk: %w", index, err)
+		prefix, err := profile.MatchRecord(values, "radio.", "phyname", capability.Interface)
+		if err != nil || prefix == "" {
+			return nil, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+		}
+		result = append(result, profile.ResourceBinding{Kind: "radio", Identity: string(radio.Band), RadioID: capability.ID, Prefixes: []string{prefix}})
+	}
+	for _, wifi := range config.Networks.Value {
+		for _, band := range wifi.Bands.Value {
+			capability, err := radioCapability(descriptor, band)
+			if err != nil {
+				slog.Warn("configuration composition failed")
+				return nil, fmt.Errorf("resolve access point: %w", err)
+			}
+			binding, err := resolveWiFi(values, wifi.Name, capability)
+			if err != nil {
+				slog.Warn("configuration composition failed")
+				return nil, fmt.Errorf("resolve access point: %w", err)
+			}
+			result = append(result, binding)
 		}
 	}
-	return psks, nil
+	result = profile.CloneBindings(result)
+	for index := 1; index < len(result); index++ {
+		prior, current := result[index-1], result[index]
+		if prior.Kind == current.Kind && prior.Identity == current.Identity && prior.RadioID == current.RadioID {
+			return nil, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+		}
+	}
+	return result, nil
 }
 
-func writeSSH(values configmap.Values, ssh *network.SSHConfig, secrets profile.SecretReader) error {
-	if ssh == nil {
+func resolveWiFi(values configmap.Values, name string, capability profile.RadioCapability) (profile.ResourceBinding, error) {
+	var prefix string
+	for _, candidate := range profile.RecordPrefixes(values, "wireless.") {
+		if values[candidate+"ssid"] != name || values[candidate+"parent"] != capability.Interface {
+			continue
+		}
+		if prefix != "" {
+			return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+		}
+		prefix = candidate
+	}
+	if prefix == "" || values[prefix+"devname"] == "" {
+		return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+	}
+	deviceName := values[prefix+"devname"]
+	owner, err := profile.MatchRecord(values, "wireless.", "devname", deviceName)
+	if err != nil || owner != prefix {
+		return profile.ResourceBinding{}, &network.ControlError{Code: network.BaselineUnusable}
+	}
+	aaa, err := profile.MatchRecord(values, "aaa.", "devname", deviceName)
+	if err != nil || aaa == "" || values[aaa+"ssid"] != name {
+		return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+	}
+	prefixes := []string{prefix, aaa}
+	netconf, err := profile.MatchRecord(values, "netconf.", "devname", deviceName)
+	if err != nil {
+		slog.Warn("configuration composition failed")
+		return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, fmt.Errorf("resolve WLAN: %w", err)
+	}
+	if netconf != "" {
+		prefixes = append(prefixes, netconf)
+	}
+	bridge, err := profile.MatchRecord(values, "bridge.", "devname", values[aaa+"br.devname"])
+	if err != nil || bridge == "" {
+		return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+	}
+	member, err := uniqueBridgeMember(values, deviceName)
+	if err != nil || member != "" && !strings.HasPrefix(member, bridge+"port.") {
+		return profile.ResourceBinding{}, &network.ControlError{Code: network.BaselineUnusable}
+	}
+	if member != "" {
+		prefixes = append(prefixes, member)
+	}
+	filters, err := interfaceFilters(values, deviceName)
+	if err != nil {
+		return profile.ResourceBinding{}, err
+	}
+	prefixes = append(prefixes, filters...)
+	return profile.ResourceBinding{Kind: "wifi", Identity: name, RadioID: capability.ID, Prefixes: prefixes}, nil
+}
+
+func interfaceFilters(values configmap.Values, deviceName string) ([]string, error) {
+	wirelessDevices := make(map[string]bool)
+	for _, prefix := range profile.RecordPrefixes(values, "wireless.") {
+		wirelessDevices[values[prefix+"devname"]] = true
+	}
+	var result []string
+	for _, command := range profile.RecordPrefixes(values, "ebtables.") {
+		words := strings.Fields(values[command+"cmd"])
+		interfaces := make(map[string]bool)
+		for index, word := range words {
+			if (word == "--in-interface" || word == "--out-interface") && index+1 < len(words) && wirelessDevices[words[index+1]] {
+				interfaces[words[index+1]] = true
+			}
+		}
+		if !interfaces[deviceName] {
+			continue
+		}
+		if len(interfaces) != 1 {
+			return nil, &network.ControlError{Code: network.BaselineUnusable}
+		}
+		result = append(result, command)
+	}
+	return result, nil
+}
+
+func verifyBindings(stored, resolved []profile.ResourceBinding) error {
+	for _, binding := range stored {
+		index := slices.IndexFunc(resolved, func(candidate profile.ResourceBinding) bool {
+			return candidate.Kind == binding.Kind && candidate.Identity == binding.Identity && candidate.RadioID == binding.RadioID
+		})
+		if index < 0 {
+			return &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+		}
+		for _, prefix := range binding.Prefixes {
+			if !slices.Contains(resolved[index].Prefixes, prefix) {
+				return &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+			}
+		}
+	}
+	return nil
+}
+
+func wifiBinding(bindings []profile.ResourceBinding, name, radioID string) (profile.ResourceBinding, bool) {
+	for _, binding := range bindings {
+		if binding.Kind == "wifi" && binding.Identity == name && binding.RadioID == radioID {
+			return binding, true
+		}
+	}
+	return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, false
+}
+
+func retainsWiFi(config network.APConfig, descriptor profile.DeviceDescriptor, binding profile.ResourceBinding) bool {
+	for _, wifi := range config.Networks.Value {
+		if wifi.Name != binding.Identity {
+			continue
+		}
+		for _, band := range wifi.Bands.Value {
+			for _, radio := range descriptor.Radios {
+				if radio.Band == band && radio.ID == binding.RadioID {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func removeWiFi(values configmap.Values, binding profile.ResourceBinding) error {
+	deviceName := values[binding.Prefixes[0]+"devname"]
+	bridgeName := values[binding.Prefixes[1]+"br.devname"]
+	parent := values[binding.Prefixes[0]+"parent"]
+	for _, prefix := range binding.Prefixes {
+		profile.DeleteRecord(values, prefix)
+	}
+	radio, err := profile.MatchRecord(values, "radio.", "phyname", parent)
+	if err != nil {
+		slog.Warn("configuration composition failed")
+		return fmt.Errorf("compose access point: %w", err)
+	}
+	if radio != "" {
+		removeRadioInterface(values, radio, parent, deviceName)
+	}
+	return removeUnusedBridge(values, bridgeName)
+}
+
+func removeUnusedBridge(values configmap.Values, name string) error {
+	if name == "" || name == "br0" {
 		return nil
 	}
-	if strings.ContainsAny(ssh.Username, "\r\n") {
-		return fmt.Errorf("ssh.username: contains newline")
+	for _, prefix := range profile.RecordPrefixes(values, "aaa.") {
+		if values[prefix+"br.devname"] == name {
+			return nil
+		}
 	}
-	password, err := secrets.ReadSecret(ssh.Password)
+	bridge, err := profile.MatchRecord(values, "bridge.", "devname", name)
 	if err != nil {
-		slog.Error("SSH secret read failed", "error", err)
-		return fmt.Errorf("ssh.password: %w", err)
+		slog.Warn("configuration composition failed")
+		return fmt.Errorf("resolve bridge: %w", err)
 	}
-	plainPassword := string(password)
-	if plainPassword == "" || strings.ContainsAny(plainPassword, "\r\n") {
-		return fmt.Errorf("ssh.password: secret is empty or contains newline")
+	if bridge == "" {
+		return nil
 	}
-	saltDigest := sha256.Sum256([]byte(ssh.Username + "\x00" + plainPassword))
-	salt := "$6$" + hex.EncodeToString(saltDigest[:8])
-	passwordHash, err := sha512_crypt.New().Generate([]byte(plainPassword), []byte(salt))
+	members := profile.RecordPrefixes(values, bridge+"port.")
+	// An unrecognized interface keeps its bridge; only known VLAN dependencies can be collected.
+	for _, member := range members {
+		if vlanInterface(values, values[member+"devname"]) == "" {
+			return nil
+		}
+	}
+	for _, member := range members {
+		deviceName := values[member+"devname"]
+		if usedByOtherBridge(values, bridge, deviceName) {
+			continue
+		}
+		profile.DeleteRecord(values, vlanInterface(values, deviceName))
+		if err := removeNetconf(values, deviceName); err != nil {
+			return err
+		}
+	}
+	profile.DeleteRecord(values, bridge)
+	return removeNetconf(values, name)
+}
+
+func removeNetconf(values configmap.Values, deviceName string) error {
+	prefix, err := profile.MatchRecord(values, "netconf.", "devname", deviceName)
 	if err != nil {
-		slog.Error("SSH password hashing failed", "error", err)
-		return fmt.Errorf("ssh.password: hash secret: %w", err)
+		slog.Warn("configuration composition failed")
+		return fmt.Errorf("remove interface: %w", err)
 	}
-	set(values, "sshd.status", "enabled")
-	set(values, "sshd.auth.passwd", "enabled")
-	set(values, "sshd.1.ifname", "br0")
-	set(values, "sshd.1.status", "enabled")
-	set(values, "users.status", "enabled")
-	set(values, "users.1.status", "enabled")
-	set(values, "users.1.name", ssh.Username)
-	set(values, "users.1.password", passwordHash)
+	if prefix != "" {
+		profile.DeleteRecord(values, prefix)
+	}
 	return nil
+}
+
+func vlanInterface(values configmap.Values, deviceName string) string {
+	for _, prefix := range profile.RecordPrefixes(values, "vlan.") {
+		if values[prefix+"devname"]+"."+values[prefix+"id"] == deviceName {
+			return prefix
+		}
+	}
+	return ""
+}
+
+func usedByOtherBridge(values configmap.Values, excluded, deviceName string) bool {
+	for _, bridge := range profile.RecordPrefixes(values, "bridge.") {
+		if bridge == excluded {
+			continue
+		}
+		for _, member := range profile.RecordPrefixes(values, bridge+"port.") {
+			if values[member+"devname"] == deviceName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func overlayRadio(values configmap.Values, descriptor profile.DeviceDescriptor, request network.RadioConfig, effective network.APConfig) error {
+	capability, err := radioCapability(descriptor, request.Band)
+	if err != nil {
+		slog.Warn("configuration composition failed")
+		return fmt.Errorf("compose access point: %w", err)
+	}
+	prefix, err := profile.MatchRecord(values, "radio.", "phyname", capability.Interface)
+	if err != nil {
+		slog.Warn("configuration composition failed")
+		return fmt.Errorf("compose access point: %w", err)
+	}
+	if prefix == "" {
+		return &network.ControlError{Code: network.PolicyRequired, Field: "radios"}
+	}
+	var resolved network.RadioConfig
+	for _, radio := range effective.Radios.Value {
+		if radio.Band == request.Band {
+			resolved = radio
+		}
+	}
+	exception := resolved.Channel.Present && resolved.WidthMHz.Present && reproducedRadioSetting(descriptor, resolved)
+	if request.Channel.Present && !request.Channel.Null && !slices.Contains(capability.Channels, request.Channel.Value) && (len(capability.Channels) != 0 || !exception) {
+		return fmt.Errorf("radios: requested channel lacks capability evidence")
+	}
+	if request.WidthMHz.Present && !slices.Contains(capability.Widths, request.WidthMHz.Value) && (len(capability.Widths) != 0 || !exception) {
+		return fmt.Errorf("radios: requested width lacks capability evidence")
+	}
+	if request.Enabled.Present {
+		values[prefix+"status"] = enabled(request.Enabled.Value)
+	}
+	if request.Channel.Present {
+		channel := "auto"
+		if !request.Channel.Null {
+			channel = strconv.Itoa(int(request.Channel.Value))
+		}
+		values[prefix+"channel"] = channel
+	}
+	if request.WidthMHz.Present {
+		values[prefix+"cwm.mode"] = widthMode(request.Band, request.WidthMHz.Value)
+		values[prefix+"ieee_mode"] = ieeeMode(request.Band, request.WidthMHz.Value)
+	}
+	if request.Power.Present {
+		return overlayPower(values, prefix, capability, request, effective)
+	}
+	return nil
+}
+
+func overlayWiFi(values configmap.Values, descriptor profile.DeviceDescriptor, binding profile.ResourceBinding, wifi network.WiFiNetwork, secrets profile.SecretReader) error {
+	wireless, aaa := binding.Prefixes[0], binding.Prefixes[1]
+	if wifi.Enabled.Present {
+		values[wireless+"status"], values[aaa+"status"] = enabled(wifi.Enabled.Value), enabled(wifi.Enabled.Value)
+	}
+	if wifi.BSSTransition.Present {
+		if err := values.Set(aaa+"bss_transition", string(wifi.BSSTransition.Value)); err != nil {
+			slog.Warn("configuration composition failed")
+			return fmt.Errorf("compose access point: %w", err)
+		}
+	}
+	if wifi.Security.Present {
+		if err := overlaySecurity(values, wireless, aaa, wifi.Security.Value, secrets); err != nil {
+			return err
+		}
+	}
+	if wifi.VLAN.Present {
+		return assignBridge(values, descriptor, wireless, aaa, wifi.VLAN)
+	}
+	return nil
+}
+
+func assignBridge(values configmap.Values, descriptor profile.DeviceDescriptor, wireless, aaa string, vlan network.Optional[network.VLANID]) error {
+	name := "br0"
+	if !vlan.Null {
+		name = fmt.Sprintf("br0.%d", vlan.Value)
+	}
+	oldName := values[aaa+"br.devname"]
+	if oldName == name {
+		return nil
+	}
+	deviceName := values[wireless+"devname"]
+	bridge, err := profile.MatchRecord(values, "bridge.", "devname", name)
+	if err != nil {
+		slog.Warn("configuration composition failed")
+		return fmt.Errorf("compose access point: %w", err)
+	}
+	if bridge == "" {
+		if vlan.Null {
+			return &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+		}
+		bridge = profile.NextRecord(values, "bridge.")
+		values[bridge+"devname"] = name
+		netconf := profile.NextRecord(values, "netconf.")
+		values[netconf+"devname"], values[netconf+"status"], values[netconf+"up"] = name, "enabled", "enabled"
+		for _, port := range descriptor.Ports {
+			if port.Interface == "" {
+				continue
+			}
+			wireName := fmt.Sprintf("%s.%d", port.Interface, vlan.Value)
+			prefix := profile.NextRecord(values, "vlan.")
+			values[prefix+"devname"], values[prefix+"id"] = port.Interface, strconv.Itoa(int(vlan.Value))
+			member := profile.NextRecord(values, bridge+"port.")
+			values[member+"devname"] = wireName
+			netconf := profile.NextRecord(values, "netconf.")
+			values[netconf+"devname"], values[netconf+"status"], values[netconf+"up"] = wireName, "enabled", "enabled"
+		}
+	}
+	source, err := uniqueBridgeMember(values, deviceName)
+	if err != nil {
+		return err
+	}
+	member := profile.NextRecord(values, bridge+"port.")
+	if source != "" {
+		profile.CopyBindingRecords(values, map[string]string{source: member}, nil)
+		profile.DeleteRecord(values, source)
+	}
+	values[member+"devname"] = deviceName
+	values[aaa+"br.devname"] = name
+	return removeUnusedBridge(values, oldName)
+}
+
+func addWiFi(values configmap.Values, descriptor profile.DeviceDescriptor, bindings []profile.ResourceBinding, capability profile.RadioCapability, wifi network.WiFiNetwork, secrets profile.SecretReader) (profile.ResourceBinding, error) {
+	// A band extension can copy only the same named WLAN, never a positional peer.
+	var source *profile.ResourceBinding
+	for index, binding := range bindings {
+		if binding.Kind == "wifi" && binding.Identity == wifi.Name {
+			if source != nil {
+				return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+			}
+			source = &bindings[index]
+		}
+	}
+	if source == nil {
+		if err := requireWiFiPolicy(wifi); err != nil {
+			return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, err
+		}
+	} else {
+		refreshed, err := refreshWiFiBinding(values, descriptor, *source)
+		if err != nil {
+			return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, err
+		}
+		source = &refreshed
+	}
+	wireless, aaa := profile.NextRecord(values, "wireless."), profile.NextRecord(values, "aaa.")
+	deviceName := availableInterface(values, capability.Interface)
+	var extra []string
+	if source != nil {
+		extra = copyWiFiRecords(values, *source, wireless, aaa, deviceName, capability.Interface)
+	} else {
+		values[wireless+"mode"], values[wireless+"security"], values[wireless+"authmode"] = "master", "none", "1"
+		values[aaa+"driver"] = "madwifi"
+	}
+	values[wireless+"ssid"], values[aaa+"ssid"] = wifi.Name, wifi.Name
+	values[wireless+"devname"], values[aaa+"devname"], values[wireless+"parent"] = deviceName, deviceName, capability.Interface
+	radio, err := profile.MatchRecord(values, "radio.", "phyname", capability.Interface)
+	if err != nil || radio == "" {
+		return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+	}
+	if values[radio+"devname"] == "" {
+		values[radio+"devname"] = deviceName
+	} else {
+		virtual := profile.NextRecord(values, radio+"virtual.")
+		values[virtual+"devname"], values[virtual+"mode"], values[virtual+"status"] = deviceName, "master", "enabled"
+	}
+	if len(extra) == 0 {
+		netconf := profile.NextRecord(values, "netconf.")
+		values[netconf+"devname"], values[netconf+"status"], values[netconf+"up"] = deviceName, "enabled", "disabled"
+		extra = append(extra, netconf)
+	}
+	binding := profile.ResourceBinding{Kind: "wifi", Identity: wifi.Name, RadioID: capability.ID, Prefixes: append([]string{wireless, aaa}, extra...)}
+	if source != nil {
+		// The copied bridge reference needs a distinct member for the new interface.
+		bridgeName := values[aaa+"br.devname"]
+		bridge, err := profile.MatchRecord(values, "bridge.", "devname", bridgeName)
+		if err != nil || bridge == "" {
+			return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+		}
+		if !hasBridgeMember(values, bridge, deviceName) {
+			member := profile.NextRecord(values, bridge+"port.")
+			values[member+"devname"] = deviceName
+		}
+	} else if err := overlayWiFi(values, descriptor, binding, wifi, secrets); err != nil {
+		return binding, err
+	}
+	return binding, nil
 }
 
 func validatePSK(psk string) error {
@@ -258,288 +553,6 @@ func validatePSK(psk string) error {
 		}
 	}
 	return fmt.Errorf("must contain 8 through 63 bytes or 64 hexadecimal characters")
-}
-
-func validateRadioCapability(requested network.RadioConfig, reported profile.RadioCapability, index int, descriptor profile.DeviceDescriptor) error {
-	exception := reproducedRadioSetting(descriptor, requested)
-	if requested.Channel != nil && !slices.Contains(reported.Channels, *requested.Channel) && (len(reported.Channels) != 0 || !exception) {
-		return fmt.Errorf("radios[%d].channel: requested channel lacks capability evidence", index)
-	}
-	if !slices.Contains(reported.Widths, requested.WidthMHz) && (len(reported.Widths) != 0 || !exception) {
-		return fmt.Errorf("radios[%d].width_mhz: requested width lacks capability evidence", index)
-	}
-	if requested.Power.Mode == network.PowerExplicit && requested.Power.DBm != nil {
-		if reported.MinPowerDBm == nil || reported.MaxPowerDBm == nil {
-			return fmt.Errorf("radios[%d].power.dbm: power bounds are not reported", index)
-		}
-		if reported.MinPowerDBm != nil && *requested.Power.DBm < *reported.MinPowerDBm {
-			return fmt.Errorf("radios[%d].power.dbm: below reported minimum", index)
-		}
-		if reported.MaxPowerDBm != nil && *requested.Power.DBm > *reported.MaxPowerDBm {
-			return fmt.Errorf("radios[%d].power.dbm: above reported maximum", index)
-		}
-	}
-	return nil
-}
-
-func writeRadio(values configmap.Values, index int, deviceName string, interfaceName string, country uint16, radio network.RadioConfig) {
-	prefix := fmt.Sprintf("radio.%d.", index)
-	set(values, prefix+"phyname", interfaceName)
-	set(values, prefix+"devname", deviceName)
-	set(values, prefix+"countrycode", strconv.Itoa(int(country)))
-	set(values, prefix+"status", enabled(radio.Enabled))
-	channel := "auto"
-	if radio.Channel != nil {
-		channel = strconv.Itoa(int(*radio.Channel))
-	}
-	set(values, prefix+"channel", channel)
-	set(values, prefix+"clksel", "1")
-	set(values, prefix+"cwm.mode", widthMode(radio.Band, radio.WidthMHz))
-	set(values, prefix+"ieee_mode", ieeeMode(radio.Band, radio.WidthMHz))
-	set(values, prefix+"txpower_mode", string(radio.Power.Mode))
-	power := "auto"
-	if radio.Power.Mode == network.PowerExplicit && radio.Power.DBm != nil {
-		power = strconv.Itoa(*radio.Power.DBm)
-		set(values, prefix+"txpower_mode", "custom")
-	}
-	set(values, prefix+"txpower", power)
-	for key, value := range map[string]string{
-		"ack.auto": "disabled", "acktimeout": "64", "ampdu.status": "enabled",
-		"antenna": "-1", "antenna.gain": "3", "bcmc_l2_filter.status": "enabled",
-		"bgscan.status": "disabled", "cwm.enable": "0", "forbiasauto": "0",
-		"hard_noisefloor.status": "disabled", "mode": "master", "rate.auto": "enabled",
-		"rate.mcs": "auto", "rfscan": "disabled",
-	} {
-		set(values, prefix+key, value)
-	}
-}
-
-func writeWireless(values configmap.Values, index int, deviceName string, parent string, bridge string, band network.RadioBand, wifi network.WiFiNetwork, psk string) {
-	prefix := fmt.Sprintf("wireless.%d.", index)
-	set(values, prefix+"devname", deviceName)
-	set(values, prefix+"parent", parent)
-	set(values, prefix+"ssid", wifi.Name)
-	set(values, prefix+"status", enabled(wifi.Enabled))
-	set(values, prefix+"mode", "master")
-	set(values, prefix+"security", "none")
-	iappDigest := sha256.Sum256([]byte(wifi.Name + "\x00" + psk))
-	iappKey := hex.EncodeToString(iappDigest[:16])
-	for key, value := range map[string]string{
-		"addmtikie": "disabled", "authmode": "1", "autowds": "disabled",
-		"element_adopt": "disabled", "hide_ssid": "false", "is_guest": "false",
-		"l2_isolation": "disabled", "mac_acl.policy": "deny", "mac_acl.status": "enabled",
-		"mcast.enhance": "0", "mcastrate": "auto", "multicast.inspect": "false",
-		"no2ghz_oui": "disabled", "schedule_enabled": "disabled", "uapsd": "disabled",
-		"usage": "user", "vport": "disabled", "vwire": "disabled", "wds": "disabled",
-		"wmm": "enabled",
-	} {
-		set(values, prefix+key, value)
-	}
-	if wifi.Bands != nil {
-		set(values, prefix+"id", "2")
-	}
-	if band == network.Band2GHz {
-		for key, value := range map[string]string{
-			"beacon_rate": "1000", "dtim_period": "1", "mgmt_rate": "1000",
-			"minrate_cck_rates.status": "true", "minrate_data": "1000",
-			"pureg": "0", "puren": "0",
-		} {
-			set(values, prefix+key, value)
-		}
-	} else {
-		set(values, prefix+"dtim_period", "3")
-		set(values, prefix+"pureg", "1")
-		set(values, prefix+"puren", "0")
-	}
-	aaa := fmt.Sprintf("aaa.%d.", index)
-	set(values, aaa+"devname", deviceName)
-	set(values, aaa+"br.devname", bridge)
-	set(values, aaa+"ssid", wifi.Name)
-	set(values, aaa+"status", enabled(wifi.Enabled))
-	set(values, aaa+"wpa", "2")
-	set(values, aaa+"wpa.1.pairwise", "CCMP")
-	set(values, aaa+"wpa.key.1.mgmt", "WPA-PSK")
-	set(values, aaa+"wpa.psk", psk)
-	for key, value := range map[string]string{
-		"11k.status": "disabled", "bss_transition": "enabled", "country_beacon": "disabled",
-		"driver": "madwifi", "eapol_version": "2", "ft.status": "disabled",
-		"hide_ssid": "false", "iapp_key": iappKey, "id": "2", "is_guest": "false",
-		"p2p": "disabled", "p2p_cross_connect": "disabled", "pmf.cipher": "AES-128-CMAC",
-		"pmf.mode": "0", "pmf.status": "disabled", "proxy_arp": "disabled",
-		"radius.macacl.status": "disabled", "tdls_prohibit": "disabled", "verbose": "2",
-		"wpa.group_rekey": "3600",
-	} {
-		set(values, aaa+key, value)
-	}
-}
-
-func writePhysicalVirtualRadios(values configmap.Values, radioIndex int, physicalInterface string, firstVAPIndex int, vapCount int) {
-	for virtualIndex := 1; virtualIndex < vapCount; virtualIndex++ {
-		prefix := fmt.Sprintf("radio.%d.virtual.%d.", radioIndex, virtualIndex)
-		set(values, prefix+"devname", virtualInterface(physicalInterface, firstVAPIndex+virtualIndex))
-		set(values, prefix+"mode", "master")
-		set(values, prefix+"status", "enabled")
-	}
-}
-
-func writeVAPEbtables(values configmap.Values, vapIndex int, deviceName string) {
-	firstCommand := vapIndex*2 - 1
-	set(values, fmt.Sprintf("ebtables.%d.cmd", firstCommand), fmt.Sprintf("-t nat -A PREROUTING --in-interface %s -d BGA -j DROP", deviceName))
-	set(values, fmt.Sprintf("ebtables.%d.cmd", firstCommand+1), fmt.Sprintf("-t nat -A POSTROUTING --out-interface %s -d BGA -j DROP", deviceName))
-}
-
-func writeNetconf(values configmap.Values, index int, deviceName string, up bool) {
-	prefix := fmt.Sprintf("netconf.%d.", index)
-	set(values, prefix+"autoip.status", "disabled")
-	set(values, prefix+"devname", deviceName)
-	set(values, prefix+"ip", "0.0.0.0")
-	set(values, prefix+"status", "enabled")
-	set(values, prefix+"up", enabled(up))
-	if deviceName != "br0" {
-		set(values, prefix+"promisc", "enabled")
-	}
-}
-
-func writeBridge(values configmap.Values, index int, name string, members []string) {
-	prefix := fmt.Sprintf("bridge.%d.", index)
-	set(values, prefix+"devname", name)
-	set(values, prefix+"fd", "1")
-	set(values, prefix+"stp.status", "disabled")
-	for memberIndex, member := range members {
-		set(values, fmt.Sprintf("%sport.%d.devname", prefix, memberIndex+1), member)
-	}
-}
-
-func writeVLANs(values configmap.Values, descriptor profile.DeviceDescriptor, vlanMembers map[network.VLANID][]string, vapCount int) {
-	vlanIndex := 0
-	bridgeIndex := 1
-	netconfIndex := 1 + vapCount + len(wiredInterfaces(descriptor))
-	vlans := make([]network.VLANID, 0, len(vlanMembers))
-	for vlan := range vlanMembers {
-		vlans = append(vlans, vlan)
-	}
-	slices.Sort(vlans)
-	for _, vlan := range vlans {
-		wirelessMembers := vlanMembers[vlan]
-		bridgeIndex++
-		members := append([]string(nil), wirelessMembers...)
-		for _, wired := range wiredInterfaces(descriptor) {
-			vlanIndex++
-			vlanName := fmt.Sprintf("%s.%d", wired, vlan)
-			set(values, fmt.Sprintf("vlan.%d.devname", vlanIndex), wired)
-			set(values, fmt.Sprintf("vlan.%d.id", vlanIndex), strconv.Itoa(int(vlan)))
-			members = append(members, vlanName)
-		}
-		writeBridge(values, bridgeIndex, fmt.Sprintf("br0.%d", vlan), members)
-		netconfIndex++
-		writeNetconf(values, netconfIndex, fmt.Sprintf("br0.%d", vlan), true)
-		for _, member := range wiredInterfaces(descriptor) {
-			netconfIndex++
-			writeNetconf(values, netconfIndex, fmt.Sprintf("%s.%d", member, vlan), true)
-		}
-	}
-	set(values, "vlan.status", enabled(len(vlanMembers) > 0))
-}
-
-func configuredVAPCount(networks []network.WiFiNetwork) int {
-	count := 0
-	for _, wifi := range networks {
-		count += len(wifi.Bands)
-	}
-	return count
-}
-
-func wiredInterfaces(descriptor profile.DeviceDescriptor) []string {
-	var result []string
-	for _, port := range descriptor.Ports {
-		if port.Interface != "" && !slices.Contains(result, port.Interface) {
-			result = append(result, port.Interface)
-		}
-	}
-	return result
-}
-
-func baseSystem() configmap.Values {
-	return configmap.Values{"radio.status": "enabled", "wireless.status": "enabled", "aaa.status": "enabled", "bridge.status": "enabled", "netconf.status": "enabled"}
-}
-
-func writeSystemDefaults(values configmap.Values, descriptor profile.DeviceDescriptor, countryCode uint16) {
-	writeConnectivityDefaults(values, descriptor.UplinkInterface)
-	writeNetworkServiceDefaults(values)
-	writeFilterDefaults(values)
-	writeLocaleDefaults(values)
-	writeRadioDefaults(values, countryCode)
-	writeResolverDefaults(values)
-	writeSwitchDefaults(values)
-	writeRuntimeDefaults(values)
-}
-
-func writeConnectivityDefaults(values configmap.Values, uplinkInterface string) {
-	if uplinkInterface == "" {
-		set(values, "connectivity.status", "disabled")
-		return
-	}
-	set(values, "connectivity.status", "enabled")
-	set(values, "connectivity.uplink_bridge", "br0")
-	set(values, "connectivity.uplink_eth", uplinkInterface)
-}
-
-func writeNetworkServiceDefaults(values configmap.Values) {
-	for key, value := range map[string]string{
-		"dhcpc.status": "enabled", "dhcpc.1.devname": "br0", "dhcpc.1.status": "enabled",
-		"dnsmasq.status": "disabled", "ntpclient.status": "disabled",
-		"redirector.status": "disabled", "route.status": "enabled",
-	} {
-		set(values, key, value)
-	}
-}
-
-func writeFilterDefaults(values configmap.Values) {
-	for key, value := range map[string]string{
-		"ebtables.add_vlan.status": "disabled",
-		"ebtables.status":          "enabled", "ip6tables.status": "disabled", "ipset.status": "disabled",
-		"iptables.status": "disabled", "macacl.status": "disabled",
-	} {
-		set(values, key, value)
-	}
-}
-
-func writeLocaleDefaults(values configmap.Values) {
-	set(values, "locale.timezone", "UTC0")
-	set(values, "system.timezone", "UTC0")
-}
-
-func writeRadioDefaults(values configmap.Values, countryCode uint16) {
-	set(values, "radio.outdoor", "disabled")
-	set(values, "radio.countrycode", strconv.Itoa(int(countryCode)))
-}
-
-func writeResolverDefaults(values configmap.Values) {
-	for key, value := range map[string]string{
-		"resolv.nameserver.1.status": "disabled",
-		"resolv.nameserver.2.status": "disabled", "resolv.status": "enabled",
-	} {
-		set(values, key, value)
-	}
-}
-
-func writeSwitchDefaults(values configmap.Values) {
-	for key, value := range map[string]string{
-		"switch.status":      "disabled",
-		"switch.vlan.status": "disabled", "switch.dot1x.status": "disabled",
-		"switch.jumboframes": "disabled",
-	} {
-		set(values, key, value)
-	}
-}
-
-func writeRuntimeDefaults(values configmap.Values) {
-	for key, value := range map[string]string{
-		"mesh.status": "disabled", "qos.status": "disabled", "stamgr.status": "disabled",
-		"system.analytics.status": "disabled",
-	} {
-		set(values, key, value)
-	}
 }
 
 func ieeeMode(band network.RadioBand, width network.ChannelWidthMHz) string {
@@ -573,25 +586,266 @@ func virtualInterface(physicalInterface string, globalVAPIndex int) string {
 	return fmt.Sprintf("ath%d", globalVAPIndex)
 }
 
-func set(values configmap.Values, key string, value string) { _ = values.Set(key, value) }
+func removeMembers(values configmap.Values, descriptor profile.DeviceDescriptor, bindings []profile.ResourceBinding, effective, request network.APConfig) error {
+	if request.Networks.Present {
+		for _, binding := range bindings {
+			if binding.Kind != "wifi" {
+				continue
+			}
+			if !retainsWiFi(effective, descriptor, binding) {
+				if err := removeWiFi(values, binding); err != nil {
+					slog.Warn("configuration composition failed")
+					return fmt.Errorf("compose access point: %w", err)
+				}
+			}
+		}
+	}
+	return removeRadios(values, bindings, effective, request)
+}
 
-func validateDescriptorValues(descriptor profile.DeviceDescriptor, radios map[network.RadioBand]profile.RadioCapability) error {
-	probe := configmap.Values{}
-	for band, radio := range radios {
-		if err := probe.Set("radio", radio.Interface); err != nil {
-			slog.Error("reported radio interface validation failed", "band", band, "error", err)
-			return fmt.Errorf("reported radio interface: %w", err)
+func overlayNetworks(values configmap.Values, descriptor profile.DeviceDescriptor, bindings []profile.ResourceBinding, effective, request network.APConfig, secrets profile.SecretReader) error {
+	networks := slices.Clone(request.Networks.Value)
+	slices.SortFunc(networks, func(left, right network.WiFiNetwork) int { return strings.Compare(left.Name, right.Name) })
+	for _, wifi := range networks {
+		resolved := effective.Networks.Value[slices.IndexFunc(effective.Networks.Value, func(candidate network.WiFiNetwork) bool { return candidate.Name == wifi.Name })]
+		if !resolved.Bands.Present {
+			return &network.ControlError{Code: network.PolicyRequired, Field: "networks"}
+		}
+		bands := slices.Clone(resolved.Bands.Value)
+		slices.Sort(bands)
+		for _, band := range bands {
+			capability, err := radioCapability(descriptor, band)
+			if err != nil {
+				slog.Warn("configuration composition failed")
+				return fmt.Errorf("compose access point: %w", err)
+			}
+			binding, found := wifiBinding(bindings, wifi.Name, capability.ID)
+			if !found {
+				binding, err = addWiFi(values, descriptor, bindings, capability, resolved, secrets)
+				if err != nil {
+					slog.Warn("configuration composition failed")
+					return fmt.Errorf("compose access point: %w", err)
+				}
+			}
+			if err := overlayWiFi(values, descriptor, binding, wifi, secrets); err != nil {
+				slog.Warn("configuration composition failed")
+				return fmt.Errorf("compose access point: %w", err)
+			}
 		}
 	}
-	for index, port := range descriptor.Ports {
-		if err := probe.Set("port", port.Interface); err != nil {
-			slog.Error("reported port interface validation failed", "port_index", index, "error", err)
-			return fmt.Errorf("reported ports[%d].interface: %w", index, err)
+
+	return nil
+}
+
+func removeRadioInterface(values configmap.Values, radio, parent, deviceName string) {
+	for _, prefix := range profile.RecordPrefixes(values, radio+"virtual.") {
+		if values[prefix+"devname"] == deviceName {
+			profile.DeleteRecord(values, prefix)
 		}
 	}
-	if err := probe.Set("uplink", descriptor.UplinkInterface); err != nil {
-		slog.Error("reported uplink interface validation failed", "error", err)
-		return fmt.Errorf("reported uplink interface: %w", err)
+	if values[radio+"devname"] != deviceName {
+		return
+	}
+	delete(values, radio+"devname")
+	for _, prefix := range profile.RecordPrefixes(values, "wireless.") {
+		if values[prefix+"parent"] != parent {
+			continue
+		}
+		replacement := values[prefix+"devname"]
+		values[radio+"devname"] = replacement
+		return
+	}
+}
+
+func overlayPower(values configmap.Values, prefix string, capability profile.RadioCapability, request network.RadioConfig, effective network.APConfig) error {
+	var power network.PowerConfig
+	for _, radio := range effective.Radios.Value {
+		if radio.Band == request.Band {
+			power = radio.Power.Value
+		}
+	}
+	if !power.Mode.Present {
+		return &network.ControlError{Code: network.PolicyRequired, Field: "radios"}
+	}
+	if power.Mode.Value == network.PowerExplicit {
+		if !power.DBm.Present {
+			return &network.ControlError{Code: network.PolicyRequired, Field: "radios"}
+		}
+		if capability.MinPowerDBm == nil || capability.MaxPowerDBm == nil || power.DBm.Value < *capability.MinPowerDBm || power.DBm.Value > *capability.MaxPowerDBm {
+			return fmt.Errorf("radios: requested power lacks capability evidence")
+		}
+		values[prefix+"txpower_mode"], values[prefix+"txpower"] = "custom", strconv.Itoa(power.DBm.Value)
+	} else if request.Power.Value.Mode.Present {
+		values[prefix+"txpower_mode"], values[prefix+"txpower"] = "auto", "auto"
 	}
 	return nil
+}
+
+func overlaySecurity(values configmap.Values, wireless, aaa string, security network.WiFiSecurity, secrets profile.SecretReader) error {
+	if security.Mode.Present {
+		values[wireless+"security"], values[aaa+"wpa"], values[aaa+"wpa.1.pairwise"], values[aaa+"wpa.key.1.mgmt"] = "none", "2", "CCMP", "WPA-PSK"
+	}
+	if !security.PSK.Present {
+		return nil
+	}
+	if secrets == nil {
+		return &network.ControlError{Code: network.FileReadFailed, Field: "networks"}
+	}
+	psk, err := secrets.ReadSecret(security.PSK.Value)
+	if err != nil {
+		return &network.ControlError{Code: network.FileReadFailed, Field: "networks"}
+	}
+	if err := validatePSK(string(psk)); err != nil {
+		return err
+	}
+	values[aaa+"wpa.psk"] = string(psk)
+	return nil
+}
+
+func requireWiFiPolicy(wifi network.WiFiNetwork) error {
+	if !wifi.Enabled.Present || !wifi.VLAN.Present || !wifi.Bands.Present || !wifi.BSSTransition.Present || !wifi.Security.Present || !wifi.Security.Value.Mode.Present || !wifi.Security.Value.PSK.Present {
+		return &network.ControlError{Code: network.PolicyRequired, Field: "networks"}
+	}
+	return nil
+}
+
+func availableInterface(values configmap.Values, physical string) string {
+	for index := 0; ; index++ {
+		candidate := virtualInterface(physical, index)
+		used := false
+		for key, value := range values {
+			if strings.HasSuffix(key, ".devname") && value == candidate {
+				used = true
+				break
+			}
+		}
+		if !used {
+			return candidate
+		}
+	}
+}
+
+func hasBridgeMember(values configmap.Values, bridge, deviceName string) bool {
+	for _, member := range profile.RecordPrefixes(values, bridge+"port.") {
+		if values[member+"devname"] == deviceName {
+			return true
+		}
+	}
+	return false
+}
+
+func uniqueBridgeMember(values configmap.Values, deviceName string) (string, error) {
+	var result string
+	for _, bridge := range profile.RecordPrefixes(values, "bridge.") {
+		for _, member := range profile.RecordPrefixes(values, bridge+"port.") {
+			if values[member+"devname"] != deviceName {
+				continue
+			}
+			if result != "" {
+				return "", &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+			}
+			result = member
+		}
+	}
+	return result, nil
+}
+
+func copyWiFiRecords(values configmap.Values, source profile.ResourceBinding, wireless, aaa, deviceName, parent string) []string {
+	oldDevice := values[source.Prefixes[0]+"devname"]
+	oldParent := values[source.Prefixes[0]+"parent"]
+	references := map[string]string{oldDevice: deviceName, oldParent: parent}
+	profile.CopyBindingRecords(values, map[string]string{source.Prefixes[0]: wireless, source.Prefixes[1]: aaa}, references)
+	var extra []string
+	for _, prefix := range source.Prefixes[2:] {
+		namespace := "netconf."
+		switch {
+		case strings.HasPrefix(prefix, "bridge."):
+			head, _, _ := strings.Cut(prefix, "port.")
+			namespace = head + "port."
+		case strings.HasPrefix(prefix, "ebtables."):
+			namespace = "ebtables."
+		}
+		target := profile.NextRecord(values, namespace)
+		profile.CopyBindingRecords(values, map[string]string{prefix: target}, references)
+		if namespace == "ebtables." {
+			words := strings.Fields(values[target+"cmd"])
+			for index, word := range words {
+				if (word == "--in-interface" || word == "--out-interface") && index+1 < len(words) && words[index+1] == oldDevice {
+					words[index+1] = deviceName
+				}
+			}
+			values[target+"cmd"] = strings.Join(words, " ")
+		}
+		if namespace == "netconf." {
+			extra = append(extra, target)
+		}
+	}
+	return extra
+}
+
+// This compatibility evidence is limited to reproduced settings on this firmware.
+// Model identity never admits a device or supplies power bounds.
+func reproducedRadioSetting(descriptor profile.DeviceDescriptor, requested network.RadioConfig) bool {
+	if descriptor.Model != "U7PG2" || descriptor.Firmware != "6.8.2.15592" {
+		return false
+	}
+	channel := uint16(0)
+	if !requested.Channel.Null {
+		channel = requested.Channel.Value
+	}
+	switch requested.Band {
+	case network.Band2GHz:
+		if requested.WidthMHz.Value == network.Width20 {
+			return channel == 0 || channel == 6 || channel == 11
+		}
+		return requested.WidthMHz.Value == network.Width40 && channel == 6
+	case network.Band5GHz:
+		return requested.WidthMHz.Value == network.Width40 && (channel == 0 || channel == 44 || channel == 157)
+	default:
+		return false
+	}
+}
+
+func removeRadios(values configmap.Values, bindings []profile.ResourceBinding, effective, request network.APConfig) error {
+	if !request.Radios.Present {
+		return nil
+	}
+	for _, binding := range bindings {
+		if binding.Kind != "radio" {
+			continue
+		}
+		if slices.ContainsFunc(effective.Radios.Value, func(radio network.RadioConfig) bool { return string(radio.Band) == binding.Identity }) {
+			continue
+		}
+		if radioHasWireless(values, binding.Prefixes[0]) {
+			return fmt.Errorf("radios: removed radio still has a WLAN")
+		}
+		for _, wifi := range effective.Networks.Value {
+			if slices.Contains(wifi.Bands.Value, network.RadioBand(binding.Identity)) {
+				return fmt.Errorf("radios: removed radio still has a WLAN")
+			}
+		}
+		profile.DeleteRecord(values, binding.Prefixes[0])
+	}
+
+	return nil
+}
+
+func radioHasWireless(values configmap.Values, radioPrefix string) bool {
+	parent := values[radioPrefix+"phyname"]
+	for _, prefix := range profile.RecordPrefixes(values, "wireless.") {
+		if values[prefix+"parent"] == parent {
+			return true
+		}
+	}
+	return false
+}
+
+func refreshWiFiBinding(values configmap.Values, descriptor profile.DeviceDescriptor, binding profile.ResourceBinding) (profile.ResourceBinding, error) {
+	for _, radio := range descriptor.Radios {
+		if radio.ID == binding.RadioID {
+			return resolveWiFi(values, binding.Identity, radio)
+		}
+	}
+	return profile.ResourceBinding{Kind: "", Identity: "", RadioID: "", Prefixes: nil}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
 }

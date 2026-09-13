@@ -18,10 +18,34 @@ The accepted configuration installed generated SSH credentials. A later successf
 SSH connection using those credentials proves that credential configuration applied.
 SSH was a recovery operation, not the Go controller's adoption transport.
 
-The latest physical typed Apply reports both target virtual access points and the
-requested radio settings: channel 6 at 20 MHz and 11 dBm on 2.4 GHz, and channel 44
-at 40 MHz and 12 dBm on 5 GHz. The current error is empty and SSH access is restored.
-Both radios report zero clients, so client association remains pending.
+On September 13, 2026, read-only device inspection found the selected legacy
+network's one authentication record already had BSS Transition disabled. Six peer
+authentication records retained their saved values. All 557 radio, wireless,
+authentication, bridge, VLAN, and interface records matched the submitted baseline,
+and all seven virtual interfaces were running. A fresh authenticated inform reported
+the desired version with an empty queue. This verifies a pre-existing physical fix;
+this task did not apply it or replace the active controller.
+
+## Physical configuration dry run
+
+A separately built branch controller used an owner-only copy of current device
+state. It authenticated a captured current inform through its local HTTP listener;
+the replayed response was never sent to the physical device. The active service
+continued running throughout the check.
+
+The old desired projection contained `ssh: null`, which the current typed API rejects
+as an unsupported clear. Explicit import of the exact complete bodies with current
+network and radio identities established usable ownership in the shadow controller.
+No policy values were reconstructed from observations.
+
+The actual CLI dry run returned zero added, one changed, and zero removed records.
+Independent compilation verified that only configuration-version metadata changed;
+every policy record was identical. Preview left state bytes, the empty queue, and
+the reported version unchanged. The active state also remained byte-identical.
+Private evidence preserves the request, opaque token, full candidate, current inform,
+device inspection, and a recoverable state copy.
+
+## Historical physical protocol evidence
 
 Reproduced channel/width pairs on U7PG2 firmware 6.8.2.15592 supply a narrow
 compatibility exception when required lists are absent. On 2.4 GHz, the supported
@@ -72,21 +96,30 @@ support allowlist.
 Upstream unifi-emu does not reflect `system_cfg` into later radio or port reports.
 The test-only derivative parses the tested radio, native VLAN, tagged VLAN, and
 PoE mode records into report state. It adds synthetic channel and width lists for
-the selected AP and a typed VLAN capability for the selected switches. These added
-fields are test contracts, not physical firmware evidence. It does not generate clients or
-simulate forwarding or electrical power. Results from this derivative are
+the selected AP, a typed VLAN capability for the selected switches, and an explicit
+family field. Imported switch fixtures also receive synthetic port status and native
+VLAN records. These additions are test contracts, not physical firmware evidence.
+It does not generate clients or simulate forwarding or electrical power.
+Results from this derivative are
 patched-emulator evidence.
 
-The live flow passed with a U6EXT AP, an S216150 switch reporting 18 ports, and an
-S224250 switch reporting 26 ports. Each device completed set-adopt and reported the
-version returned by typed Apply. Decrypted replies contain WPA2, VLAN 20, explicit
-radio settings, and switch access, tagged uplink, and PoE-off configuration.
+The September 13 live flow used a U6EXT AP, an S216150 switch reporting 18 ports,
+and an S224250 switch reporting 26 ports. Each completed set-adopt. The public client
+imported complete reference bodies and explicit projections through the actual
+controller socket, then previewed and applied one policy change with an opaque token.
+
+The combined recording contains 100 decrypted messages. Six preview intervals
+returned encrypted noops. Six delivered management/system map pairs matched their
+complete expected contents before and after restart. Unknown records and omitted
+policy survived, including an AP peer whose BSS Transition key remained absent.
 
 Restart validation paused the emulators, queued a marked command, and restarted
 the controller. Registering another synthetic identity forced the restarted process
-to save its loaded device records. Keys and desired configuration survived that
-rewrite; observations and queues did not survive restart. Fresh informs restored
-snapshots without replaying the marked command.
+to save its loaded device records. Keys, complete baselines, bindings, and desired
+configuration survived that rewrite; observations and queues did not survive restart. Fresh informs restored
+snapshots without replaying the marked command. An unrelated second change in each
+family retained the first change. The recorder reattached after the controller
+restarted; both recordings remain preserved alongside their combined capture.
 Private evidence preserves captures, exact image identities, patch copies,
 operation results, and a SHA-256 manifest.
 
@@ -107,7 +140,7 @@ Independent capture comparison passed for 24 messages in the initial physical ru
 and 104 messages in the later run. The live test requires an explicit environment
 variable; an ordinary skipped invocation is not acceptance evidence.
 
-Desired configuration versions identify queued commands. Snapshot versions come
+Compiled versions alone do not prove device application. Snapshot versions come
 from device reports. In-process encrypted reports and emulator reflections do not
 prove physical behavior.
 

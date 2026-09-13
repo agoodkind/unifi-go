@@ -14,12 +14,28 @@ import (
 // Client calls the controller over a local Unix socket.
 type Client struct{ http *http.Client }
 
+// Command carries an operator-selected device command and its JSON fields.
+type Command struct {
+	Name       string                     `json:"name"`
+	Parameters map[string]json.RawMessage `json:"parameters"`
+}
+
+// BaselineImport establishes configuration bytes and explicit typed identities without delivery.
+type BaselineImport struct {
+	Config Config        `json:"config"`
+	AP     *APConfig     `json:"ap,omitempty"`
+	Switch *SwitchConfig `json:"switch,omitempty"`
+}
+
 type controlRequest struct {
-	Operation string        `json:"operation"`
-	Device    DeviceID      `json:"device,omitempty"`
-	AP        *APConfig     `json:"ap,omitempty"`
-	Switch    *SwitchConfig `json:"switch,omitempty"`
-	Config    *Config       `json:"config,omitempty"`
+	Operation    string          `json:"operation"`
+	Device       DeviceID        `json:"device,omitempty"`
+	AP           *APConfig       `json:"ap,omitempty"`
+	Switch       *SwitchConfig   `json:"switch,omitempty"`
+	Config       *Config         `json:"config,omitempty"`
+	TypedCommand *Command        `json:"typed_command,omitempty"`
+	Baseline     *BaselineImport `json:"baseline,omitempty"`
+	PreviewToken PreviewToken    `json:"preview_token,omitempty"`
 }
 
 type controlResponse struct {
@@ -27,6 +43,7 @@ type controlResponse struct {
 	Version ConfigVersion    `json:"version,omitempty"`
 	Device  *DeviceSnapshot  `json:"device,omitempty"`
 	Devices []DeviceSnapshot `json:"devices,omitempty"`
+	Preview *ConfigPreview   `json:"preview,omitempty"`
 }
 
 // Dial creates a client for socket; connections open on demand.
@@ -56,6 +73,21 @@ func (client *Client) ApplyConfig(ctx context.Context, id DeviceID, config Confi
 	}
 	response, err := client.call(ctx, controlRequest{Operation: "apply-config", Device: id, Config: &config})
 	return response.Version, err
+}
+
+// SendCommand queues an arbitrary device command without replacing configuration.
+func (client *Client) SendCommand(ctx context.Context, id DeviceID, command Command) error {
+	_, err := client.call(ctx, controlRequest{Operation: "command", Device: id, TypedCommand: &command})
+	return err
+}
+
+// ImportBaseline records a baseline without queueing or claiming device application.
+func (client *Client) ImportBaseline(ctx context.Context, id DeviceID, baseline BaselineImport) error {
+	if err := baseline.Config.Validate(); err != nil {
+		return err
+	}
+	_, err := client.call(ctx, controlRequest{Operation: "baseline-import", Device: id, Baseline: &baseline})
+	return err
 }
 
 // Device returns the latest observed device state.

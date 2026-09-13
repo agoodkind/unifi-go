@@ -2,6 +2,7 @@
 package controller
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -36,6 +37,7 @@ type Device struct {
 	DesiredAP       *network.APConfig         `json:"desired_ap,omitempty"`
 	DesiredSwitch   *network.SwitchConfig     `json:"desired_switch,omitempty"`
 	DesiredVersion  network.ConfigVersion     `json:"desired_version,omitempty"`
+	Baseline        *ConfigurationBaseline    `json:"baseline,omitempty"`
 	MAC             string                    `json:"mac"`
 	Key             string                    `json:"key"`
 	LastSetParam    *Reply                    `json:"last_setparam,omitempty"`
@@ -83,6 +85,8 @@ type Controller struct {
 	advertise string
 	devices   map[string]Device
 	queues    map[string][]Reply
+	awaiting  map[string]network.ConfigVersion
+	previews  map[network.PreviewToken]previewRecord
 	status    map[string]Status
 }
 
@@ -92,7 +96,7 @@ func Open(stateFile, advertise string, registries ...profile.Registry) (*Control
 	if err != nil || u.Scheme != "http" || u.Host == "" || u.Path != "/inform" || u.User != nil {
 		return nil, errors.New("advertise must be an HTTP URL ending in /inform")
 	}
-	c := &Controller{mu: sync.Mutex{}, stateFile: stateFile, advertise: advertise, devices: make(map[string]Device), queues: make(map[string][]Reply), status: make(map[string]Status), reports: make(map[string]informmodel.Report), registry: profile.Registry{}}
+	c := &Controller{mu: sync.Mutex{}, stateFile: stateFile, advertise: advertise, devices: make(map[string]Device), queues: make(map[string][]Reply), status: make(map[string]Status), reports: make(map[string]informmodel.Report), registry: profile.Registry{}, awaiting: make(map[string]network.ConfigVersion), previews: make(map[network.PreviewToken]previewRecord)}
 	if len(registries) > 0 {
 		c.registry = registries[0]
 	}
@@ -116,6 +120,13 @@ func Open(stateFile, advertise string, registries ...profile.Registry) (*Control
 	for index, device := range devices {
 		if device.LastSetParam == nil && index < len(legacyDevices) {
 			device.LastSetParam = legacyDevices[index].Config
+		}
+		if device.Baseline == nil && device.LastSetParam != nil {
+			baseline, baselineErr := baselineFromLegacy(device)
+			if baselineErr != nil {
+				return nil, fault("derive baseline from legacy state", baselineErr)
+			}
+			device.Baseline = baseline
 		}
 		mac, err := normalizeMAC(device.MAC)
 		if err != nil {
@@ -199,14 +210,23 @@ func (c *Controller) Register(mac, key string) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	device := c.devices[mac]
+	device, existed := c.devices[mac]
+	previous := device
 	device.MAC, device.Key = mac, key
 	c.devices[mac] = device
-	return c.saveLocked()
+	if err := c.saveLocked(); err != nil {
+		if existed {
+			c.devices[mac] = previous
+		} else {
+			delete(c.devices, mac)
+		}
+		return err
+	}
+	return nil
 }
 
-// Adopt queues captured configuration with new SSH credentials for a registered AP.
-func (c *Controller) Adopt(mac string, template Reply) error {
+// Adopt queues captured configuration and optionally installs generated SSH credentials.
+func (c *Controller) Adopt(mac string, template Reply, setupSSH bool) error {
 	mac, err := normalizeMAC(mac)
 	if err != nil {
 		return err
@@ -224,32 +244,35 @@ func (c *Controller) Adopt(mac string, template Reply) error {
 	managementConfig := template.ManagementConfig
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	device, exists := c.devices[mac]
-	if !exists {
+	device, existed := c.devices[mac]
+	previous := device
+	if !existed {
 		keyBytes := make([]byte, 16)
 		if _, err := rand.Read(keyBytes); err != nil {
 			return fault("generate inform key", err)
 		}
-		device = Device{MAC: mac, Key: inform.DefaultKey, LastSetParam: nil, SSHUsername: "", SSHPassword: "", SSHPasswordHash: "", NextKey: hex.EncodeToString(keyBytes), Family: "", Descriptor: nil, DesiredAP: nil, DesiredSwitch: nil, DesiredVersion: ""}
+		device = Device{MAC: mac, Key: inform.DefaultKey, LastSetParam: nil, SSHUsername: "", SSHPassword: "", SSHPasswordHash: "", NextKey: hex.EncodeToString(keyBytes), Family: "", Descriptor: nil, DesiredAP: nil, DesiredSwitch: nil, DesiredVersion: "", Baseline: nil}
 	}
-	passwordBytes := make([]byte, 16)
-	if _, err := rand.Read(passwordBytes); err != nil {
-		return fault("generate SSH password", err)
-	}
-	password := hex.EncodeToString(passwordBytes)
-	passwordHash, err := sha512_crypt.New().Generate([]byte(password), nil)
-	if err != nil {
-		return fault("hash SSH password", err)
-	}
-	device.SSHUsername = "unifi-go"
-	device.SSHPassword = password
-	device.SSHPasswordHash = passwordHash
-	for key, value := range map[string]string{
-		"sshd.status": "enabled", "sshd.1.status": "enabled", "sshd.auth.passwd": "enabled",
-		"users.status": "enabled", "users.1.status": "enabled", "users.1.name": device.SSHUsername,
-		"users.1.password": device.SSHPasswordHash,
-	} {
-		systemConfig = setConfigValue(systemConfig, key, value)
+	if setupSSH {
+		passwordBytes := make([]byte, 16)
+		if _, err := rand.Read(passwordBytes); err != nil {
+			return fault("generate SSH password", err)
+		}
+		password := hex.EncodeToString(passwordBytes)
+		passwordHash, err := sha512_crypt.New().Generate([]byte(password), nil)
+		if err != nil {
+			return fault("hash SSH password", err)
+		}
+		device.SSHUsername = "unifi-go"
+		device.SSHPassword = password // gitleaks:allow -- generated credential, not a literal secret
+		device.SSHPasswordHash = passwordHash
+		for key, value := range map[string]string{
+			"sshd.status": "enabled", "sshd.1.status": "enabled", "sshd.auth.passwd": "enabled",
+			"users.status": "enabled", "users.1.status": "enabled", "users.1.name": device.SSHUsername,
+			"users.1.password": device.SSHPasswordHash,
+		} {
+			systemConfig = setConfigValue(systemConfig, key, value)
+		}
 	}
 	targetKey := device.Key
 	if device.NextKey != "" {
@@ -263,8 +286,15 @@ func (c *Controller) Adopt(mac string, template Reply) error {
 	template.ConfigVersion = "unifi-go-1"
 	template.ServerTime = 0
 	device.LastSetParam = &template
+	device.Baseline = baselineFromRawReply(template)
+	device.DesiredAP, device.DesiredSwitch, device.DesiredVersion = nil, nil, ""
 	c.devices[mac] = device
 	if err := c.saveLocked(); err != nil {
+		if existed {
+			c.devices[mac] = previous
+		} else {
+			delete(c.devices, mac)
+		}
 		return err
 	}
 	c.queues[mac] = []Reply{template}
@@ -292,6 +322,11 @@ func (c *Controller) Queue(mac string, command Reply) error {
 	if err := command.validate(); err != nil {
 		return err
 	}
+	parameters := make(map[string]json.RawMessage, len(command.Parameters))
+	for name, value := range command.Parameters {
+		parameters[name] = bytes.Clone(value)
+	}
+	command.Parameters = parameters
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	device, exists := c.devices[mac]
@@ -299,11 +334,16 @@ func (c *Controller) Queue(mac string, command Reply) error {
 		return errors.New("device is not registered")
 	}
 	if command.Type == ReplySetparam {
+		previous := device
 		device.LastSetParam = &command
+		device.Baseline = baselineFromRawReply(command)
+		device.DesiredAP, device.DesiredSwitch, device.DesiredVersion = nil, nil, ""
 		c.devices[mac] = device
 		if err := c.saveLocked(); err != nil {
-			return err
+			c.devices[mac] = previous
+			return &network.ControlError{Code: network.PersistenceFailed, Field: ""}
 		}
+		delete(c.awaiting, mac)
 	}
 	c.queues[mac] = append(c.queues[mac], command)
 	return nil
@@ -366,10 +406,13 @@ func (c *Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid device report", http.StatusBadRequest)
 		return
 	}
-	reply := Reply{Type: ReplyNoop, Command: "", Key: "", URI: "", Interval: 10, ConfigVersion: "", ManagementConfig: "", SystemConfig: "", BlockedStations: "", ServerTime: 0}
+	if version := c.awaiting[mac]; version != "" && string(version) == report.ConfigVersion {
+		delete(c.awaiting, mac)
+	}
+	reply := Reply{Type: ReplyNoop, Command: "", Key: "", URI: "", Interval: 10, ConfigVersion: "", ManagementConfig: "", SystemConfig: "", BlockedStations: "", ServerTime: 0, Parameters: nil}
 	consumeCommand := false
 	if device.NextKey != "" && !adoptionCompleted {
-		reply = Reply{Type: ReplyCommand, Command: CommandSetAdopt, Key: device.NextKey, URI: c.advertise, Interval: 0, ConfigVersion: "", ManagementConfig: "", SystemConfig: "", BlockedStations: "", ServerTime: 0}
+		reply = Reply{Type: ReplyCommand, Command: CommandSetAdopt, Key: device.NextKey, URI: c.advertise, Interval: 0, ConfigVersion: "", ManagementConfig: "", SystemConfig: "", BlockedStations: "", ServerTime: 0, Parameters: nil}
 	} else if queue := c.queues[mac]; len(queue) != 0 {
 		reply = queue[0]
 		consumeCommand = true

@@ -24,33 +24,33 @@ func NewRegistry(ap APCompiler, switches SwitchCompiler) Registry {
 }
 
 // CompileAP routes an access point descriptor to the access point compiler.
-func (registry Registry) CompileAP(descriptor DeviceDescriptor, config network.APConfig, secrets SecretReader) (SetParam, error) {
+func (registry Registry) CompileAP(descriptor DeviceDescriptor, input CompilationInput, config network.APConfig, secrets SecretReader) (Compilation, error) {
 	if descriptor.Family != network.FamilyAP {
-		return SetParam{}, fmt.Errorf("compile access point: device family is %q", descriptor.Family)
+		return Compilation{}, fmt.Errorf("compile access point: device family is %q", descriptor.Family)
 	}
 	if registry.ap == nil || !registry.ap.Supports(descriptor) {
-		return SetParam{}, fmt.Errorf("compile access point: unsupported device capabilities")
+		return Compilation{}, fmt.Errorf("compile access point: unsupported device capabilities")
 	}
-	param, err := registry.ap.Compile(descriptor, config, secrets)
+	param, err := registry.ap.Compile(descriptor, input, config, secrets)
 	if err != nil {
-		slog.Error("access point configuration compilation failed", "error", err)
-		return SetParam{}, fmt.Errorf("compile access point: %w", err)
+		slog.Error("access point configuration compilation failed", "err", &network.ControlError{Code: network.InvalidConfig})
+		return Compilation{}, fmt.Errorf("compile access point: %w", err)
 	}
 	return param, nil
 }
 
 // CompileSwitch routes a switch descriptor to the switch compiler.
-func (registry Registry) CompileSwitch(descriptor DeviceDescriptor, config network.SwitchConfig, secrets SecretReader) (SetParam, error) {
+func (registry Registry) CompileSwitch(descriptor DeviceDescriptor, input CompilationInput, config network.SwitchConfig, secrets SecretReader) (Compilation, error) {
 	if descriptor.Family != network.FamilySwitch {
-		return SetParam{}, fmt.Errorf("compile switch: device family is %q", descriptor.Family)
+		return Compilation{}, fmt.Errorf("compile switch: device family is %q", descriptor.Family)
 	}
 	if registry.switches == nil || !registry.switches.Supports(descriptor) {
-		return SetParam{}, fmt.Errorf("compile switch: unsupported device capabilities")
+		return Compilation{}, fmt.Errorf("compile switch: unsupported device capabilities")
 	}
-	param, err := registry.switches.Compile(descriptor, config, secrets)
+	param, err := registry.switches.Compile(descriptor, input, config, secrets)
 	if err != nil {
-		slog.Error("switch configuration compilation failed", "error", err)
-		return SetParam{}, fmt.Errorf("compile switch: %w", err)
+		slog.Error("switch configuration compilation failed", "err", &network.ControlError{Code: network.InvalidConfig})
+		return Compilation{}, fmt.Errorf("compile switch: %w", err)
 	}
 	return param, nil
 }

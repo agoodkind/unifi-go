@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +27,92 @@ import (
 	"goodkind.io/unifi-go/network"
 )
 
+func TestTypedCLIRejectsUnknownNestedPolicy(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "nested-unknown.json")
+	writeTypedFixture(t, configPath, []byte(`{"radios":[{"band":"2.4ghz","power":{"mode":"auto","mod":"typo"}}]}`))
+
+	var output bytes.Buffer
+	err := run(t.Context(), []string{"apply", "ap", "--device", "02:00:00:00:00:11", "--file", configPath, "--socket", filepath.Join(directory, "missing.sock")}, &output)
+	if err == nil || err.Error() != "invalid typed configuration or unknown field" {
+		t.Fatalf("run() error = %v", err)
+	}
+}
+
+func TestPersistedBaselineRejectsIncompleteResourceIdentity(t *testing.T) {
+	const key = "0123456789abcdef0123456789abcdef" // gitleaks:allow
+	const version network.ConfigVersion = "review-v1"
+	management := "cfgversion=" + string(version) + "\n"
+	switchConfig := typedSwitchFixture()
+	apConfig := typedAPFixture("/run/secrets/review")
+	tests := map[string]controller.Device{
+		"switch unknown port field": {
+			MAC: "02:00:00:00:00:31", Key: key, Family: network.FamilySwitch,
+			Descriptor:     &profile.DeviceDescriptor{Family: network.FamilySwitch, Ports: []profile.PortCapability{{Index: 1, Interface: "eth0"}}},
+			DesiredSwitch:  &switchConfig,
+			DesiredVersion: version,
+			LastSetParam: &controller.Reply{
+				Type: controller.ReplySetparam, ConfigVersion: string(version), ManagementConfig: management,
+				SystemConfig: "switch.port.1.unknown=value\n",
+			},
+		},
+		"access point missing devnames": {
+			MAC: "02:00:00:00:00:32", Key: key, Family: network.FamilyAP,
+			Descriptor:     &profile.DeviceDescriptor{Family: network.FamilyAP, Radios: []profile.RadioCapability{{ID: "ng", Interface: "wifi0", Band: network.Band2GHz}}},
+			DesiredAP:      &apConfig,
+			DesiredVersion: version,
+			LastSetParam: &controller.Reply{
+				Type: controller.ReplySetparam, ConfigVersion: string(version), ManagementConfig: management,
+				SystemConfig: "radio.1.phyname=wifi0\nwireless.1.ssid=Documentation\nwireless.1.parent=wifi0\naaa.1.ssid=Documentation\n",
+			},
+		},
+	}
+
+	for name, device := range tests {
+		device := device
+		t.Run(name, func(t *testing.T) {
+			state := filepath.Join(t.TempDir(), "state.json")
+			writeTypedJSON(t, state, []controller.Device{device})
+			c := openTypedController(t, state)
+			if err := c.Register(device.MAC, key); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var persisted []controller.Device
+			if err := json.Unmarshal(data, &persisted); err != nil {
+				t.Fatal(err)
+			}
+			if len(persisted) != 1 || persisted[0].Baseline == nil || persisted[0].Baseline.TypedReady {
+				t.Fatal("incomplete resource identity marked typed ready")
+			}
+		})
+	}
+}
+
 func TestTypedControlIntegration(t *testing.T) {
+	t.Run("preview transaction", testPreviewTransaction)
+	var omitted network.Optional[bool]
+	disabled := network.Supplied(false)
+	untagged := network.Cleared[network.VLANID]()
+	if omitted.Present || !disabled.Present || disabled.Value || !untagged.Null {
+		t.Fatal("policy presence changed")
+	}
+	presenceJSON, err := json.Marshal(struct {
+		Omitted  network.Optional[network.PoEMode] `json:"omitted,omitzero"`
+		Disabled network.Optional[bool]            `json:"disabled,omitzero"`
+		Untagged network.Optional[network.VLANID]  `json:"untagged,omitzero"`
+	}{Omitted: network.Optional[network.PoEMode]{}, Disabled: disabled, Untagged: untagged})
+	if err != nil || string(presenceJSON) != `{"disabled":false,"untagged":null}` {
+		t.Fatal("policy presence JSON shape changed")
+	}
+	var malformedPresence network.Optional[bool]
+	if err := json.Unmarshal([]byte("false true"), &malformedPresence); err == nil {
+		t.Fatal("trailing policy JSON was accepted")
+	}
+
 	ctx := context.Background()
 	directory := t.TempDir()
 	state := filepath.Join(directory, "state.json")
@@ -42,19 +126,23 @@ func TestTypedControlIntegration(t *testing.T) {
 	writeTypedFixture(t, secretPath, []byte(secret))
 	// This is the legacy persisted shape, before typed fields existed.
 	legacy := []struct {
-		MAC             network.DeviceID `json:"mac"`
-		Key             string           `json:"key"`
-		SSHUsername     string           `json:"ssh_username,omitempty"`
-		SSHPassword     string           `json:"ssh_password,omitempty"`
-		SSHPasswordHash string           `json:"ssh_password_hash,omitempty"`
+		MAC             network.DeviceID                  `json:"mac"`
+		Key             string                            `json:"key"`
+		SSHUsername     string                            `json:"ssh_username,omitempty"`
+		SSHPassword     string                            `json:"ssh_password,omitempty"`
+		SSHPasswordHash string                            `json:"ssh_password_hash,omitempty"`
+		Baseline        *controller.ConfigurationBaseline `json:"baseline,omitempty"`
 	}{{MAC: apID, Key: key, SSHUsername: "preserved-user", SSHPassword: storedPlaintext, SSHPasswordHash: storedHash}, {MAC: switchID, Key: key, SSHUsername: "", SSHPassword: "", SSHPasswordHash: ""}}
+	legacy[0].Baseline = typedSeedBaseline(t, network.FamilyAP, "seed")
+	legacy[1].Baseline = typedSeedBaseline(t, network.FamilySwitch, "seed")
+	legacy[0].Baseline.Config.System += "sshd.status=enabled\nsshd.1.ifname=br0\nusers.1.name=preserved-user\nusers.1.password=" + storedHash + "\n"
 	writeTypedJSON(t, state, legacy)
 	c := openTypedController(t, state)
 	socket := startTypedSocket(t, c)
 	client := network.Dial(socket)
-	apConfig := network.APConfig{CountryCode: 840, Radios: []network.RadioConfig{{Band: network.Band2GHz, Enabled: true, WidthMHz: network.Width20, Power: network.PowerConfig{Mode: network.PowerAuto}}}, Networks: []network.WiFiNetwork{{Name: "Documentation", Enabled: true, Bands: []network.RadioBand{network.Band2GHz}, Security: network.WiFiSecurity{Mode: network.WPA2Personal, PSK: network.SecretFile(secretPath)}}}}
-	swConfig := network.SwitchConfig{Ports: []network.SwitchPortConfig{{Index: 1, Enabled: true, NativeVLAN: 20, TaggedVLANs: []network.VLANID{30}, PoE: network.PoEAuto}}}
-	_, err := client.ApplyAP(ctx, apID, apConfig)
+	apConfig := typedAPFixture(secretPath)
+	swConfig := typedSwitchFixture()
+	_, err = client.ApplyAP(ctx, apID, apConfig)
 	assertControlFailure(t, err, network.NoReport, "")
 	up := true
 	poe := uint64(1)
@@ -66,19 +154,19 @@ func TestTypedControlIntegration(t *testing.T) {
 	typedExchange(t, c, apID, key, apReport, false)
 	typedExchange(t, c, switchID, key, swReport, true)
 	invalid := apConfig
-	invalid.Networks = []network.WiFiNetwork{apConfig.Networks[0]}
-	invalid.Networks[0].Bands = nil
+	invalid.Networks.Value = []network.WiFiNetwork{apConfig.Networks.Value[0]}
+	invalid.Networks.Value[0].Bands = network.Supplied([]network.RadioBand{})
 	_, err = client.ApplyAP(ctx, apID, invalid)
 	assertControlFailure(t, err, network.InvalidConfig, "networks[0].bands")
 	invalid = apConfig
 	power := 10
-	invalid.Radios = []network.RadioConfig{apConfig.Radios[0]}
-	invalid.Radios[0].Power.DBm = &power
+	invalid.Radios.Value = []network.RadioConfig{apConfig.Radios.Value[0]}
+	invalid.Radios.Value[0].Power.Value.DBm = network.Supplied(power)
 	if _, err := client.ApplyAP(ctx, apID, invalid); err == nil {
 		t.Fatal("automatic explicit power accepted")
 	}
 	invalid = apConfig
-	invalid.SSH = &network.SSHConfig{Password: network.SecretFile(secretPath)}
+	invalid.SSH = network.Supplied(network.SSHConfig{Username: network.Supplied("")}) // gitleaks:allow
 	if _, err := client.ApplyAP(ctx, apID, invalid); err == nil {
 		t.Fatal("invalid SSH accepted")
 	}
@@ -132,7 +220,10 @@ func TestTypedControlIntegration(t *testing.T) {
 		if entry.id == switchID && !strings.Contains(reply.SystemConfig, "vlan.") {
 			t.Fatal("switch VLAN configuration missing")
 		}
+		entry.report.ConfigVersion = string(entry.version)
+		typedExchange(t, c, entry.id, key, entry.report, entry.gcm)
 	}
+	apReport.ConfigVersion, swReport.ConfigVersion = string(apVersion), string(swVersion)
 	snapshots, err := client.Devices(ctx)
 	if err != nil || len(snapshots) != 2 || snapshots[0].ID != apID {
 		t.Fatal("device list failed")
@@ -174,19 +265,31 @@ func TestTypedControlIntegration(t *testing.T) {
 	writeTypedJSON(t, invalidFile, invalid)
 	err = run(ctx, []string{"apply", "ap", "--device", string(apID), "--file", invalidFile, "--socket", socket}, &output)
 	assertControlFailure(t, err, network.InvalidConfig, "ssh.username")
+	newlineUsername := apConfig
+	newlineUsername.SSH = network.Supplied(network.SSHConfig{Username: network.Supplied("bad\nname")})
+	_, err = client.ApplyAP(ctx, apID, newlineUsername)
+	assertControlFailure(t, err, network.InvalidConfig, "ssh.username")
 	missing := apConfig
-	missing.Networks = []network.WiFiNetwork{apConfig.Networks[0]}
-	missing.Networks[0].Security.PSK = network.SecretFile(filepath.Join(directory, "missing-secret"))
+	missing.Networks.Value = []network.WiFiNetwork{apConfig.Networks.Value[0]}
+	missing.Networks.Value[0].Security.Value.PSK = network.Supplied(network.SecretFile(filepath.Join(directory, "missing-secret")))
 	_, err = client.ApplyAP(ctx, apID, missing)
-	assertControlFailure(t, err, network.FileReadFailed, "networks[0].security.psk")
+	assertControlFailure(t, err, network.FileReadFailed, "networks")
 	oversized := filepath.Join(directory, "oversized.json")
 	writeTypedFixture(t, oversized, append(append([]byte("{}"), bytes.Repeat([]byte(" "), 8388608)...), []byte("{}")...))
 	if err := run(ctx, []string{"apply", "switch", "--device", string(switchID), "--file", oversized, "--socket", socket}, &output); err == nil || !strings.Contains(err.Error(), "exceeds 8 MiB") {
 		t.Fatal("oversized config accepted")
 	}
 	binaryPath := filepath.Join(directory, "unifi-go")
+	if err := os.Remove(binaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	buildStarted := time.Now()
 	if output, err := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build CLI: %v: %s", err, output)
+	}
+	binaryInfo, err := os.Stat(binaryPath)
+	if err != nil || binaryInfo.ModTime().Before(buildStarted) {
+		t.Fatal("CLI build did not produce a fresh executable")
 	}
 	processOutput, processErr := exec.CommandContext(ctx, binaryPath, "apply", "ap", "--device", string(apID), "--file", invalidFile, "--socket", socket).CombinedOutput()
 	exitError, ok := errors.AsType[*exec.ExitError](processErr)
@@ -205,6 +308,87 @@ func TestTypedControlIntegration(t *testing.T) {
 			id = switchID
 			writeTypedJSON(t, configFile, swConfig)
 		}
+		previewConfigFile := filepath.Join(directory, family+"-preview.json")
+		if family == "ap" {
+			previewConfig := apConfig
+			previewConfig.Networks.Value = append([]network.WiFiNetwork(nil), apConfig.Networks.Value...)
+			previewConfig.Networks.Value[0].BSSTransition = network.Supplied(network.BSSTransitionDisabled)
+			writeTypedJSON(t, previewConfigFile, previewConfig)
+		} else {
+			previewConfig := swConfig
+			previewConfig.Ports.Value = append([]network.SwitchPortConfig(nil), swConfig.Ports.Value...)
+			previewConfig.Ports.Value[0].Enabled = network.Supplied(true)
+			writeTypedJSON(t, previewConfigFile, previewConfig)
+		}
+		beforePreview := previewStateBytes(t, state)
+		previewOutput, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", previewConfigFile, "--socket", socket, "--dry-run").CombinedOutput()
+		if err != nil {
+			t.Fatal("fresh executable preview failed")
+		}
+		var preview network.ConfigPreview
+		decoder := json.NewDecoder(bytes.NewReader(previewOutput))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&preview); err != nil || preview.Token == "" || decoder.Decode(new(json.RawMessage)) != io.EOF {
+			t.Fatal("fresh executable did not return only ConfigPreview")
+		}
+		if !bytes.Equal(beforePreview, previewStateBytes(t, state)) {
+			t.Fatal("fresh executable preview changed state")
+		}
+		for _, status := range c.Status() {
+			if status.Pending != 0 {
+				t.Fatal("fresh executable preview queued work")
+			}
+		}
+		tokenFile := filepath.Join(directory, family+".token")
+		writeTypedFixture(t, tokenFile, []byte(string(preview.Token)+"\n"))
+		beforeTokenApply := previewStateBytes(t, state)
+		tokenApplyOutput, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", previewConfigFile, "--socket", socket, "--preview-token-file", tokenFile).CombinedOutput()
+		if err != nil {
+			t.Fatal("fresh executable token application failed")
+		}
+		if bytes.Equal(beforeTokenApply, previewStateBytes(t, state)) {
+			t.Fatal("token application did not persist a state change")
+		}
+		for _, forbidden := range []string{secret, secretPath, key, storedHash, storedPlaintext, "desired_ap", "ssh_password"} {
+			if strings.Contains(string(tokenApplyOutput), forbidden) {
+				t.Fatal("token application output exposed credentials")
+			}
+		}
+		var previewVersion struct {
+			Version network.ConfigVersion `json:"version"`
+		}
+		if err := json.Unmarshal(tokenApplyOutput, &previewVersion); err != nil || previewVersion.Version == "" {
+			t.Fatal("token application did not return a version")
+		}
+		if family == "ap" {
+			apReport.ConfigVersion = string(previewVersion.Version)
+			reply := typedExchange(t, c, apID, key, apReport, false)
+			if reply.ConfigVersion != string(previewVersion.Version) {
+				t.Fatal("preview token configuration was not delivered")
+			}
+			restoredVersion, err := client.ApplyAP(ctx, apID, apConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			apReport.ConfigVersion = string(restoredVersion)
+			if reply := typedExchange(t, c, apID, key, apReport, false); reply.ConfigVersion != string(restoredVersion) {
+				t.Fatal("original AP configuration was not restored")
+			}
+		} else {
+			swReport.ConfigVersion = string(previewVersion.Version)
+			reply := typedExchange(t, c, switchID, key, swReport, true)
+			if reply.ConfigVersion != string(previewVersion.Version) {
+				t.Fatal("preview token configuration was not delivered")
+			}
+			restoredVersion, err := client.ApplySwitch(ctx, switchID, swConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			swReport.ConfigVersion = string(restoredVersion)
+			if reply := typedExchange(t, c, switchID, key, swReport, true); reply.ConfigVersion != string(restoredVersion) {
+				t.Fatal("original switch configuration was not restored")
+			}
+		}
 		output.Reset()
 		if err := run(ctx, []string{"apply", family, "--device", string(id), "--file", configFile, "--socket", socket}, &output); err != nil {
 			t.Fatal(err)
@@ -212,11 +396,17 @@ func TestTypedControlIntegration(t *testing.T) {
 		if strings.Contains(output.String(), secret) || strings.Contains(output.String(), secretPath) {
 			t.Fatal("apply output exposed credentials")
 		}
+		if _, err := exec.CommandContext(ctx, binaryPath, "apply", family, "--device", string(id), "--file", configFile, "--socket", socket, "--dry-run", "--preview-token-file", tokenFile).CombinedOutput(); err == nil {
+			t.Fatal("fresh executable accepted conflicting preview flags")
+		}
 	}
 	if _, err := client.ApplyAP(ctx, apID, apConfig); err != nil {
 		t.Fatal(err)
 	}
-	repeated := assertTypedMetadata(t, typedExchange(t, c, apID, key, apReport, false), key)
+	if reply := typedExchange(t, c, apID, key, apReport, false); reply.Type != controller.ReplyNoop {
+		t.Fatal("unchanged configuration was queued")
+	}
+	repeated := assertTypedMetadata(t, typedPersistedReply(t, state, apID), key)
 	assertSameTypedIdentity(t, firstSystem, repeated)
 	if _, err := client.ApplySwitch(ctx, switchID, swConfig); err != nil {
 		t.Fatal(err)
@@ -235,8 +425,16 @@ func TestTypedControlIntegration(t *testing.T) {
 	if err := json.Unmarshal(persisted, &records); err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 2 || records[0].Key != key || records[0].DesiredAP == nil || records[0].DesiredVersion != apVersion || records[1].DesiredSwitch == nil || records[1].DesiredVersion != swVersion || records[0].LastSetParam == nil || records[0].LastSetParam.ConfigVersion != string(apVersion) || records[1].LastSetParam == nil || records[1].LastSetParam.ConfigVersion != string(swVersion) {
+	if len(records) != 2 || records[0].Key != key || records[0].DesiredAP == nil || records[0].DesiredVersion != apVersion || records[1].DesiredSwitch == nil || records[1].DesiredVersion != swVersion || records[0].LastSetParam == nil || records[0].LastSetParam.ConfigVersion != string(apVersion) || records[1].LastSetParam == nil || records[1].LastSetParam.ConfigVersion != string(swVersion) || records[0].Baseline == nil || !records[0].Baseline.TypedReady || records[1].Baseline == nil || !records[1].Baseline.TypedReady {
 		t.Fatal("desired state or keys did not survive")
+	}
+	persistedAP := records[0].DesiredAP
+	persistedSwitch := records[1].DesiredSwitch
+	if persistedAP.SSH.Present || !persistedAP.Networks.Value[0].VLAN.Present || !persistedAP.Networks.Value[0].VLAN.Null {
+		t.Fatal("absent and explicitly cleared policy did not survive")
+	}
+	if !persistedSwitch.Ports.Value[0].Enabled.Present || persistedSwitch.Ports.Value[0].Enabled.Value {
+		t.Fatal("explicit false policy did not survive")
 	}
 	permissions, err := os.Stat(state)
 	if err != nil || permissions.Mode().Perm() != 0o600 {
@@ -258,7 +456,10 @@ func TestTypedControlIntegration(t *testing.T) {
 	if err != nil || restartedVersion != apVersion {
 		t.Fatal("restarted Apply changed the desired version")
 	}
-	restartedSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, apReport, true), key)
+	if reply := typedExchange(t, reloaded, apID, key, apReport, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("unchanged restarted configuration was queued")
+	}
+	restartedSystem := assertTypedMetadata(t, typedPersistedReply(t, state, apID), key)
 	assertSameTypedIdentity(t, firstSystem, restartedSystem)
 	if restartedSystem["users.1.password"] != storedHash {
 		t.Fatal("restart lost the persisted SSH hash")
@@ -269,23 +470,32 @@ func TestTypedControlIntegration(t *testing.T) {
 	if _, err := restarted.ApplyAP(ctx, apID, apConfig); err != nil {
 		t.Fatal(err)
 	}
-	uplinkSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, uplinkReport, true), key)
+	if reply := typedExchange(t, reloaded, apID, key, uplinkReport, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("unrelated uplink report queued unchanged policy")
+	}
+	uplinkSystem := assertTypedMetadata(t, typedPersistedReply(t, state, apID), key)
 	if uplinkSystem["sshd.1.ifname"] != "br0" {
 		t.Fatal("preserved AP SSH did not bind the management bridge")
 	}
 	explicitSSH := apConfig
-	explicitSSH.SSH = &network.SSHConfig{Username: "explicit-user", Password: network.SecretFile(secretPath)}
+	explicitSSH.SSH = network.Supplied(network.SSHConfig{Username: network.Supplied("explicit-user"), Password: network.Supplied(network.SecretFile(secretPath))}) // gitleaks:allow
 	if _, err := restarted.ApplyAP(ctx, apID, explicitSSH); err != nil {
 		t.Fatal(err)
 	}
-	explicitSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, apReport, true), key)
+	explicitReply := typedExchange(t, reloaded, apID, key, apReport, true)
+	explicitSystem := assertTypedMetadata(t, explicitReply, key)
+	apReport.ConfigVersion = explicitReply.ConfigVersion
+	typedExchange(t, reloaded, apID, key, apReport, true)
 	if explicitSystem["users.1.name"] != "explicit-user" || explicitSystem["users.1.password"] == storedHash || explicitSystem["users.1.password"] == secret || !strings.HasPrefix(explicitSystem["users.1.password"], "$6$") {
 		t.Fatal("stored SSH overrode explicit typed SSH")
 	}
 	if _, err := restarted.ApplyAP(ctx, apID, apConfig); err != nil {
 		t.Fatal(err)
 	}
-	omittedSystem := assertTypedMetadata(t, typedExchange(t, reloaded, apID, key, apReport, true), key)
+	if reply := typedExchange(t, reloaded, apID, key, apReport, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("omitted SSH policy queued unchanged configuration")
+	}
+	omittedSystem := assertTypedMetadata(t, typedPersistedReply(t, state, apID), key)
 	if omittedSystem["users.1.name"] != "explicit-user" || omittedSystem["users.1.password"] != explicitSystem["users.1.password"] {
 		t.Fatal("omitted SSH restored obsolete adoption credentials")
 	}
@@ -306,13 +516,17 @@ func TestTypedControlIntegration(t *testing.T) {
 	if _, err := afterSSHClient.ApplyAP(ctx, apID, apConfig); err != nil {
 		t.Fatal(err)
 	}
-	afterSSHSystem := assertTypedMetadata(t, typedExchange(t, afterSSHRestart, apID, key, apReport, true), key)
+	if reply := typedExchange(t, afterSSHRestart, apID, key, apReport, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("unchanged SSH policy queued after restart")
+	}
+	afterSSHSystem := assertTypedMetadata(t, typedPersistedReply(t, state, apID), key)
 	if afterSSHSystem["users.1.password"] != explicitSystem["users.1.password"] || afterSSHSystem["users.1.name"] != "explicit-user" {
 		t.Fatal("restart restored obsolete SSH credentials")
 	}
 	switchState := filepath.Join(directory, "stored-switch-ssh.json")
 	switchRecord := records[1]
 	switchRecord.SSHUsername, switchRecord.SSHPasswordHash = "preserved-user", storedHash
+	switchRecord.Baseline.Config.System += "sshd.status=enabled\nsshd.1.ifname=eth0\nusers.1.name=preserved-user\nusers.1.password=" + storedHash + "\n"
 	writeTypedJSON(t, switchState, []controller.Device{switchRecord})
 	switchController := openTypedController(t, switchState)
 	switchClient := network.Dial(startTypedSocket(t, switchController))
@@ -332,18 +546,83 @@ func TestTypedControlIntegration(t *testing.T) {
 	writeTypedJSON(t, badState, records)
 	badController := openTypedController(t, badState)
 	badClient := network.Dial(startTypedSocket(t, badController))
-	typedExchange(t, badController, apID, key, apReport, true)
+	badReport := apReport
+	badReport.ConfigVersion = string(records[0].DesiredVersion)
+	typedExchange(t, badController, apID, key, badReport, true)
 	_, err = badClient.ApplyAP(ctx, apID, apConfig)
-	assertControlFailure(t, err, network.EncodingFailed, "")
-	if reply := typedExchange(t, badController, apID, key, apReport, true); reply.Type != controller.ReplyNoop {
-		t.Fatal("invalid stored SSH queued a configuration")
+	if err != nil {
+		t.Fatal("unrelated legacy credential metadata overrode the baseline")
+	}
+	if reply := typedExchange(t, badController, apID, key, badReport, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("legacy credential metadata changed baseline policy")
+	}
+	if strings.Contains(typedPersistedReply(t, badState, apID).SystemConfig, "injected=value") {
+		t.Fatal("legacy credential metadata changed persisted policy")
 	}
 	const pendingID network.DeviceID = "02:00:00:00:00:13"
-	if err := reloaded.Adopt(string(pendingID), controller.Reply{Type: controller.ReplySetparam, ManagementConfig: "cfgversion=adopt\n", SystemConfig: "users.status=enabled\n"}); err != nil {
+	if err := reloaded.Adopt(string(pendingID), controller.Reply{Type: controller.ReplySetparam, ManagementConfig: "cfgversion=adopt\n", SystemConfig: "users.status=enabled\n"}, false); err != nil {
 		t.Fatal(err)
 	}
 	_, err = restarted.ApplyAP(ctx, pendingID, apConfig)
 	assertControlFailure(t, err, network.AdoptionPending, "")
+
+	legacyPresenceState := filepath.Join(directory, "legacy-presence.json")
+	const legacyManagement = "cfgversion=legacy-presence\nunknown.management=exact value \n"
+	const legacySystem = "aaa.1.bss_transition=disabled\nunknown.system=exact value \n"
+	legacyPresenceJSON := strings.Replace(`[{"mac":"02:00:00:00:00:14","key":"fixture-key","desired_ap":{"country_code":840,"networks":[{"name":"Legacy","enabled":false,"vlan":null,"bands":[],"security":{"mode":"wpa2-personal","psk":"/legacy-secret"}}],"radios":[]},"desired_version":"legacy-presence","last_setparam":{"_type":"setparam","cfgversion":"legacy-presence","mgmt_cfg":"cfgversion=legacy-presence\nunknown.management=exact value \n","system_cfg":"aaa.1.bss_transition=disabled\nunknown.system=exact value \n"}}]`, "fixture-key", key, 1)
+	writeTypedFixture(t, legacyPresenceState, []byte(legacyPresenceJSON))
+	legacyController := openTypedController(t, legacyPresenceState)
+	legacyClient := network.Dial(startTypedSocket(t, legacyController))
+	if _, err := legacyClient.Device(ctx, "02:00:00:00:00:14"); err != nil {
+		t.Fatal(err)
+	}
+	if reply := typedExchange(t, legacyController, "02:00:00:00:00:14", key, informmodel.Report{Model: "LegacyPresence", Version: "1"}, false); reply.Type != controller.ReplyNoop {
+		t.Fatal("baseline migration replayed configuration")
+	}
+	if err := legacyController.Register("02:00:00:00:00:14", key); err != nil {
+		t.Fatal(err)
+	}
+	legacyPersisted, err := os.ReadFile(legacyPresenceState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var migrated []controller.Device
+	if err := json.Unmarshal(legacyPersisted, &migrated); err != nil {
+		t.Fatal(err)
+	}
+	if len(migrated) != 1 || migrated[0].DesiredAP == nil || migrated[0].DesiredAP.Networks.Value[0].BSSTransition.Present {
+		t.Fatal("legacy omitted enum became supplied")
+	}
+	if migrated[0].LastSetParam == nil || migrated[0].LastSetParam.ManagementConfig != legacyManagement || migrated[0].LastSetParam.SystemConfig != legacySystem || migrated[0].Baseline == nil || migrated[0].Baseline.Config.Management != legacyManagement || migrated[0].Baseline.Config.System != legacySystem || migrated[0].Baseline.TypedReady {
+		t.Fatal("legacy baseline migration changed exact bodies or claimed typed ownership")
+	}
+	testTypedBSSPersistence(t, ctx, directory, key, secretPath)
+}
+
+func typedAPFixture(secretPath string) network.APConfig {
+	return network.APConfig{
+		CountryCode: network.Supplied(uint16(840)),
+		Radios: network.Supplied([]network.RadioConfig{{
+			Band: network.Band2GHz, Enabled: network.Supplied(true), Channel: network.Cleared[uint16](),
+			WidthMHz: network.Supplied(network.Width20),
+			Power:    network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerAuto)}),
+		}}),
+		Networks: network.Supplied([]network.WiFiNetwork{{
+			Name: "Documentation", Enabled: network.Supplied(true), VLAN: network.Cleared[network.VLANID](),
+			Bands:         network.Supplied([]network.RadioBand{network.Band2GHz}),
+			BSSTransition: network.Supplied(network.BSSTransitionEnabled),
+			Security: network.Supplied(network.WiFiSecurity{
+				Mode: network.Supplied(network.WPA2Personal), PSK: network.Supplied(network.SecretFile(secretPath)),
+			}),
+		}}),
+	}
+}
+
+func typedSwitchFixture() network.SwitchConfig {
+	return network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{{
+		Index: 1, Enabled: network.Supplied(false), NativeVLAN: network.Supplied(network.VLANID(20)),
+		TaggedVLANs: network.Supplied([]network.VLANID{30}), PoE: network.Supplied(network.PoEAuto),
+	}})}
 }
 
 func TestConfigVersionUXIntegration(t *testing.T) {
@@ -353,10 +632,11 @@ func TestConfigVersionUXIntegration(t *testing.T) {
 	const id network.DeviceID = "02:00:00:00:00:41"
 	legacySetParam := controller.Reply{Type: controller.ReplySetparam, ConfigVersion: "legacy-v0", ManagementConfig: "cfgversion=legacy-v0\n"}
 	legacy := []struct {
-		MAC    network.DeviceID `json:"mac"`
-		Key    string           `json:"key"`
-		Config controller.Reply `json:"config"`
-	}{{MAC: id, Key: key, Config: legacySetParam}}
+		MAC      network.DeviceID                  `json:"mac"`
+		Key      string                            `json:"key"`
+		Config   controller.Reply                  `json:"config"`
+		Baseline *controller.ConfigurationBaseline `json:"baseline,omitempty"`
+	}{{MAC: id, Key: key, Config: legacySetParam, Baseline: typedSeedBaseline(t, network.FamilyAP, "legacy-v0")}}
 	writeTypedJSON(t, state, legacy)
 
 	controllerInstance := openTypedController(t, state)
@@ -373,11 +653,13 @@ func TestConfigVersionUXIntegration(t *testing.T) {
 	assertVersionState(t, client, id, "reported-v1", "", "legacy-v0")
 
 	typedConfig := network.APConfig{
-		CountryCode: 840,
-		Radios: []network.RadioConfig{{
-			Band: network.Band2GHz, Enabled: true, WidthMHz: network.Width20,
-			Power: network.PowerConfig{Mode: network.PowerAuto},
-		}},
+		CountryCode: network.Supplied(uint16(840)),
+		Networks:    network.Supplied([]network.WiFiNetwork{}),
+		Radios: network.Supplied([]network.RadioConfig{{
+			Band: network.Band2GHz, Enabled: network.Supplied(true), Channel: network.Cleared[uint16](),
+			WidthMHz: network.Supplied(network.Width20),
+			Power:    network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerAuto)}),
+		}}),
 	}
 	typedVersion, err := client.ApplyAP(t.Context(), id, typedConfig)
 	if err != nil {
@@ -395,13 +677,13 @@ func TestConfigVersionUXIntegration(t *testing.T) {
 	if _, err := client.ApplyConfig(t.Context(), id, rawConfig); err != nil {
 		t.Fatal(err)
 	}
-	assertVersionState(t, client, id, typedVersion, typedVersion, rawConfig.Version)
+	assertVersionState(t, client, id, typedVersion, "", rawConfig.Version)
 	if reply := typedExchange(t, controllerInstance, id, key, report, false); reply.ConfigVersion != string(rawConfig.Version) {
 		t.Fatal("raw setparam was not delivered")
 	}
 	report.ConfigVersion = string(rawConfig.Version)
 	typedExchange(t, controllerInstance, id, key, report, false)
-	assertVersionState(t, client, id, rawConfig.Version, typedVersion, rawConfig.Version)
+	assertVersionState(t, client, id, rawConfig.Version, "", rawConfig.Version)
 
 	persisted, err := os.ReadFile(state)
 	if err != nil {
@@ -414,6 +696,69 @@ func TestConfigVersionUXIntegration(t *testing.T) {
 	if len(records) != 1 || records[0]["last_setparam"] == nil || records[0]["config"] != nil {
 		t.Fatal("legacy config field was not migrated")
 	}
+	var devices []controller.Device
+	if err := json.Unmarshal(persisted, &devices); err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].Baseline == nil || devices[0].Baseline.TypedReady || devices[0].Baseline.Config != rawConfig || devices[0].DesiredAP != nil || devices[0].DesiredVersion != "" {
+		t.Fatal("later raw configuration retained stale typed ownership")
+	}
+
+	malformedState := filepath.Join(t.TempDir(), "devices.json")
+	duplicateBody := "cfgversion=duplicate\ncfgversion=duplicate-again\n"
+	malformedLegacy := []controller.Device{{
+		MAC: string(id), Key: key,
+		LastSetParam: &controller.Reply{Type: controller.ReplySetparam, ConfigVersion: "duplicate", ManagementConfig: duplicateBody},
+	}}
+	writeTypedJSON(t, malformedState, malformedLegacy)
+	malformedController := openTypedController(t, malformedState)
+	malformedClient := network.Dial(startTypedSocket(t, malformedController))
+	assertVersionState(t, malformedClient, id, "", "", "duplicate")
+	if statuses := malformedController.Status(); len(statuses) != 1 || statuses[0].Pending != 0 {
+		t.Fatal("malformed legacy baseline replayed configuration")
+	}
+	malformedRaw := network.Config{Version: "duplicate", Management: duplicateBody}
+	if _, err := malformedClient.ApplyConfig(t.Context(), id, malformedRaw); err != nil {
+		t.Fatal(err)
+	}
+	malformedPersisted, err := os.ReadFile(malformedState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var malformedDevices []controller.Device
+	if err := json.Unmarshal(malformedPersisted, &malformedDevices); err != nil {
+		t.Fatal(err)
+	}
+	if len(malformedDevices) != 1 || malformedDevices[0].Baseline == nil || malformedDevices[0].Baseline.TypedReady || malformedDevices[0].Baseline.Config != malformedRaw {
+		t.Fatal("raw duplicate-key baseline was changed or marked typed ready")
+	}
+	if reply := typedExchange(t, malformedController, id, key, report, false); reply.ManagementConfig != duplicateBody {
+		t.Fatal("raw duplicate-key baseline changed before delivery")
+	}
+
+	failureDirectory := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(failureDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	failureState := filepath.Join(failureDirectory, "devices.json")
+	writeTypedJSON(t, failureState, legacy)
+	failureController := openTypedController(t, failureState)
+	failureSocket := startTypedSocket(t, failureController)
+	if err := os.Remove(failureState); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(failureDirectory); err != nil {
+		t.Fatal(err)
+	}
+	writeTypedFixture(t, failureDirectory, []byte("blocks state directory"))
+	failureClient := network.Dial(failureSocket)
+	_, err = failureClient.ApplyConfig(t.Context(), id, network.Config{Version: "must-not-queue", Management: "cfgversion=must-not-queue\n"})
+	assertControlFailure(t, err, network.PersistenceFailed, "")
+	statuses := failureController.Status()
+	if len(statuses) != 1 || statuses[0].Pending != 0 {
+		t.Fatal("failed persistence queued raw configuration")
+	}
+	assertVersionState(t, failureClient, id, "", "", "legacy-v0")
 }
 
 func assertVersionState(t *testing.T, client *network.Client, id network.DeviceID, reported, desired, lastSetParam network.ConfigVersion) {
@@ -433,22 +778,9 @@ func assertTypedMetadata(t *testing.T, reply controller.Reply, key string) confi
 	if err != nil {
 		t.Fatal("invalid outgoing system configuration")
 	}
-	for name, expected := range map[string]string{
-		"unifi.key": key, "unifi.mcip": "192.0.2.1", "unifi.version": "0.1.0",
-		"unifi.cfgcap_info": "0x7", "unifi.feature.always_send_crash_logs": "disabled", "unifi.idp": "enabled",
-	} {
-		if system[name] != expected {
-			t.Fatalf("controller metadata incorrect: %s", name)
-		}
-	}
-	uuid := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-	for _, name := range []string{"unifi.anonymous_controller_id", "unifi.anonymous_site_id", "unifi.reporterid"} {
-		if !uuid.MatchString(system[name]) {
-			t.Fatalf("invalid controller UUID: %s", name)
-		}
-	}
-	if !regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(system["unifi.siteid"]) || system["unifi.anonymous_controller_id"] != system["unifi.reporterid"] || system["unifi.anonymous_site_id"] == system["unifi.anonymous_controller_id"] {
-		t.Fatal("invalid controller identity relationship")
+	management, err := configmap.Parse(reply.ManagementConfig)
+	if err != nil || management["authkey"] != key || management["inform_url"] != "http://192.0.2.1:8080/inform" || management["cfgversion"] != reply.ConfigVersion {
+		t.Fatal("required connection metadata changed")
 	}
 	return system
 }
@@ -463,6 +795,10 @@ func assertSameTypedIdentity(t *testing.T, first, current configmap.Values) {
 }
 
 func TestGenericConfigControlIntegration(t *testing.T) {
+	t.Run("command and baseline ownership", testCommandAndBaselineOwnership)
+	t.Run("explicit adoption SSH", testExplicitAdoptionSSH)
+	t.Run("import AP identities", testImportAPIdentities)
+	t.Run("transport persistence rollback", testTransportPersistenceRollback)
 	directory := t.TempDir()
 	state := filepath.Join(directory, "state.json")
 	const key = "0123456789abcdef0123456789abcdef"
@@ -502,8 +838,8 @@ func TestGenericConfigControlIntegration(t *testing.T) {
 	}
 	config := network.Config{
 		Version:    "generic-config-v1",
-		Management: "unknown.management.key=value=with=equals\nunknown.management.trailing=preserve-space \n",
-		System:     "unknown.system.key=quoted\\value\nunknown.system.empty=\n",
+		Management: "z=last\n\na=first\nunknown.management.key=value=with=equals\nunknown.management.trailing=preserve-space \n",
+		System:     "unknown.security=operator\nrepeat=one\nrepeat=two\n\nunknown.system.key=quoted\\value\nunknown.system.empty=\nlabel=雪😀\n",
 	}
 	version, err := client.ApplyConfig(t.Context(), id, config)
 	if err != nil {
@@ -578,6 +914,8 @@ func TestRawConfigSocketEncoding(t *testing.T) {
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}
 	for _, body := range [][]byte{
+		[]byte(`{"operation":"baseline-import","device":"02:00:00:00:00:32","baseline":{"config":{"version":"version","management":"key=value","system":"key=\ud800"}}}`),
+		append([]byte(`{"operation":"baseline-import","device":"02:00:00:00:00:32","baseline":{"config":{"version":"version","management":"key=value","system":"key=`), append([]byte{0xff}, []byte(`"}}}`)...)...),
 		append([]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"`), append([]byte{0xff}, []byte(`","management":"key=value","system":""}}`)...)...),
 		[]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"version","management":"\ud800","system":""}}`),
 		[]byte(`{"operation":"apply-config","device":"02:00:00:00:00:32","config":{"version":"version","management":"key=value","system":"\udc00"}}`),
@@ -757,4 +1095,337 @@ func typedExchange(t *testing.T, c *controller.Controller, id network.DeviceID, 
 		t.Fatal(err)
 	}
 	return reply
+}
+
+func typedSeedBaseline(t *testing.T, family network.DeviceFamily, version network.ConfigVersion) *controller.ConfigurationBaseline {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("..", "..", "testdata", "profiles", string(family), "baseline-setparam.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Management configmap.Values
+		System     configmap.Values
+	}
+	if err := json.Unmarshal(body, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	fixture.Management["cfgversion"] = string(version)
+	if family == network.FamilyAP {
+		fixture.System["radio.2.phyname"] = "wifi0"
+	}
+	// Credential policy is supplied separately by the tests that exercise it.
+	for key := range fixture.System {
+		if strings.HasPrefix(key, "sshd.") || strings.HasPrefix(key, "users.") {
+			delete(fixture.System, key)
+		}
+	}
+	management, err := fixture.Management.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	system, err := fixture.System.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &controller.ConfigurationBaseline{SchemaVersion: 1, TypedReady: true, Config: network.Config{Version: version, Management: management, System: system}}
+}
+
+func testTypedBSSPersistence(t *testing.T, ctx context.Context, directory, key, secretPath string) {
+	t.Helper()
+	const id network.DeviceID = "02:00:00:00:00:15"
+	const baselineVersion network.ConfigVersion = "bss-baseline"
+	state := filepath.Join(directory, "bss-persistence.json")
+	config, baseline := typedBSSFixture(t, secretPath, baselineVersion)
+	writeTypedJSON(t, state, []controller.Device{{
+		MAC:            string(id),
+		Key:            key,
+		Family:         network.FamilyAP,
+		DesiredAP:      &config,
+		DesiredVersion: baselineVersion,
+		LastSetParam: &controller.Reply{
+			Type:             controller.ReplySetparam,
+			ConfigVersion:    string(baselineVersion),
+			ManagementConfig: baseline.Config.Management,
+			SystemConfig:     baseline.Config.System,
+		},
+		Baseline: baseline,
+	}})
+	controllerInstance := openTypedController(t, state)
+	client := network.Dial(startTypedSocket(t, controllerInstance))
+	report := informmodel.Report{
+		Type:    "uap",
+		Model:   "BSSFixtureAP",
+		Version: "1",
+		RadioTable: []informmodel.Radio{
+			{Name: "wifi0", Radio: "ng", Widths: []informmodel.Uint16Scalar{20}},
+			{Name: "wifi1", Radio: "na", Widths: []informmodel.Uint16Scalar{40}},
+		},
+		PortTable: []informmodel.Port{{Index: 1, Interface: "eth0"}},
+	}
+	if reply := typedExchange(t, controllerInstance, id, key, report, false); reply.Type != controller.ReplyNoop {
+		t.Fatal("loaded BSS fixture replayed configuration")
+	}
+
+	unchanged, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+		{Name: "fixture-legacy", BSSTransition: network.Supplied(network.BSSTransitionMode("automatic"))},
+		{Name: "fixture-enabled"},
+		{Name: "fixture-disabled"},
+		{Name: "fixture-absent"},
+	})}
+	_, err = client.ApplyAP(ctx, id, invalid)
+	assertControlFailure(t, err, network.InvalidConfig, "networks[0].bss_transition")
+	afterInvalid, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterInvalid, unchanged) || controllerInstance.Status()[0].Pending != 0 {
+		t.Fatal("invalid BSS Transition changed baseline, projection, or queue")
+	}
+
+	disableLegacy := network.APConfig{Networks: network.Supplied([]network.WiFiNetwork{
+		{Name: "fixture-enabled"},
+		{Name: "fixture-legacy", BSSTransition: network.Supplied(network.BSSTransitionDisabled)},
+		{Name: "fixture-absent"},
+		{Name: "fixture-disabled"},
+	})}
+	disabledVersion, err := client.ApplyAP(ctx, id, disableLegacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledReply := typedExchange(t, controllerInstance, id, key, report, false)
+	if disabledReply.Type != controller.ReplySetparam || disabledReply.ConfigVersion != string(disabledVersion) {
+		t.Fatal("typed legacy-network disable was not delivered")
+	}
+	assertBSSFixtureValues(t, disabledReply.SystemConfig)
+	report.ConfigVersion = string(disabledVersion)
+	if reply := typedExchange(t, controllerInstance, id, key, report, false); reply.Type != controller.ReplyNoop {
+		t.Fatal("matching BSS fixture inform received a command")
+	}
+
+	reloaded := openTypedController(t, state)
+	restarted := network.Dial(startTypedSocket(t, reloaded))
+	if reply := typedExchange(t, reloaded, id, key, report, true); reply.Type != controller.ReplyNoop {
+		t.Fatal("BSS fixture command survived restart")
+	}
+	unrelated := network.APConfig{CountryCode: network.Supplied(uint16(124))}
+	unrelatedVersion, err := restarted.ApplyAP(ctx, id, unrelated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedReply := typedExchange(t, reloaded, id, key, report, true)
+	if unrelatedReply.Type != controller.ReplySetparam || unrelatedReply.ConfigVersion != string(unrelatedVersion) {
+		t.Fatal("unrelated typed request was not delivered")
+	}
+	assertBSSFixtureValues(t, unrelatedReply.SystemConfig)
+
+	persisted, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devices []controller.Device
+	if err := json.Unmarshal(persisted, &devices); err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].LastSetParam == nil || devices[0].Baseline == nil || !devices[0].Baseline.TypedReady {
+		t.Fatal("BSS fixture persisted state is incomplete")
+	}
+	if devices[0].LastSetParam.SystemConfig != unrelatedReply.SystemConfig || devices[0].Baseline.Config.System != unrelatedReply.SystemConfig {
+		t.Fatal("last complete persisted body differs from the delivered reply")
+	}
+	assertBSSFixtureValues(t, devices[0].Baseline.Config.System)
+}
+
+func typedBSSFixture(t *testing.T, secretPath string, version network.ConfigVersion) (network.APConfig, *controller.ConfigurationBaseline) {
+	t.Helper()
+	baseline := typedSeedBaseline(t, network.FamilyAP, version)
+	system, err := configmap.Parse(baseline.Config.System)
+	if err != nil {
+		t.Fatal(err)
+	}
+	system["radio.1.phyname"], system["radio.1.devname"] = "wifi1", "ath1"
+	system["radio.2.phyname"], system["radio.2.devname"] = "wifi0", "ath0"
+	type fixtureWLAN struct {
+		index      string
+		name       string
+		parent     string
+		deviceName string
+		bss        string
+		bssPresent bool
+		bands      []network.RadioBand
+	}
+	wlans := []fixtureWLAN{
+		{index: "1", name: "fixture-legacy", parent: "wifi0", deviceName: "ath0", bss: "enabled", bssPresent: true, bands: []network.RadioBand{network.Band2GHz, network.Band5GHz}},
+		{index: "2", name: "fixture-legacy", parent: "wifi1", deviceName: "ath1", bss: "enabled", bssPresent: true},
+		{index: "3", name: "fixture-enabled", parent: "wifi0", deviceName: "ath2", bss: "enabled", bssPresent: true, bands: []network.RadioBand{network.Band2GHz}},
+		{index: "4", name: "fixture-disabled", parent: "wifi0", deviceName: "ath3", bss: "disabled", bssPresent: true, bands: []network.RadioBand{network.Band2GHz}},
+		{index: "5", name: "fixture-absent", parent: "wifi0", deviceName: "ath4", bands: []network.RadioBand{network.Band2GHz}},
+	}
+	var networks []network.WiFiNetwork
+	var bindings []profile.ResourceBinding
+	for _, wlan := range wlans {
+		wireless := "wireless." + wlan.index + "."
+		aaa := "aaa." + wlan.index + "."
+		netconf := "netconf." + wlan.index + "0."
+		member := "bridge.1.port." + wlan.index + "0."
+		system[wireless+"ssid"], system[wireless+"parent"], system[wireless+"devname"], system[wireless+"status"] = wlan.name, wlan.parent, wlan.deviceName, "enabled"
+		system[aaa+"ssid"], system[aaa+"devname"], system[aaa+"status"], system[aaa+"br.devname"] = wlan.name, wlan.deviceName, "enabled", "br0"
+		system[aaa+"wpa"], system[aaa+"wpa.1.pairwise"], system[aaa+"wpa.key.1.mgmt"], system[aaa+"wpa.psk"] = "2", "CCMP", "WPA-PSK", "fixture-passphrase"
+		system[netconf+"devname"], system[netconf+"status"], system[netconf+"up"] = wlan.deviceName, "enabled", "disabled"
+		system[member+"devname"] = wlan.deviceName
+		if wlan.bssPresent {
+			system[aaa+"bss_transition"] = wlan.bss
+		}
+		radioID := "ng"
+		if wlan.parent == "wifi1" {
+			radioID = "na"
+		}
+		bindings = append(bindings, profile.ResourceBinding{Kind: "wifi", Identity: wlan.name, RadioID: radioID, Prefixes: []string{wireless, aaa, netconf, member}})
+		if len(wlan.bands) == 0 {
+			continue
+		}
+		bss := network.Optional[network.BSSTransitionMode]{}
+		if wlan.bssPresent {
+			bss = network.Supplied(network.BSSTransitionMode(wlan.bss))
+		}
+		networks = append(networks, network.WiFiNetwork{
+			Name: wlan.name, Enabled: network.Supplied(true), VLAN: network.Cleared[network.VLANID](),
+			Bands: network.Supplied(wlan.bands), BSSTransition: bss,
+			Security: network.Supplied(network.WiFiSecurity{
+				Mode: network.Supplied(network.WPA2Personal), PSK: network.Supplied(network.SecretFile(secretPath)),
+			}),
+		})
+	}
+	systemBody, err := system.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline.Config.System = systemBody
+	baseline.Bindings = bindings
+	config := network.APConfig{
+		CountryCode: network.Supplied(uint16(840)),
+		Radios: network.Supplied([]network.RadioConfig{
+			{Band: network.Band2GHz, Enabled: network.Supplied(true), Channel: network.Cleared[uint16](), WidthMHz: network.Supplied(network.Width20), Power: network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerAuto)})},
+			{Band: network.Band5GHz, Enabled: network.Supplied(true), Channel: network.Cleared[uint16](), WidthMHz: network.Supplied(network.Width40), Power: network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerAuto)})},
+		}),
+		Networks: network.Supplied(networks),
+	}
+	return config, baseline
+}
+
+func assertBSSFixtureValues(t *testing.T, body string) {
+	t.Helper()
+	values, err := configmap.Parse(body)
+	if err != nil {
+		t.Fatal("BSS fixture body is invalid")
+	}
+	for _, prefix := range []string{"aaa.1.", "aaa.2."} {
+		if values[prefix+"bss_transition"] != "disabled" {
+			t.Fatal("fixture-legacy BSS Transition is not disabled")
+		}
+	}
+	if values["aaa.3.bss_transition"] != "enabled" || values["aaa.4.bss_transition"] != "disabled" {
+		t.Fatal("peer BSS Transition changed")
+	}
+	if _, exists := values["aaa.5.bss_transition"]; exists {
+		t.Fatal("absent peer BSS Transition acquired a default")
+	}
+}
+
+func TestTypedApplyRequiresUsableBaseline(t *testing.T) {
+	const key = "0123456789abcdef0123456789abcdef" // gitleaks:allow
+	const id network.DeviceID = "02:00:00:00:00:51"
+	tests := []struct {
+		name     string
+		baseline *controller.ConfigurationBaseline
+		code     network.ErrorCode
+	}{
+		{name: "missing", code: network.BaselineRequired},
+		{name: "raw ownership", baseline: &controller.ConfigurationBaseline{SchemaVersion: 1, TypedReady: false, Config: network.Config{Management: "ready=yes\n", System: "ready=yes\n"}}, code: network.BaselineUnusable},
+		{name: "duplicate records", baseline: &controller.ConfigurationBaseline{SchemaVersion: 1, TypedReady: true, Config: network.Config{Management: "ready=yes\n", System: "same=1\nsame=2\n"}}, code: network.BaselineUnusable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := filepath.Join(t.TempDir(), "state.json")
+			writeTypedJSON(t, state, []controller.Device{{MAC: string(id), Key: key, Baseline: test.baseline}})
+			c := openTypedController(t, state)
+			client := network.Dial(startTypedSocket(t, c))
+			report := informmodel.Report{Type: "uap", RadioTable: []informmodel.Radio{{Name: "wifi0", Radio: "ng"}}}
+			typedExchange(t, c, id, key, report, false)
+			before, err := os.ReadFile(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.ApplyAP(t.Context(), id, network.APConfig{})
+			assertControlFailure(t, err, test.code, "")
+			after, err := os.ReadFile(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("failed typed apply changed persisted state")
+			}
+			if reply := typedExchange(t, c, id, key, report, false); reply.Type != controller.ReplyNoop {
+				t.Fatal("failed typed apply queued configuration")
+			}
+		})
+	}
+}
+
+func TestTypedApplyPersistenceFailurePreservesBaseline(t *testing.T) {
+	const key = "0123456789abcdef0123456789abcdef" // gitleaks:allow
+	const id network.DeviceID = "02:00:00:00:00:52"
+	directory := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(directory, "devices.json")
+	baseline := typedSeedBaseline(t, network.FamilyAP, "before")
+	writeTypedJSON(t, state, []controller.Device{{MAC: string(id), Key: key, Baseline: baseline}})
+	c := openTypedController(t, state)
+	client := network.Dial(startTypedSocket(t, c))
+	report := informmodel.Report{Type: "uap", RadioTable: []informmodel.Radio{{Name: "wifi0", Radio: "ng"}}}
+	typedExchange(t, c, id, key, report, false)
+	if err := os.Remove(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(directory, []byte("blocked state directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := client.ApplyAP(t.Context(), id, network.APConfig{CountryCode: network.Supplied(uint16(840))})
+	assertControlFailure(t, err, network.PersistenceFailed, "")
+	snapshot, err := client.Device(t.Context(), id)
+	if err != nil || snapshot.DesiredConfigVersion != "" || snapshot.LastSetParamVersion != "" {
+		t.Fatal("failed persistence changed desired state")
+	}
+	if statuses := c.Status(); len(statuses) != 1 || statuses[0].Pending != 0 {
+		t.Fatal("failed persistence changed queue")
+	}
+	if err := os.Remove(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Register(string(id), key); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devices []controller.Device
+	if err := json.Unmarshal(body, &devices); err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].Baseline == nil || devices[0].Baseline.Config != baseline.Config {
+		t.Fatal("failed persistence changed in-memory baseline")
+	}
 }

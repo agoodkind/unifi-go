@@ -39,7 +39,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return errors.New("usage: unifi-go serve|adopt|import|send|status [flags]")
 	}
 	switch typedOperation(args[0]) {
-	case operationApply, operationDevices, operationDevice, operationClients, operationPorts:
+	case operationApply, operationDevices, operationDevice, operationClients, operationPorts, operationCommand, operationBaselineImport:
 		return runTyped(ctx, args, output)
 	}
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
@@ -50,13 +50,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	mac := flags.String("mac", "", "device MAC")
 	keyFile := flags.String("key-file", "", "inform key file")
 	commandFile := flags.String("file", "", "controller JSON reply file")
+	setupSSH := flags.Bool("setup-ssh", false, "install generated SSH credentials during adoption")
 	if err := flags.Parse(args[1:]); err != nil {
 		return failure("parse arguments", err)
 	}
 	if args[0] == "serve" {
 		return serve(ctx, *listen, *advertise, *state, *socket, output)
 	}
-	request := controller.ControlRequest{Operation: controller.Operation(args[0]), MAC: *mac, KeyFile: *keyFile, Command: nil, Device: "", AP: nil, Switch: nil, Config: nil}
+	request := controller.ControlRequest{Operation: controller.Operation(args[0]), MAC: *mac, KeyFile: *keyFile, Command: nil, Device: "", AP: nil, Switch: nil, Config: nil, TypedCommand: nil, Baseline: nil, SetupSSH: *setupSSH, PreviewToken: ""}
 	if args[0] == "send" || args[0] == "adopt" {
 		data, err := os.ReadFile(filepath.Clean(*commandFile))
 		if err != nil {
