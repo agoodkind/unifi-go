@@ -484,12 +484,14 @@ func TestTypedControlIntegration(t *testing.T) {
 	writeTypedJSON(t, badState, records)
 	badController := openTypedController(t, badState)
 	badClient := network.Dial(startTypedSocket(t, badController))
-	typedExchange(t, badController, apID, key, apReport, true)
+	badReport := apReport
+	badReport.ConfigVersion = string(records[0].DesiredVersion)
+	typedExchange(t, badController, apID, key, badReport, true)
 	_, err = badClient.ApplyAP(ctx, apID, apConfig)
 	if err != nil {
 		t.Fatal("unrelated legacy credential metadata overrode the baseline")
 	}
-	if reply := typedExchange(t, badController, apID, key, apReport, true); reply.Type != controller.ReplyNoop {
+	if reply := typedExchange(t, badController, apID, key, badReport, true); reply.Type != controller.ReplyNoop {
 		t.Fatal("legacy credential metadata changed baseline policy")
 	}
 	if strings.Contains(typedPersistedReply(t, badState, apID).SystemConfig, "injected=value") {

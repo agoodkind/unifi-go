@@ -315,7 +315,8 @@ func testPreviewRepresentationRestart(t *testing.T) {
 		t.Fatal("equivalent representation was not persisted")
 	}
 	fixture.config.Networks.Value[0].BSSTransition = network.Supplied(network.BSSTransitionDisabled)
-	if _, err := fixture.client.ApplyAP(t.Context(), previewTestID, fixture.config); err != nil {
+	pendingVersion, err := fixture.client.ApplyAP(t.Context(), previewTestID, fixture.config)
+	if err != nil {
 		t.Fatal("unchanged apply incorrectly set awaiting state")
 	}
 	fixture.controller = openTypedController(t, fixture.state)
@@ -324,6 +325,19 @@ func testPreviewRepresentationRestart(t *testing.T) {
 	assertControlFailure(t, err, network.NoReport, "")
 	if reply := typedExchange(t, fixture.controller, previewTestID, previewTestKey, fixture.report, true); reply.Type != controller.ReplyNoop {
 		t.Fatal("restart replayed pending work")
+	}
+	retriedVersion, err := fixture.client.ApplyAP(t.Context(), previewTestID, fixture.config)
+	if err != nil || retriedVersion != pendingVersion || fixture.controller.Status()[0].Pending != 1 {
+		t.Fatal("same desired configuration was not requeued after restart with an older report")
+	}
+	retriedReply := typedExchange(t, fixture.controller, previewTestID, previewTestKey, fixture.report, true)
+	if retriedReply.Type != controller.ReplySetparam || retriedReply.ConfigVersion != string(pendingVersion) || !strings.Contains(retriedReply.SystemConfig, "aaa.1.bss_transition=disabled") {
+		t.Fatal("restart retry did not deliver the persisted desired configuration")
+	}
+	fixture.report.ConfigVersion = string(pendingVersion)
+	typedExchange(t, fixture.controller, previewTestID, previewTestKey, fixture.report, true)
+	if version, err := fixture.client.ApplyAP(t.Context(), previewTestID, fixture.config); err != nil || version != pendingVersion || fixture.controller.Status()[0].Pending != 0 {
+		t.Fatal("acknowledged retry queued unchanged configuration")
 	}
 	fixture.config.Networks.Value[0].BSSTransition = network.Supplied(network.BSSTransitionEnabled)
 	if _, err := fixture.client.ApplyAP(t.Context(), previewTestID, fixture.config); err != nil {
