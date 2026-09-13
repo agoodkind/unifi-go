@@ -28,22 +28,28 @@ type BaselineImport struct {
 }
 
 type controlRequest struct {
-	Operation    string          `json:"operation"`
-	Device       DeviceID        `json:"device,omitempty"`
-	AP           *APConfig       `json:"ap,omitempty"`
-	Switch       *SwitchConfig   `json:"switch,omitempty"`
-	Config       *Config         `json:"config,omitempty"`
-	TypedCommand *Command        `json:"typed_command,omitempty"`
-	Baseline     *BaselineImport `json:"baseline,omitempty"`
-	PreviewToken PreviewToken    `json:"preview_token,omitempty"`
+	Operation    string            `json:"operation"`
+	Device       DeviceID          `json:"device,omitempty"`
+	AP           *APConfig         `json:"ap,omitempty"`
+	Switch       *SwitchConfig     `json:"switch,omitempty"`
+	Config       *Config           `json:"config,omitempty"`
+	TypedCommand *Command          `json:"typed_command,omitempty"`
+	Baseline     *BaselineImport   `json:"baseline,omitempty"`
+	PreviewToken PreviewToken      `json:"preview_token,omitempty"`
+	WiFiAdd      *AddWiFiRequest   `json:"wifi_add,omitempty"`
+	WiFiSet      *SetWiFiRequest   `json:"wifi_set,omitempty"`
+	WiFiRemove   *string           `json:"wifi_remove,omitempty"`
+	Radio        *RadioConfig      `json:"radio,omitempty"`
+	Port         *SwitchPortConfig `json:"port,omitempty"`
 }
 
 type controlResponse struct {
-	Error   *ControlError    `json:"error,omitempty"`
-	Version ConfigVersion    `json:"version,omitempty"`
-	Device  *DeviceSnapshot  `json:"device,omitempty"`
-	Devices []DeviceSnapshot `json:"devices,omitempty"`
-	Preview *ConfigPreview   `json:"preview,omitempty"`
+	Error        *ControlError     `json:"error,omitempty"`
+	Version      ConfigVersion     `json:"version,omitempty"`
+	Device       *DeviceSnapshot   `json:"device,omitempty"`
+	Devices      []DeviceSnapshot  `json:"devices,omitempty"`
+	Preview      *ConfigPreview    `json:"preview,omitempty"`
+	WiFiNetworks []WiFiNetworkView `json:"wifi_networks,omitempty"`
 }
 
 // Dial creates a client for socket; connections open on demand.
@@ -106,6 +112,45 @@ func (client *Client) Device(ctx context.Context, id DeviceID) (DeviceSnapshot, 
 func (client *Client) Devices(ctx context.Context) ([]DeviceSnapshot, error) {
 	response, err := client.call(ctx, controlRequest{Operation: "devices"})
 	return response.Devices, err
+}
+
+// WiFiNetworks returns non-secret desired WiFi resources.
+func (client *Client) WiFiNetworks(ctx context.Context, id DeviceID) ([]WiFiNetworkView, error) {
+	response, err := client.call(ctx, controlRequest{Operation: "wifi-list", Device: id})
+	if response.WiFiNetworks == nil && err == nil {
+		response.WiFiNetworks = []WiFiNetworkView{}
+	}
+	return response.WiFiNetworks, err
+}
+
+// AddWiFi copies an existing WiFi resource under a new name and secret.
+func (client *Client) AddWiFi(ctx context.Context, id DeviceID, request AddWiFiRequest) (ConfigVersion, error) {
+	response, err := client.call(ctx, controlRequest{Operation: "wifi-add", Device: id, WiFiAdd: &request})
+	return response.Version, err
+}
+
+// SetWiFi changes one named WiFi resource.
+func (client *Client) SetWiFi(ctx context.Context, id DeviceID, request SetWiFiRequest) (ConfigVersion, error) {
+	response, err := client.call(ctx, controlRequest{Operation: "wifi-set", Device: id, WiFiSet: &request})
+	return response.Version, err
+}
+
+// RemoveWiFi removes one named WiFi resource.
+func (client *Client) RemoveWiFi(ctx context.Context, id DeviceID, name string) (ConfigVersion, error) {
+	response, err := client.call(ctx, controlRequest{Operation: "wifi-remove", Device: id, WiFiRemove: &name})
+	return response.Version, err
+}
+
+// SetRadio changes one physical access point radio.
+func (client *Client) SetRadio(ctx context.Context, id DeviceID, config RadioConfig) (ConfigVersion, error) {
+	response, err := client.call(ctx, controlRequest{Operation: "radio-set", Device: id, Radio: &config})
+	return response.Version, err
+}
+
+// SetSwitchPort changes one physical switch port.
+func (client *Client) SetSwitchPort(ctx context.Context, id DeviceID, config SwitchPortConfig) (ConfigVersion, error) {
+	response, err := client.call(ctx, controlRequest{Operation: "port-set", Device: id, Port: &config})
+	return response.Version, err
 }
 
 func (client *Client) call(ctx context.Context, request controlRequest) (controlResponse, error) {

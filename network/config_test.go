@@ -28,6 +28,15 @@ func validAPConfig() APConfig {
 func TestAPConfigValidateAcceptsValidConfigurations(t *testing.T) {
 	tests := map[string]APConfig{
 		"dual band": validAPConfig(),
+		"repeated band with identities": {
+			Radios: Supplied([]RadioConfig{
+				{ID: "radio-5a", Band: Band5GHz},
+				{ID: "radio-5b", Band: Band5GHz},
+			}),
+			Networks: Supplied([]WiFiNetwork{{
+				Name: "selected", Enabled: Supplied(true), RadioIDs: Supplied([]RadioID{"radio-5b"}),
+			}}),
+		},
 		"no networks": {
 			CountryCode: Supplied(uint16(840)),
 			Networks:    Supplied([]WiFiNetwork{}),
@@ -69,11 +78,29 @@ func TestAPConfigValidateRejectsInvalidConfigurations(t *testing.T) {
 		"unknown bss transition": {func(config *APConfig) {
 			config.Networks.Value[0].BSSTransition = Supplied(BSSTransitionMode("automatic"))
 		}, "networks[0].bss_transition"},
-		"duplicate radio band": {func(config *APConfig) { config.Radios.Value = append(config.Radios.Value, config.Radios.Value[0]) }, "radios[2].band"},
-		"unknown radio band":   {func(config *APConfig) { config.Radios.Value[0].Band = RadioBand("6ghz") }, "radios[0].band"},
-		"zero channel":         {func(config *APConfig) { config.Radios.Value[0].Channel = Supplied(uint16(0)) }, "radios[0].channel"},
-		"invalid width":        {func(config *APConfig) { config.Radios.Value[0].WidthMHz = Supplied(ChannelWidthMHz(80)) }, "radios[0].width_mhz"},
-		"unknown power":        {func(config *APConfig) { config.Radios.Value[0].Power.Value.Mode = Supplied(PowerMode("high")) }, "radios[0].power.mode"},
+		"missing repeated radio identity": {func(config *APConfig) { config.Radios.Value = append(config.Radios.Value, config.Radios.Value[0]) }, "radios[0].id"},
+		"duplicate radio identity": {func(config *APConfig) {
+			config.Radios.Value[0].ID = "same"
+			config.Radios.Value[1].ID = "same"
+		}, "radios[1].id"},
+		"mixed network selectors": {func(config *APConfig) {
+			config.Radios.Value[0].ID = "radio-24"
+			config.Networks.Value[0].RadioIDs = Supplied([]RadioID{"radio-24"})
+		}, "networks[0]"},
+		"duplicate network radio identity": {func(config *APConfig) {
+			config.Radios.Value[0].ID = "radio-24"
+			config.Networks.Value[0].Bands = Optional[[]RadioBand]{}
+			config.Networks.Value[0].RadioIDs = Supplied([]RadioID{"radio-24", "radio-24"})
+		}, "networks[0].radio_ids[1]"},
+		"missing configured radio identity": {func(config *APConfig) {
+			config.Radios.Value[0].ID = "radio-24"
+			config.Networks.Value[0].Bands = Optional[[]RadioBand]{}
+			config.Networks.Value[0].RadioIDs = Supplied([]RadioID{"missing"})
+		}, "networks[0].radio_ids[0]"},
+		"unknown radio band": {func(config *APConfig) { config.Radios.Value[0].Band = RadioBand("6ghz") }, "radios[0].band"},
+		"zero channel":       {func(config *APConfig) { config.Radios.Value[0].Channel = Supplied(uint16(0)) }, "radios[0].channel"},
+		"invalid width":      {func(config *APConfig) { config.Radios.Value[0].WidthMHz = Supplied(ChannelWidthMHz(80)) }, "radios[0].width_mhz"},
+		"unknown power":      {func(config *APConfig) { config.Radios.Value[0].Power.Value.Mode = Supplied(PowerMode("high")) }, "radios[0].power.mode"},
 	}
 
 	for name, test := range tests {
@@ -105,6 +132,47 @@ func TestAPConfigValidateCompleteRequiresExplicitPowerDBm(t *testing.T) {
 	failure, ok := errors.AsType[*ControlError](err)
 	if !ok || failure.Code != PolicyRequired || failure.Field != "radios[1].power.dbm" {
 		t.Fatalf("ValidateComplete() error = %v", err)
+	}
+}
+
+func TestConfigurationClonesOwnNestedCollections(t *testing.T) {
+	apSource := validAPConfig()
+	apSource.Networks.Value[0].RadioIDs = Supplied([]RadioID{"wifi0"})
+	apClone := apSource.Clone()
+	apClone.Networks.Value[0].Bands.Value[0] = Band5GHz
+	apClone.Networks.Value[0].RadioIDs.Value[0] = "wifi1"
+	apClone.Radios.Value[0].Channel = Supplied(uint16(11))
+	if apSource.Networks.Value[0].Bands.Value[0] != Band2GHz || apSource.Networks.Value[0].RadioIDs.Value[0] != "wifi0" || apSource.Radios.Value[0].Channel.Value == 11 {
+		t.Fatal("AP clone aliases its source")
+	}
+
+	switchSource := validSwitchConfig()
+	switchClone := switchSource.Clone()
+	switchClone.Ports.Value[0].TaggedVLANs.Value[0] = 99
+	if switchSource.Ports.Value[0].TaggedVLANs.Value[0] != 10 {
+		t.Fatal("switch clone aliases its source")
+	}
+
+	emptyAP := APConfig{
+		Networks: Supplied([]WiFiNetwork{{
+			Name:     "empty",
+			Bands:    Supplied([]RadioBand{}),
+			RadioIDs: Supplied([]RadioID{}),
+		}}),
+		Radios: Supplied([]RadioConfig{}),
+	}
+	emptyAPClone := emptyAP.Clone()
+	if emptyAPClone.Networks.Value == nil || emptyAPClone.Networks.Value[0].Bands.Value == nil || emptyAPClone.Networks.Value[0].RadioIDs.Value == nil || emptyAPClone.Radios.Value == nil {
+		t.Fatal("AP clone collapsed a supplied empty collection")
+	}
+
+	emptySwitch := SwitchConfig{Ports: Supplied([]SwitchPortConfig{{
+		Index:       1,
+		TaggedVLANs: Supplied([]VLANID{}),
+	}})}
+	emptySwitchClone := emptySwitch.Clone()
+	if emptySwitchClone.Ports.Value == nil || emptySwitchClone.Ports.Value[0].TaggedVLANs.Value == nil {
+		t.Fatal("switch clone collapsed a supplied empty collection")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"net/netip"
 
 	"goodkind.io/unifi-go/internal/informmodel"
+	"goodkind.io/unifi-go/internal/profile"
 	"goodkind.io/unifi-go/network"
 )
 
@@ -39,11 +40,9 @@ func decodeRadios(report informmodel.Report) []network.RadioSnapshot {
 		statistics[item.Name] = item
 	}
 	var radios []network.RadioSnapshot
-	for _, radio := range report.RadioTable {
-		identifier := radio.Radio
-		if identifier == "" {
-			identifier = radio.Name
-		}
+	radioIDs := profile.StableRadioIDs(report.RadioTable)
+	for radioIndex, radio := range report.RadioTable {
+		identifier := radioIDs[radioIndex]
 		item := network.RadioSnapshot{ID: identifier, Band: decodeBand(radio.Radio), Channel: radio.Channel, PowerDBm: radio.TXPower}
 		if radio.HT != nil {
 			width := network.ChannelWidthMHz(*radio.HT)
@@ -154,10 +153,7 @@ func summedClientCount(vaps []informmodel.VAP) *uint32 {
 func decodeClients(report informmodel.Report) ([]network.ClientSnapshot, error) {
 	var clients []network.ClientSnapshot
 	for _, vap := range report.VAPTable {
-		radioID := vap.Radio
-		if radioID == "" {
-			radioID = vap.RadioName
-		}
+		radioID := clientRadioID(vap, report.RadioTable)
 		for _, station := range vap.Stations {
 			ip, err := decodeOptionalAddress(station.IP)
 			if err != nil {
@@ -168,6 +164,28 @@ func decodeClients(report informmodel.Report) ([]network.ClientSnapshot, error) 
 		}
 	}
 	return clients, nil
+}
+
+func clientRadioID(vap informmodel.VAP, radios []informmodel.Radio) string {
+	identifiers := profile.StableRadioIDs(radios)
+	codeCounts := make(map[string]int, len(radios))
+	for _, radio := range radios {
+		codeCounts[radio.Radio]++
+	}
+	for index, radio := range radios {
+		radioNameMatches := vap.RadioName != "" && vap.RadioName == radio.Name
+		crossNameMatches := vap.Radio != "" && vap.Radio == radio.Name
+		if radioNameMatches || crossNameMatches {
+			return identifiers[index]
+		}
+		if vap.Radio != "" && vap.Radio == radio.Radio && codeCounts[radio.Radio] == 1 {
+			return identifiers[index]
+		}
+	}
+	if vap.RadioName != "" {
+		return vap.RadioName
+	}
+	return vap.Radio
 }
 
 func decodeUplink(report informmodel.Report) (*network.UplinkSnapshot, error) {
