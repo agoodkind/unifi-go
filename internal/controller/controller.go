@@ -36,6 +36,7 @@ type Device struct {
 	DesiredAP       *network.APConfig         `json:"desired_ap,omitempty"`
 	DesiredSwitch   *network.SwitchConfig     `json:"desired_switch,omitempty"`
 	DesiredVersion  network.ConfigVersion     `json:"desired_version,omitempty"`
+	Baseline        *ConfigurationBaseline    `json:"baseline,omitempty"`
 	MAC             string                    `json:"mac"`
 	Key             string                    `json:"key"`
 	LastSetParam    *Reply                    `json:"last_setparam,omitempty"`
@@ -116,6 +117,12 @@ func Open(stateFile, advertise string, registries ...profile.Registry) (*Control
 	for index, device := range devices {
 		if device.LastSetParam == nil && index < len(legacyDevices) {
 			device.LastSetParam = legacyDevices[index].Config
+		}
+		if device.Baseline == nil && device.LastSetParam != nil {
+			baseline, baselineErr := baselineFromLegacy(device)
+			if baselineErr == nil {
+				device.Baseline = baseline
+			}
 		}
 		mac, err := normalizeMAC(device.MAC)
 		if err != nil {
@@ -199,10 +206,19 @@ func (c *Controller) Register(mac, key string) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	device := c.devices[mac]
+	device, existed := c.devices[mac]
+	previous := device
 	device.MAC, device.Key = mac, key
 	c.devices[mac] = device
-	return c.saveLocked()
+	if err := c.saveLocked(); err != nil {
+		if existed {
+			c.devices[mac] = previous
+		} else {
+			delete(c.devices, mac)
+		}
+		return err
+	}
+	return nil
 }
 
 // Adopt queues captured configuration with new SSH credentials for a registered AP.
@@ -224,13 +240,14 @@ func (c *Controller) Adopt(mac string, template Reply) error {
 	managementConfig := template.ManagementConfig
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	device, exists := c.devices[mac]
-	if !exists {
+	device, existed := c.devices[mac]
+	previous := device
+	if !existed {
 		keyBytes := make([]byte, 16)
 		if _, err := rand.Read(keyBytes); err != nil {
 			return fault("generate inform key", err)
 		}
-		device = Device{MAC: mac, Key: inform.DefaultKey, LastSetParam: nil, SSHUsername: "", SSHPassword: "", SSHPasswordHash: "", NextKey: hex.EncodeToString(keyBytes), Family: "", Descriptor: nil, DesiredAP: nil, DesiredSwitch: nil, DesiredVersion: ""}
+		device = Device{MAC: mac, Key: inform.DefaultKey, LastSetParam: nil, SSHUsername: "", SSHPassword: "", SSHPasswordHash: "", NextKey: hex.EncodeToString(keyBytes), Family: "", Descriptor: nil, DesiredAP: nil, DesiredSwitch: nil, DesiredVersion: "", Baseline: nil}
 	}
 	passwordBytes := make([]byte, 16)
 	if _, err := rand.Read(passwordBytes); err != nil {
@@ -263,8 +280,15 @@ func (c *Controller) Adopt(mac string, template Reply) error {
 	template.ConfigVersion = "unifi-go-1"
 	template.ServerTime = 0
 	device.LastSetParam = &template
+	device.Baseline = baselineFromRawReply(template)
+	device.DesiredAP, device.DesiredSwitch, device.DesiredVersion = nil, nil, ""
 	c.devices[mac] = device
 	if err := c.saveLocked(); err != nil {
+		if existed {
+			c.devices[mac] = previous
+		} else {
+			delete(c.devices, mac)
+		}
 		return err
 	}
 	c.queues[mac] = []Reply{template}
@@ -299,10 +323,14 @@ func (c *Controller) Queue(mac string, command Reply) error {
 		return errors.New("device is not registered")
 	}
 	if command.Type == ReplySetparam {
+		previous := device
 		device.LastSetParam = &command
+		device.Baseline = baselineFromRawReply(command)
+		device.DesiredAP, device.DesiredSwitch, device.DesiredVersion = nil, nil, ""
 		c.devices[mac] = device
 		if err := c.saveLocked(); err != nil {
-			return err
+			c.devices[mac] = previous
+			return &network.ControlError{Code: network.PersistenceFailed, Field: ""}
 		}
 	}
 	c.queues[mac] = append(c.queues[mac], command)

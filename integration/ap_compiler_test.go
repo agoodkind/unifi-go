@@ -45,24 +45,28 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 	if err := os.WriteFile(secretPath, []byte("fixture-passphrase"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	vlan := network.VLANID(20)
-	secondVLAN := network.VLANID(30)
 	config := network.APConfig{
-		CountryCode: 840,
-		Networks: []network.WiFiNetwork{{
-			Name: "fixture-wifi", Enabled: true, VLAN: &vlan,
-			Bands:    []network.RadioBand{network.Band2GHz, network.Band5GHz},
-			Security: network.WiFiSecurity{Mode: network.WPA2Personal, PSK: network.SecretFile(secretPath)},
+		CountryCode: network.Supplied(uint16(840)),
+		Networks: network.Supplied([]network.WiFiNetwork{{
+			Name: "fixture-wifi", Enabled: network.Supplied(true), VLAN: network.Supplied(network.VLANID(20)),
+			Bands:         network.Supplied([]network.RadioBand{network.Band2GHz, network.Band5GHz}),
+			BSSTransition: network.Supplied(network.BSSTransitionEnabled),
+			Security: network.Supplied(network.WiFiSecurity{
+				Mode: network.Supplied(network.WPA2Personal), PSK: network.Supplied(network.SecretFile(secretPath)),
+			}),
 		}, {
-			Name: "fixture-iot", Enabled: true, VLAN: &secondVLAN,
-			Bands:    []network.RadioBand{network.Band2GHz},
-			Security: network.WiFiSecurity{Mode: network.WPA2Personal, PSK: network.SecretFile(secretPath)},
-		}},
-		Radios: []network.RadioConfig{
-			{Band: network.Band2GHz, Enabled: true, WidthMHz: network.Width20, Power: network.PowerConfig{Mode: network.PowerAuto}},
-			{Band: network.Band5GHz, Enabled: true, WidthMHz: network.Width40, Power: network.PowerConfig{Mode: network.PowerAuto}},
-		},
-		SSH: &network.SSHConfig{Username: "fixture-user", Password: network.SecretFile(secretPath)},
+			Name: "fixture-iot", Enabled: network.Supplied(true), VLAN: network.Supplied(network.VLANID(30)),
+			Bands:         network.Supplied([]network.RadioBand{network.Band2GHz}),
+			BSSTransition: network.Supplied(network.BSSTransitionDisabled),
+			Security: network.Supplied(network.WiFiSecurity{
+				Mode: network.Supplied(network.WPA2Personal), PSK: network.Supplied(network.SecretFile(secretPath)),
+			}),
+		}}),
+		Radios: network.Supplied([]network.RadioConfig{
+			{Band: network.Band2GHz, Enabled: network.Supplied(true), Channel: network.Cleared[uint16](), WidthMHz: network.Supplied(network.Width20), Power: network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerAuto)})},
+			{Band: network.Band5GHz, Enabled: network.Supplied(true), Channel: network.Cleared[uint16](), WidthMHz: network.Supplied(network.Width40), Power: network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerAuto)})},
+		}),
+		SSH: network.Supplied(network.SSHConfig{Username: network.Supplied("fixture-user"), Password: network.Supplied(network.SecretFile(secretPath))}), // gitleaks:allow
 	}
 	compiled, err := ap.New().Compile(descriptor, config, fileSecrets{})
 	if err != nil {
@@ -90,6 +94,9 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 	if compiled.System["wireless.2.devname"] == compiled.System["wireless.3.devname"] || compiled.System["aaa.2.br.devname"] != "br0.20" || compiled.System["aaa.3.br.devname"] != "br0.30" {
 		t.Fatal("compiled VAP interfaces or VLAN bridges are not distinct")
 	}
+	if compiled.System["aaa.1.bss_transition"] != "enabled" || compiled.System["aaa.2.bss_transition"] != "enabled" || compiled.System["aaa.3.bss_transition"] != "disabled" {
+		t.Fatal("compiled per-SSID BSS Transition settings are incorrect")
+	}
 	if compiled.System["netconf.3.devname"] != "ath0" || compiled.System["netconf.5.devname"] != "ath2" {
 		t.Fatal("compiled VAP netconf records are incomplete")
 	}
@@ -113,12 +120,11 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 		t.Fatal("repeated compilation is not deterministic")
 	}
 	unused := config
-	unused.Networks = config.Networks[1:]
-	unused.Radios = append([]network.RadioConfig(nil), config.Radios...)
-	unused.Radios[0].WidthMHz = network.Width40
-	unusedChannel := uint16(6)
-	unused.Radios[0].Channel = &unusedChannel
-	unused.Radios[1].Enabled = false
+	unused.Networks.Value = config.Networks.Value[1:]
+	unused.Radios.Value = append([]network.RadioConfig(nil), config.Radios.Value...)
+	unused.Radios.Value[0].WidthMHz = network.Supplied(network.Width40)
+	unused.Radios.Value[0].Channel = network.Supplied(uint16(6))
+	unused.Radios.Value[1].Enabled = network.Supplied(false)
 	unusedCompiled, err := ap.New().Compile(descriptor, unused, fileSecrets{})
 	if err != nil {
 		t.Fatal(err)
@@ -147,7 +153,7 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 		{Index: 2, Interface: "eth1", VLAN: nil, PoEModes: nil},
 	}
 	physicalConfig := config
-	physicalConfig.Networks = config.Networks[:1]
+	physicalConfig.Networks.Value = config.Networks.Value[:1]
 	physicalCompiled, err := ap.New().Compile(physicalDescriptor, physicalConfig, fileSecrets{})
 	if err != nil {
 		t.Fatal(err)
@@ -184,30 +190,29 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 		{network.Band5GHz, 44, network.Width40},
 		{network.Band5GHz, 157, network.Width40},
 	} {
-		requested := network.RadioConfig{Band: pair.band, Enabled: true, WidthMHz: pair.width, Power: network.PowerConfig{Mode: network.PowerAuto}}
+		requested := network.RadioConfig{Band: pair.band, Enabled: network.Supplied(true), Channel: network.Cleared[uint16](), WidthMHz: network.Supplied(pair.width), Power: network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerAuto)})}
 		if pair.channel != 0 {
-			requested.Channel = &pair.channel
+			requested.Channel = network.Supplied(pair.channel)
 		}
-		if _, err := ap.New().Compile(descriptor, network.APConfig{CountryCode: 840, Radios: []network.RadioConfig{requested}}, nil); err != nil {
+		if _, err := ap.New().Compile(descriptor, network.APConfig{CountryCode: network.Supplied(uint16(840)), Networks: network.Supplied([]network.WiFiNetwork{}), Radios: network.Supplied([]network.RadioConfig{requested})}, nil); err != nil {
 			t.Fatalf("reproduced channel/width pair was rejected: %s/%d/%d", pair.band, pair.channel, pair.width)
 		}
 	}
-	unverifiedChannel := uint16(11)
-	unverifiedPair := network.APConfig{CountryCode: 840, Radios: []network.RadioConfig{{Band: network.Band2GHz, Enabled: true, Channel: &unverifiedChannel, WidthMHz: network.Width40, Power: network.PowerConfig{Mode: network.PowerAuto}}}}
+	unverifiedPair := network.APConfig{CountryCode: network.Supplied(uint16(840)), Networks: network.Supplied([]network.WiFiNetwork{}), Radios: network.Supplied([]network.RadioConfig{{Band: network.Band2GHz, Enabled: network.Supplied(true), Channel: network.Supplied(uint16(11)), WidthMHz: network.Supplied(network.Width40), Power: network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerAuto)})}})}
 	if _, err := ap.New().Compile(descriptor, unverifiedPair, nil); err == nil {
 		t.Fatal("unreproduced channel 11 at 40 MHz was accepted without reported capability evidence")
 	}
-	unverifiedPair.Radios[0].Channel = nil
+	unverifiedPair.Radios.Value[0].Channel = network.Cleared[uint16]()
 	if _, err := ap.New().Compile(descriptor, unverifiedPair, nil); err == nil {
 		t.Fatal("unreproduced automatic channel at 40 MHz was accepted without reported width evidence")
 	}
 	reportedPair := descriptor
 	reportedPair.Radios = []profile.RadioCapability{{ID: "ng", Interface: "wifi0", Band: network.Band2GHz, Channels: []uint16{11}, Widths: []network.ChannelWidthMHz{network.Width40}}}
-	unverifiedPair.Radios[0].Channel = &unverifiedChannel
+	unverifiedPair.Radios.Value[0].Channel = network.Supplied(uint16(11))
 	if _, err := ap.New().Compile(reportedPair, unverifiedPair, nil); err != nil {
 		t.Fatal("explicit reported channel/width evidence was restricted by the physical exception")
 	}
-	radioOnly := network.APConfig{CountryCode: 840, Radios: []network.RadioConfig{config.Radios[0]}}
+	radioOnly := network.APConfig{CountryCode: network.Supplied(uint16(840)), Networks: network.Supplied([]network.WiFiNetwork{}), Radios: network.Supplied([]network.RadioConfig{config.Radios.Value[0]})}
 	unfamiliar := descriptor
 	unfamiliar.Model, unfamiliar.Firmware = "UnfamiliarAP", "1"
 	unfamiliar.Radios = []profile.RadioCapability{{ID: "ng", Interface: "wifi0", Band: network.Band2GHz, Widths: []network.ChannelWidthMHz{network.Width20}}}
@@ -215,7 +220,7 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 		t.Fatal("automatic channel required an explicit channel list")
 	}
 	channel := uint16(6)
-	radioOnly.Radios[0].Channel = &channel
+	radioOnly.Radios.Value[0].Channel = network.Supplied(channel)
 	if _, err := ap.New().Compile(unfamiliar, radioOnly, nil); err == nil {
 		t.Fatal("explicit channel without evidence was accepted")
 	}
@@ -226,7 +231,7 @@ func TestAPCompilerFromNetworkServerFixture(t *testing.T) {
 	}
 	unfamiliar.Radios[0].Widths = []network.ChannelWidthMHz{network.Width20}
 	power := 10
-	radioOnly.Radios[0].Power = network.PowerConfig{Mode: network.PowerExplicit, DBm: &power}
+	radioOnly.Radios.Value[0].Power = network.Supplied(network.PowerConfig{Mode: network.Supplied(network.PowerExplicit), DBm: network.Supplied(power)})
 	if _, err := ap.New().Compile(unfamiliar, radioOnly, nil); err == nil {
 		t.Fatal("explicit power without bounds was accepted")
 	}

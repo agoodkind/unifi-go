@@ -30,17 +30,17 @@ func (compiler) Compile(descriptor profile.DeviceDescriptor, config network.APCo
 	if !New().Supports(descriptor) {
 		return profile.SetParam{}, fmt.Errorf("unsupported access point configuration protocol")
 	}
-	if err := config.Validate(); err != nil {
+	if err := config.ValidateComplete(); err != nil {
 		slog.Error("access point configuration validation failed", "error", err)
 		return profile.SetParam{}, fmt.Errorf("validate access point configuration: %w", err)
 	}
-	if secrets == nil && (len(config.Networks) > 0 || config.SSH != nil) {
+	if secrets == nil && (len(config.Networks.Value) > 0 || config.SSH.Present) {
 		return profile.SetParam{}, fmt.Errorf("secret reader is required")
 	}
 	if len(descriptor.Radios) == 0 {
 		return profile.SetParam{}, fmt.Errorf("no reported radios")
 	}
-	physical, err := reportedRadios(descriptor, config.Radios)
+	physical, err := reportedRadios(descriptor, config.Radios.Value)
 	if err != nil {
 		return profile.SetParam{}, err
 	}
@@ -50,12 +50,12 @@ func (compiler) Compile(descriptor profile.DeviceDescriptor, config network.APCo
 
 	system := baseSystem()
 	bridgeMembers := wiredInterfaces(descriptor)
-	writeSystemDefaults(system, descriptor, config.CountryCode)
+	writeSystemDefaults(system, descriptor, config.CountryCode.Value)
 	configuredRadios, err := writeConfiguredRadios(system, config, physical, descriptor)
 	if err != nil {
 		return profile.SetParam{}, err
 	}
-	vlanMembers, wirelessBridgeMembers, err := writeNetworks(system, config.Networks, configuredRadios, physical, secrets, 2+len(wiredInterfaces(descriptor)))
+	vlanMembers, wirelessBridgeMembers, err := writeNetworks(system, config.Networks.Value, configuredRadios, physical, secrets, 2+len(wiredInterfaces(descriptor)))
 	if err != nil {
 		return profile.SetParam{}, err
 	}
@@ -65,9 +65,11 @@ func (compiler) Compile(descriptor profile.DeviceDescriptor, config network.APCo
 	for wiredIndex, wired := range wiredInterfaces(descriptor) {
 		writeNetconf(system, wiredIndex+2, wired, true)
 	}
-	writeVLANs(system, descriptor, vlanMembers, configuredVAPCount(config.Networks))
-	if err := writeSSH(system, config.SSH, secrets); err != nil {
-		return profile.SetParam{}, err
+	writeVLANs(system, descriptor, vlanMembers, configuredVAPCount(config.Networks.Value))
+	if config.SSH.Present {
+		if err := writeSSH(system, config.SSH.Value, secrets); err != nil {
+			return profile.SetParam{}, err
+		}
 	}
 	param := profile.SetParam{Version: "", Management: configmap.Values{}, System: system}
 	version, err := profile.CanonicalVersion(param)
@@ -102,25 +104,25 @@ func reproducedRadioSetting(descriptor profile.DeviceDescriptor, requested netwo
 		return false
 	}
 	channel := uint16(0)
-	if requested.Channel != nil {
-		channel = *requested.Channel
+	if !requested.Channel.Null {
+		channel = requested.Channel.Value
 	}
 	switch requested.Band {
 	case network.Band2GHz:
-		if requested.WidthMHz == network.Width20 {
+		if requested.WidthMHz.Value == network.Width20 {
 			return channel == 0 || channel == 6 || channel == 11
 		}
-		return requested.WidthMHz == network.Width40 && channel == 6
+		return requested.WidthMHz.Value == network.Width40 && channel == 6
 	case network.Band5GHz:
-		return requested.WidthMHz == network.Width40 && (channel == 0 || channel == 44 || channel == 157)
+		return requested.WidthMHz.Value == network.Width40 && (channel == 0 || channel == 44 || channel == 157)
 	default:
 		return false
 	}
 }
 
 func writeConfiguredRadios(values configmap.Values, config network.APConfig, physical map[network.RadioBand]profile.RadioCapability, descriptor profile.DeviceDescriptor) (map[network.RadioBand]int, error) {
-	configured := make(map[network.RadioBand]int, len(config.Radios))
-	requestedRadios := append([]network.RadioConfig(nil), config.Radios...)
+	configured := make(map[network.RadioBand]int, len(config.Radios.Value))
+	requestedRadios := append([]network.RadioConfig(nil), config.Radios.Value...)
 	slices.SortFunc(requestedRadios, func(left network.RadioConfig, right network.RadioConfig) int {
 		return strings.Compare(physical[left.Band].Interface, physical[right.Band].Interface)
 	})
@@ -135,10 +137,10 @@ func writeConfiguredRadios(values configmap.Values, config network.APConfig, phy
 		}
 		deviceName := virtualInterface(reported.Interface, nextVAPIndex)
 		configured[requested.Band] = nextVAPIndex
-		writeRadio(values, index+1, deviceName, reported.Interface, config.CountryCode, requested)
+		writeRadio(values, index+1, deviceName, reported.Interface, config.CountryCode.Value, requested)
 		vapCount := 0
-		for _, wifi := range config.Networks {
-			if slices.Contains(wifi.Bands, requested.Band) {
+		for _, wifi := range config.Networks.Value {
+			if slices.Contains(wifi.Bands.Value, requested.Band) {
 				vapCount++
 			}
 		}
@@ -171,16 +173,16 @@ func writeNetworks(values configmap.Values, networks []network.WiFiNetwork, conf
 	for _, band := range bands {
 		deviceIndex := configured[band]
 		for networkIndex, wifi := range networks {
-			if !slices.Contains(wifi.Bands, band) {
+			if !slices.Contains(wifi.Bands.Value, band) {
 				continue
 			}
 			deviceName := virtualInterface(physical[band].Interface, deviceIndex)
 			deviceIndex++
 			wirelessIndex++
 			bridgeName := "br0"
-			if wifi.VLAN != nil {
-				bridgeName = fmt.Sprintf("br0.%d", *wifi.VLAN)
-				vlans[*wifi.VLAN] = append(vlans[*wifi.VLAN], deviceName)
+			if !wifi.VLAN.Null {
+				bridgeName = fmt.Sprintf("br0.%d", wifi.VLAN.Value)
+				vlans[wifi.VLAN.Value] = append(vlans[wifi.VLAN.Value], deviceName)
 			} else {
 				untagged = append(untagged, deviceName)
 			}
@@ -198,7 +200,7 @@ func readNetworkPSKs(networks []network.WiFiNetwork, secrets profile.SecretReade
 		if strings.ContainsAny(wifi.Name, "\r\n") {
 			return nil, fmt.Errorf("networks[%d].name: contains newline", index)
 		}
-		secret, err := secrets.ReadSecret(wifi.Security.PSK)
+		secret, err := secrets.ReadSecret(wifi.Security.Value.PSK.Value)
 		if err != nil {
 			slog.Error("wireless secret read failed", "network_index", index, "error", err)
 			return nil, fmt.Errorf("networks[%d].security.psk: %w", index, err)
@@ -211,14 +213,11 @@ func readNetworkPSKs(networks []network.WiFiNetwork, secrets profile.SecretReade
 	return psks, nil
 }
 
-func writeSSH(values configmap.Values, ssh *network.SSHConfig, secrets profile.SecretReader) error {
-	if ssh == nil {
-		return nil
-	}
-	if strings.ContainsAny(ssh.Username, "\r\n") {
+func writeSSH(values configmap.Values, ssh network.SSHConfig, secrets profile.SecretReader) error {
+	if strings.ContainsAny(ssh.Username.Value, "\r\n") {
 		return fmt.Errorf("ssh.username: contains newline")
 	}
-	password, err := secrets.ReadSecret(ssh.Password)
+	password, err := secrets.ReadSecret(ssh.Password.Value)
 	if err != nil {
 		slog.Error("SSH secret read failed", "error", err)
 		return fmt.Errorf("ssh.password: %w", err)
@@ -227,7 +226,7 @@ func writeSSH(values configmap.Values, ssh *network.SSHConfig, secrets profile.S
 	if plainPassword == "" || strings.ContainsAny(plainPassword, "\r\n") {
 		return fmt.Errorf("ssh.password: secret is empty or contains newline")
 	}
-	saltDigest := sha256.Sum256([]byte(ssh.Username + "\x00" + plainPassword))
+	saltDigest := sha256.Sum256([]byte(ssh.Username.Value + "\x00" + plainPassword))
 	salt := "$6$" + hex.EncodeToString(saltDigest[:8])
 	passwordHash, err := sha512_crypt.New().Generate([]byte(plainPassword), []byte(salt))
 	if err != nil {
@@ -240,7 +239,7 @@ func writeSSH(values configmap.Values, ssh *network.SSHConfig, secrets profile.S
 	set(values, "sshd.1.status", "enabled")
 	set(values, "users.status", "enabled")
 	set(values, "users.1.status", "enabled")
-	set(values, "users.1.name", ssh.Username)
+	set(values, "users.1.name", ssh.Username.Value)
 	set(values, "users.1.password", passwordHash)
 	return nil
 }
@@ -262,20 +261,20 @@ func validatePSK(psk string) error {
 
 func validateRadioCapability(requested network.RadioConfig, reported profile.RadioCapability, index int, descriptor profile.DeviceDescriptor) error {
 	exception := reproducedRadioSetting(descriptor, requested)
-	if requested.Channel != nil && !slices.Contains(reported.Channels, *requested.Channel) && (len(reported.Channels) != 0 || !exception) {
+	if !requested.Channel.Null && !slices.Contains(reported.Channels, requested.Channel.Value) && (len(reported.Channels) != 0 || !exception) {
 		return fmt.Errorf("radios[%d].channel: requested channel lacks capability evidence", index)
 	}
-	if !slices.Contains(reported.Widths, requested.WidthMHz) && (len(reported.Widths) != 0 || !exception) {
+	if !slices.Contains(reported.Widths, requested.WidthMHz.Value) && (len(reported.Widths) != 0 || !exception) {
 		return fmt.Errorf("radios[%d].width_mhz: requested width lacks capability evidence", index)
 	}
-	if requested.Power.Mode == network.PowerExplicit && requested.Power.DBm != nil {
+	if requested.Power.Value.Mode.Value == network.PowerExplicit && requested.Power.Value.DBm.Present {
 		if reported.MinPowerDBm == nil || reported.MaxPowerDBm == nil {
 			return fmt.Errorf("radios[%d].power.dbm: power bounds are not reported", index)
 		}
-		if reported.MinPowerDBm != nil && *requested.Power.DBm < *reported.MinPowerDBm {
+		if reported.MinPowerDBm != nil && requested.Power.Value.DBm.Value < *reported.MinPowerDBm {
 			return fmt.Errorf("radios[%d].power.dbm: below reported minimum", index)
 		}
-		if reported.MaxPowerDBm != nil && *requested.Power.DBm > *reported.MaxPowerDBm {
+		if reported.MaxPowerDBm != nil && requested.Power.Value.DBm.Value > *reported.MaxPowerDBm {
 			return fmt.Errorf("radios[%d].power.dbm: above reported maximum", index)
 		}
 	}
@@ -287,19 +286,19 @@ func writeRadio(values configmap.Values, index int, deviceName string, interface
 	set(values, prefix+"phyname", interfaceName)
 	set(values, prefix+"devname", deviceName)
 	set(values, prefix+"countrycode", strconv.Itoa(int(country)))
-	set(values, prefix+"status", enabled(radio.Enabled))
+	set(values, prefix+"status", enabled(radio.Enabled.Value))
 	channel := "auto"
-	if radio.Channel != nil {
-		channel = strconv.Itoa(int(*radio.Channel))
+	if !radio.Channel.Null {
+		channel = strconv.Itoa(int(radio.Channel.Value))
 	}
 	set(values, prefix+"channel", channel)
 	set(values, prefix+"clksel", "1")
-	set(values, prefix+"cwm.mode", widthMode(radio.Band, radio.WidthMHz))
-	set(values, prefix+"ieee_mode", ieeeMode(radio.Band, radio.WidthMHz))
-	set(values, prefix+"txpower_mode", string(radio.Power.Mode))
+	set(values, prefix+"cwm.mode", widthMode(radio.Band, radio.WidthMHz.Value))
+	set(values, prefix+"ieee_mode", ieeeMode(radio.Band, radio.WidthMHz.Value))
+	set(values, prefix+"txpower_mode", string(radio.Power.Value.Mode.Value))
 	power := "auto"
-	if radio.Power.Mode == network.PowerExplicit && radio.Power.DBm != nil {
-		power = strconv.Itoa(*radio.Power.DBm)
+	if radio.Power.Value.Mode.Value == network.PowerExplicit && radio.Power.Value.DBm.Present {
+		power = strconv.Itoa(radio.Power.Value.DBm.Value)
 		set(values, prefix+"txpower_mode", "custom")
 	}
 	set(values, prefix+"txpower", power)
@@ -319,7 +318,7 @@ func writeWireless(values configmap.Values, index int, deviceName string, parent
 	set(values, prefix+"devname", deviceName)
 	set(values, prefix+"parent", parent)
 	set(values, prefix+"ssid", wifi.Name)
-	set(values, prefix+"status", enabled(wifi.Enabled))
+	set(values, prefix+"status", enabled(wifi.Enabled.Value))
 	set(values, prefix+"mode", "master")
 	set(values, prefix+"security", "none")
 	iappDigest := sha256.Sum256([]byte(wifi.Name + "\x00" + psk))
@@ -335,7 +334,7 @@ func writeWireless(values configmap.Values, index int, deviceName string, parent
 	} {
 		set(values, prefix+key, value)
 	}
-	if wifi.Bands != nil {
+	if wifi.Bands.Present {
 		set(values, prefix+"id", "2")
 	}
 	if band == network.Band2GHz {
@@ -355,13 +354,13 @@ func writeWireless(values configmap.Values, index int, deviceName string, parent
 	set(values, aaa+"devname", deviceName)
 	set(values, aaa+"br.devname", bridge)
 	set(values, aaa+"ssid", wifi.Name)
-	set(values, aaa+"status", enabled(wifi.Enabled))
+	set(values, aaa+"status", enabled(wifi.Enabled.Value))
 	set(values, aaa+"wpa", "2")
 	set(values, aaa+"wpa.1.pairwise", "CCMP")
 	set(values, aaa+"wpa.key.1.mgmt", "WPA-PSK")
 	set(values, aaa+"wpa.psk", psk)
 	for key, value := range map[string]string{
-		"11k.status": "disabled", "bss_transition": "enabled", "country_beacon": "disabled",
+		"11k.status": "disabled", "bss_transition": string(wifi.BSSTransition.Value), "country_beacon": "disabled",
 		"driver": "madwifi", "eapol_version": "2", "ft.status": "disabled",
 		"hide_ssid": "false", "iapp_key": iappKey, "id": "2", "is_guest": "false",
 		"p2p": "disabled", "p2p_cross_connect": "disabled", "pmf.cipher": "AES-128-CMAC",
@@ -444,7 +443,7 @@ func writeVLANs(values configmap.Values, descriptor profile.DeviceDescriptor, vl
 func configuredVAPCount(networks []network.WiFiNetwork) int {
 	count := 0
 	for _, wifi := range networks {
-		count += len(wifi.Bands)
+		count += len(wifi.Bands.Value)
 	}
 	return count
 }

@@ -17,6 +17,17 @@ import (
 	"goodkind.io/unifi-go/network"
 )
 
+func suppliedSwitchPort(index uint16, enabled bool, nativeVLAN network.VLANID, taggedVLANs []network.VLANID, poe network.PoEMode) network.SwitchPortConfig {
+	return network.SwitchPortConfig{
+		Index: index, Enabled: network.Supplied(enabled), NativeVLAN: network.Supplied(nativeVLAN),
+		TaggedVLANs: network.Supplied(taggedVLANs), PoE: network.Supplied(poe),
+	}
+}
+
+func suppliedSwitchConfig(ports ...network.SwitchPortConfig) network.SwitchConfig {
+	return network.SwitchConfig{Ports: network.Supplied(ports)}
+}
+
 func TestSwitchCompilerFromNetworkServerFixture(t *testing.T) {
 	loadReport := func(name string) informmodel.Report {
 		t.Helper()
@@ -40,12 +51,12 @@ func TestSwitchCompilerFromNetworkServerFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := network.SwitchConfig{Ports: []network.SwitchPortConfig{
-		{Index: 5, Enabled: true, NativeVLAN: 1, PoE: network.PoEAuto},
-		{Index: 3, Enabled: true, NativeVLAN: 1, TaggedVLANs: []network.VLANID{20}},
-		{Index: 2, Enabled: true, NativeVLAN: 20},
-		{Index: 4, Enabled: false, NativeVLAN: 1, PoE: network.PoEOff},
-	}}
+	config := suppliedSwitchConfig(
+		suppliedSwitchPort(5, true, 1, []network.VLANID{}, network.PoEAuto),
+		suppliedSwitchPort(3, true, 1, []network.VLANID{20}, ""),
+		suppliedSwitchPort(2, true, 20, []network.VLANID{}, ""),
+		suppliedSwitchPort(4, false, 1, []network.VLANID{}, network.PoEOff),
+	)
 	compiled, err := switches.New().Compile(descriptor, config, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +111,7 @@ func TestSwitchCompilerFromNetworkServerFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	sshConfig := config
-	sshConfig.SSH = &network.SSHConfig{Username: "fixture-user", Password: network.SecretFile(passwordPath)}
+	sshConfig.SSH = network.Supplied(network.SSHConfig{Username: network.Supplied("fixture-user"), Password: network.Supplied(network.SecretFile(passwordPath))}) // gitleaks:allow
 	sshCompiled, err := switches.New().Compile(descriptor, sshConfig, fileSecrets{})
 	if err != nil {
 		t.Fatal(err)
@@ -124,7 +135,7 @@ func TestSwitchCompilerFromNetworkServerFixture(t *testing.T) {
 		},
 	}
 	managementConfig := network.SwitchConfig{
-		Ports: []network.SwitchPortConfig{{Index: 7, Enabled: true, NativeVLAN: 1}},
+		Ports: network.Supplied([]network.SwitchPortConfig{suppliedSwitchPort(7, true, 1, []network.VLANID{}, "")}),
 		SSH:   sshConfig.SSH,
 	}
 	managementCompiled, err := switches.New().Compile(managementDescriptor, managementConfig, fileSecrets{})
@@ -148,10 +159,10 @@ func TestSwitchCompilerFromNetworkServerFixture(t *testing.T) {
 			{Index: 2, Interface: "eth1", VLAN: &vlanSupported},
 		},
 	}
-	noncontiguousConfig := network.SwitchConfig{Ports: []network.SwitchPortConfig{
-		{Index: 7, Enabled: true, NativeVLAN: 300, TaggedVLANs: []network.VLANID{20}},
-		{Index: 2, Enabled: true, NativeVLAN: 1},
-	}}
+	noncontiguousConfig := suppliedSwitchConfig(
+		suppliedSwitchPort(7, true, 300, []network.VLANID{20}, ""),
+		suppliedSwitchPort(2, true, 1, []network.VLANID{}, ""),
+	)
 	noncontiguousCompiled, err := switches.New().Compile(noncontiguous, noncontiguousConfig, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -164,40 +175,40 @@ func TestSwitchCompilerFromNetworkServerFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := switches.New().Compile(secondDescriptor, network.SwitchConfig{Ports: []network.SwitchPortConfig{{Index: 8, Enabled: true, NativeVLAN: 1}}}, nil); err != nil {
+	if _, err := switches.New().Compile(secondDescriptor, suppliedSwitchConfig(suppliedSwitchPort(8, true, 1, []network.VLANID{}, "")), nil); err != nil {
 		t.Fatal("different non-PoE inventory was rejected")
 	}
 
 	missingPort := config
-	missingPort.Ports = []network.SwitchPortConfig{{Index: 99, Enabled: true, NativeVLAN: 1}}
+	missingPort.Ports = network.Supplied([]network.SwitchPortConfig{suppliedSwitchPort(99, true, 1, []network.VLANID{}, "")})
 	if _, err := switches.New().Compile(descriptor, missingPort, nil); err == nil {
 		t.Fatal("missing reported port was accepted")
 	}
 	duplicatePort := config
-	duplicatePort.Ports = []network.SwitchPortConfig{{Index: 2, Enabled: true, NativeVLAN: 1}, {Index: 2, Enabled: true, NativeVLAN: 20}}
+	duplicatePort.Ports = network.Supplied([]network.SwitchPortConfig{suppliedSwitchPort(2, true, 1, []network.VLANID{}, ""), suppliedSwitchPort(2, true, 20, []network.VLANID{}, "")})
 	if _, err := switches.New().Compile(descriptor, duplicatePort, nil); err == nil {
 		t.Fatal("duplicate requested port was accepted")
 	}
 	overlap := config
-	overlap.Ports = []network.SwitchPortConfig{{Index: 2, Enabled: true, NativeVLAN: 20, TaggedVLANs: []network.VLANID{20}}}
+	overlap.Ports = network.Supplied([]network.SwitchPortConfig{suppliedSwitchPort(2, true, 20, []network.VLANID{20}, "")})
 	if _, err := switches.New().Compile(descriptor, overlap, nil); err == nil {
 		t.Fatal("native and tagged VLAN overlap was accepted")
 	}
 	withoutPoE := descriptor
 	withoutPoE.Ports = append([]profile.PortCapability(nil), descriptor.Ports...)
 	withoutPoE.Ports[1].PoEModes = nil
-	if _, err := switches.New().Compile(withoutPoE, network.SwitchConfig{Ports: []network.SwitchPortConfig{{Index: 2, Enabled: true, NativeVLAN: 1, PoE: network.PoEAuto}}}, nil); err == nil {
+	if _, err := switches.New().Compile(withoutPoE, suppliedSwitchConfig(suppliedSwitchPort(2, true, 1, []network.VLANID{}, network.PoEAuto)), nil); err == nil {
 		t.Fatal("unreported PoE mode was accepted")
 	}
 	vlanUnsupported := false
 	withoutVLAN := descriptor
 	withoutVLAN.Ports = append([]profile.PortCapability(nil), descriptor.Ports...)
 	withoutVLAN.Ports[1].VLAN = &vlanUnsupported
-	if _, err := switches.New().Compile(withoutVLAN, network.SwitchConfig{Ports: []network.SwitchPortConfig{{Index: 2, Enabled: true, NativeVLAN: 1}}}, nil); err == nil {
+	if _, err := switches.New().Compile(withoutVLAN, suppliedSwitchConfig(suppliedSwitchPort(2, true, 1, []network.VLANID{}, "")), nil); err == nil {
 		t.Fatal("explicitly unsupported VLAN configuration was accepted")
 	}
 	withoutVLAN.Ports[1].VLAN = nil
-	if _, err := switches.New().Compile(withoutVLAN, network.SwitchConfig{Ports: []network.SwitchPortConfig{{Index: 2, Enabled: true, NativeVLAN: 1}}}, nil); err == nil {
+	if _, err := switches.New().Compile(withoutVLAN, suppliedSwitchConfig(suppliedSwitchPort(2, true, 1, []network.VLANID{}, "")), nil); err == nil {
 		t.Fatal("unknown VLAN capability was accepted")
 	}
 	unsupportedProtocol := descriptor

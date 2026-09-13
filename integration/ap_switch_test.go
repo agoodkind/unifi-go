@@ -348,15 +348,15 @@ func (r *liveRun) configure(models []liveModel, ids []string) {
 		r.t.Fatal(err)
 	}
 	r.write("wifi-secret", []byte(hex.EncodeToString(secret)))
-	r.write("ap.json", []byte(`{"country_code":840,"networks":[{"name":"E2E-Lab","enabled":true,"vlan":20,"bands":["2.4ghz","5ghz"],"security":{"mode":"wpa2-personal","psk":"/state/wifi-secret"}}],"radios":[{"band":"2.4ghz","enabled":true,"channel":6,"width_mhz":20,"power":{"mode":"explicit","dbm":10}},{"band":"5ghz","enabled":true,"channel":44,"width_mhz":40,"power":{"mode":"explicit","dbm":12}}]}`))
+	r.write("ap.json", []byte(`{"country_code":840,"networks":[{"name":"E2E-Lab","enabled":true,"vlan":20,"bands":["2.4ghz","5ghz"],"bss_transition":"enabled","security":{"mode":"wpa2-personal","psk":"/state/wifi-secret"}}],"radios":[{"band":"2.4ghz","enabled":true,"channel":6,"width_mhz":20,"power":{"mode":"explicit","dbm":10}},{"band":"5ghz","enabled":true,"channel":44,"width_mhz":40,"power":{"mode":"explicit","dbm":12}}]}`))
 	for index, id := range ids {
 		family, file := "ap", "ap.json"
 		if index > 0 {
 			family, file = "switch", fmt.Sprintf("switch-%d.json", index)
-			config := network.SwitchConfig{Ports: []network.SwitchPortConfig{
-				{Index: 1, Enabled: true, NativeVLAN: 20, PoE: network.PoEOff},
-				{Index: uint16(models[index].Ports[len(models[index].Ports)-1].PortIdx), Enabled: true, NativeVLAN: 1, TaggedVLANs: []network.VLANID{20}},
-			}}
+			config := suppliedSwitchConfig(
+				suppliedSwitchPort(1, true, 20, []network.VLANID{}, network.PoEOff),
+				suppliedSwitchPort(uint16(models[index].Ports[len(models[index].Ports)-1].PortIdx), true, 1, []network.VLANID{20}, ""),
+			)
 			r.writeJSON(file, config)
 		}
 		var queued struct {

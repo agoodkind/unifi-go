@@ -38,18 +38,18 @@ func (compiler) Compile(descriptor profile.DeviceDescriptor, config network.Swit
 	if !New().Supports(descriptor) {
 		return profile.SetParam{}, fmt.Errorf("unsupported switch configuration protocol")
 	}
-	if err := config.Validate(); err != nil {
+	if err := config.ValidateComplete(); err != nil {
 		slog.Error("switch configuration validation failed", "error", err)
 		return profile.SetParam{}, fmt.Errorf("validate switch configuration: %w", err)
 	}
-	if config.SSH != nil && secrets == nil {
+	if config.SSH.Present && secrets == nil {
 		return profile.SetParam{}, fmt.Errorf("secret reader is required")
 	}
 	ports, err := reportedPorts(descriptor)
 	if err != nil {
 		return profile.SetParam{}, err
 	}
-	requested := append([]network.SwitchPortConfig(nil), config.Ports...)
+	requested := append([]network.SwitchPortConfig(nil), config.Ports.Value...)
 	slices.SortFunc(requested, func(left network.SwitchPortConfig, right network.SwitchPortConfig) int {
 		return int(left.Index) - int(right.Index)
 	})
@@ -65,8 +65,10 @@ func (compiler) Compile(descriptor profile.DeviceDescriptor, config network.Swit
 	if err := writePorts(system, requested, vlans); err != nil {
 		return profile.SetParam{}, err
 	}
-	if err := writeSSH(system, config.SSH, secrets, ports); err != nil {
-		return profile.SetParam{}, err
+	if config.SSH.Present {
+		if err := writeSSH(system, config.SSH.Value, secrets, ports); err != nil {
+			return profile.SetParam{}, err
+		}
 	}
 	param := profile.SetParam{Version: "", Management: configmap.Values{}, System: system}
 	version, err := profile.CanonicalVersion(param)
@@ -107,8 +109,8 @@ func validateRequests(requested []network.SwitchPortConfig, ports map[uint16]pro
 		if port.VLAN == nil || !*port.VLAN {
 			return fmt.Errorf("ports[%d]: VLAN configuration lacks capability evidence", requestIndex)
 		}
-		if request.PoE != "" && !slices.Contains(port.PoEModes, request.PoE) {
-			return fmt.Errorf("ports[%d].poe: mode %q is not reported", requestIndex, request.PoE)
+		if request.PoE.Value != "" && !slices.Contains(port.PoEModes, request.PoE.Value) {
+			return fmt.Errorf("ports[%d].poe: mode %q is not reported", requestIndex, request.PoE.Value)
 		}
 	}
 	return nil
@@ -117,8 +119,8 @@ func validateRequests(requested []network.SwitchPortConfig, ports map[uint16]pro
 func desiredVLANs(ports []network.SwitchPortConfig) []network.VLANID {
 	seen := map[network.VLANID]struct{}{1: {}}
 	for _, port := range ports {
-		seen[port.NativeVLAN] = struct{}{}
-		for _, vlan := range port.TaggedVLANs {
+		seen[port.NativeVLAN.Value] = struct{}{}
+		for _, vlan := range port.TaggedVLANs.Value {
 			seen[vlan] = struct{}{}
 		}
 	}
@@ -152,23 +154,23 @@ func writePorts(values configmap.Values, requested []network.SwitchPortConfig, v
 	for _, port := range requested {
 		prefix := fmt.Sprintf("switch.port.%d.", port.Index)
 		status := "disabled"
-		if port.Enabled {
+		if port.Enabled.Value {
 			status = "enabled"
 		}
 		if err := setAll(values,
 			configRecord{key: prefix + "opmode", value: "switch"},
 			configRecord{key: prefix + "status", value: status},
-			configRecord{key: prefix + "pvid", value: strconv.Itoa(int(port.NativeVLAN))},
+			configRecord{key: prefix + "pvid", value: strconv.Itoa(int(port.NativeVLAN.Value))},
 		); err != nil {
 			return err
 		}
-		tagged := make(map[network.VLANID]struct{}, len(port.TaggedVLANs))
-		for _, vlan := range port.TaggedVLANs {
+		tagged := make(map[network.VLANID]struct{}, len(port.TaggedVLANs.Value))
+		for _, vlan := range port.TaggedVLANs.Value {
 			tagged[vlan] = struct{}{}
 		}
 		for vlanIndex, vlan := range vlans {
 			mode := "exclude"
-			if vlan == port.NativeVLAN {
+			if vlan == port.NativeVLAN.Value {
 				mode = "untagged"
 			} else if _, exists := tagged[vlan]; exists {
 				mode = "tagged"
@@ -179,9 +181,9 @@ func writePorts(values configmap.Values, requested []network.SwitchPortConfig, v
 				return fmt.Errorf("set switch port VLAN membership: %w", err)
 			}
 		}
-		if port.PoE != "" {
+		if port.PoE.Value != "" {
 			poe := "auto"
-			if port.PoE == network.PoEOff {
+			if port.PoE.Value == network.PoEOff {
 				poe = "shutdown"
 			}
 			if err := values.Set(prefix+"poe", poe); err != nil {
@@ -193,14 +195,11 @@ func writePorts(values configmap.Values, requested []network.SwitchPortConfig, v
 	return nil
 }
 
-func writeSSH(values configmap.Values, ssh *network.SSHConfig, secrets profile.SecretReader, ports map[uint16]profile.PortCapability) error {
-	if ssh == nil {
-		return nil
-	}
-	if strings.ContainsAny(ssh.Username, "\r\n") {
+func writeSSH(values configmap.Values, ssh network.SSHConfig, secrets profile.SecretReader, ports map[uint16]profile.PortCapability) error {
+	if strings.ContainsAny(ssh.Username.Value, "\r\n") {
 		return fmt.Errorf("ssh.username: contains newline")
 	}
-	password, err := secrets.ReadSecret(ssh.Password)
+	password, err := secrets.ReadSecret(ssh.Password.Value)
 	if err != nil {
 		slog.Error("SSH secret read failed", "error", err)
 		return fmt.Errorf("ssh.password: %w", err)
@@ -213,7 +212,7 @@ func writeSSH(values configmap.Values, ssh *network.SSHConfig, secrets profile.S
 	if interfaceName == "" {
 		return fmt.Errorf("ssh: no reported port has an interface")
 	}
-	digest := sha256.Sum256([]byte(ssh.Username + "\x00" + plainPassword))
+	digest := sha256.Sum256([]byte(ssh.Username.Value + "\x00" + plainPassword))
 	salt := "$6$" + hex.EncodeToString(digest[:8])
 	passwordHash, err := sha512_crypt.New().Generate([]byte(plainPassword), []byte(salt))
 	if err != nil {
@@ -226,7 +225,7 @@ func writeSSH(values configmap.Values, ssh *network.SSHConfig, secrets profile.S
 		configRecord{key: "sshd.1.status", value: "enabled"},
 		configRecord{key: "users.status", value: "enabled"},
 		configRecord{key: "users.1.status", value: "enabled"},
-		configRecord{key: "users.1.name", value: ssh.Username},
+		configRecord{key: "users.1.name", value: ssh.Username.Value},
 		configRecord{key: "users.1.password", value: passwordHash},
 	); err != nil {
 		return err

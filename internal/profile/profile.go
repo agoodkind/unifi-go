@@ -18,6 +18,14 @@ type DeviceDescriptor struct {
 	Ports           []PortCapability     `json:"ports"`
 }
 
+// ResourceBinding associates typed identity with persisted configuration records.
+type ResourceBinding struct {
+	Kind     string   `json:"kind"`
+	Identity string   `json:"identity"`
+	RadioID  string   `json:"radio_id,omitempty"`
+	Prefixes []string `json:"prefixes"`
+}
+
 // ProtocolCapabilities describes the reported configuration protocol surface.
 type ProtocolCapabilities struct {
 	PacketVersion    uint32 `json:"packet_version"`

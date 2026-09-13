@@ -110,7 +110,7 @@ func (c *Controller) apply(id network.DeviceID, family network.DeviceFamily, ap 
 	}
 	command := Reply{Type: ReplySetparam, ConfigVersion: string(param.Version), ManagementConfig: managementEncoded, SystemConfig: systemEncoded, Command: "", Key: "", URI: "", Interval: 0, BlockedStations: "", ServerTime: 0}
 	previous := device
-	if ap != nil && ap.SSH != nil || sw != nil && sw.SSH != nil {
+	if ap != nil && ap.SSH.Present || sw != nil && sw.SSH.Present {
 		username, passwordHash := param.System["users.1.name"], param.System["users.1.password"]
 		if username == "" || !strings.HasPrefix(passwordHash, "$6$") {
 			return "", &network.ControlError{Code: network.EncodingFailed, Field: ""}
@@ -118,9 +118,9 @@ func (c *Controller) apply(id network.DeviceID, family network.DeviceFamily, ap 
 		device.SSHUsername, device.SSHPasswordHash = username, passwordHash
 		device.SSHPassword = ""
 	}
-	device.Family, device.Descriptor = family, &descriptor
-	device.DesiredAP, device.DesiredSwitch, device.DesiredVersion = ap, sw, param.Version
-	device.LastSetParam = &command
+	if !prepareTypedDevice(&device, family, descriptor, ap, sw, param.Version, command) {
+		return "", &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+	}
 	c.devices[mac] = device
 	if err := c.saveLocked(); err != nil {
 		c.devices[mac] = previous
@@ -190,6 +190,10 @@ func compilerFailure(err error) *network.ControlError {
 	failure := &network.ControlError{Code: network.InvalidConfig, Field: ""}
 	if typed, ok := errors.AsType[*network.ControlError](err); ok {
 		failure.Code = typed.Code
+		failure.Field = typed.Field
+	}
+	if failure.Field != "" {
+		return failure
 	}
 	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
 		field, _, found := strings.Cut(cause.Error(), ":")
