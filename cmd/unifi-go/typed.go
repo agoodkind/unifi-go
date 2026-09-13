@@ -176,7 +176,7 @@ func readConfigFile(path string) (string, error) {
 	return string(data), nil
 }
 
-func decodeConfigFile[T network.APConfig | network.SwitchConfig | network.Command | network.BaselineImport](path string, config *T) error {
+func decodeConfigFile[T network.APConfig | network.SwitchConfig | network.Command | network.BaselineImport | network.WiFiNetwork | network.RadioConfig | network.SwitchPortConfig](path string, config *T) error {
 	file, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return errors.New("cannot read configuration file")
@@ -283,7 +283,7 @@ type queuedVersion struct {
 	Version network.ConfigVersion `json:"version"`
 }
 
-func encodeTyped[T network.DeviceSnapshot | []network.DeviceSnapshot | []network.ClientSnapshot | []network.PortSnapshot | network.ConfigPreview | queuedVersion](output io.Writer, value T) error {
+func encodeTyped[T network.DeviceSnapshot | []network.DeviceSnapshot | []network.ClientSnapshot | []network.PortSnapshot | []network.WiFiNetworkView | network.ConfigPreview | queuedVersion](output io.Writer, value T) error {
 	if err := json.NewEncoder(output).Encode(value); err != nil {
 		return errors.New("cannot write response")
 	}

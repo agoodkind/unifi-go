@@ -9,7 +9,7 @@ import (
 
 type policyValue interface {
 	~bool | ~string | ~uint16 | ~int |
-		[]RadioBand | []VLANID | []WiFiNetwork | []RadioConfig | []SwitchPortConfig |
+		[]RadioBand | []RadioID | []VLANID | []WiFiNetwork | []RadioConfig | []SwitchPortConfig |
 		WiFiSecurity | PowerConfig | SSHConfig
 }
 

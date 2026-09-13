@@ -50,7 +50,7 @@ func (c *Controller) importBaseline(id network.DeviceID, imported *network.Basel
 	typedReady := imported.AP != nil || imported.Switch != nil
 	var compilation profile.Compilation
 	if typedReady {
-		input := profile.CompilationInput{Baseline: profile.SetParam{Version: imported.Config.Version, Management: management, System: system}, AP: imported.AP, Switch: imported.Switch, Bindings: nil}
+		input := profile.CompilationInput{Baseline: profile.SetParam{Version: imported.Config.Version, Management: management, System: system}, AP: imported.AP, Switch: imported.Switch, Bindings: nil, WiFiCopies: nil}
 		compilation, err = c.validateBaselineProjection(*device.Descriptor, input)
 		if err != nil {
 			return err

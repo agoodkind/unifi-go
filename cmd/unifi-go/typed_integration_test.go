@@ -94,6 +94,8 @@ func TestPersistedBaselineRejectsIncompleteResourceIdentity(t *testing.T) {
 
 func TestTypedControlIntegration(t *testing.T) {
 	t.Run("preview transaction", testPreviewTransaction)
+	t.Run("resource mutations", testResourceMutations)
+	t.Run("public resource API and CLI", testPublicResourceAPIAndCLI)
 	var omitted network.Optional[bool]
 	disabled := network.Supplied(false)
 	untagged := network.Cleared[network.VLANID]()
