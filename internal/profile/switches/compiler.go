@@ -2,15 +2,10 @@
 package switches
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"slices"
 	"strconv"
-	"strings"
-
-	"github.com/GehirnInc/crypt/sha512_crypt"
 
 	"goodkind.io/unifi-go/internal/configmap"
 	"goodkind.io/unifi-go/internal/profile"
@@ -19,11 +14,6 @@ import (
 
 type compiler struct{}
 
-type configRecord struct {
-	key   string
-	value string
-}
-
 // New returns the shared capability-driven switch compiler.
 func New() profile.SwitchCompiler { return compiler{} }
 
@@ -31,228 +21,227 @@ func (compiler) Supports(descriptor profile.DeviceDescriptor) bool {
 	return descriptor.Family == network.FamilySwitch && descriptor.Protocol.PacketVersion <= 1 && descriptor.Protocol.PayloadVersion == 1 && descriptor.Protocol.SystemConfig && descriptor.Protocol.ManagementConfig
 }
 
-func (compiler) Compile(descriptor profile.DeviceDescriptor, config network.SwitchConfig, secrets profile.SecretReader) (profile.SetParam, error) {
-	if descriptor.Family != network.FamilySwitch {
-		return profile.SetParam{}, fmt.Errorf("device family is %q", descriptor.Family)
-	}
+func (compiler) Compile(descriptor profile.DeviceDescriptor, input profile.CompilationInput, request network.SwitchConfig, secrets profile.SecretReader) (profile.Compilation, error) {
 	if !New().Supports(descriptor) {
-		return profile.SetParam{}, fmt.Errorf("unsupported switch configuration protocol")
+		return profile.Compilation{}, fmt.Errorf("unsupported switch configuration protocol")
 	}
-	if err := config.ValidateComplete(); err != nil {
-		slog.Error("switch configuration validation failed", "error", err)
-		return profile.SetParam{}, fmt.Errorf("validate switch configuration: %w", err)
+	if err := request.Validate(); err != nil {
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose switch: %w", err)
 	}
-	if config.SSH.Present && secrets == nil {
-		return profile.SetParam{}, fmt.Errorf("secret reader is required")
+	if input.AP != nil {
+		return profile.Compilation{}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
 	}
-	ports, err := reportedPorts(descriptor)
+	param, err := profile.CloneBaseline(input)
 	if err != nil {
-		return profile.SetParam{}, err
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose switch: %w", err)
 	}
-	requested := append([]network.SwitchPortConfig(nil), config.Ports.Value...)
-	slices.SortFunc(requested, func(left network.SwitchPortConfig, right network.SwitchPortConfig) int {
-		return int(left.Index) - int(right.Index)
-	})
-	if err := validateRequests(requested, ports); err != nil {
-		return profile.SetParam{}, err
+	prior := profile.MergeSwitch(input.Switch, network.SwitchConfig{})
+	effective := profile.MergeSwitch(input.Switch, request)
+	bindings, err := resolvePorts(param.System, prior)
+	if err != nil {
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose switch: %w", err)
 	}
-
-	system := configmap.Values{}
-	vlans := desiredVLANs(requested)
-	if err := writeVLANs(system, vlans); err != nil {
-		return profile.SetParam{}, err
-	}
-	if err := writePorts(system, requested, vlans); err != nil {
-		return profile.SetParam{}, err
-	}
-	if config.SSH.Present {
-		if err := writeSSH(system, config.SSH.Value, secrets, ports); err != nil {
-			return profile.SetParam{}, err
+	for _, stored := range input.Bindings {
+		index := slices.IndexFunc(bindings, func(binding profile.ResourceBinding) bool {
+			return binding.Kind == stored.Kind && binding.Identity == stored.Identity
+		})
+		if index < 0 || !slices.Equal(bindings[index].Prefixes, stored.Prefixes) {
+			return profile.Compilation{}, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
 		}
 	}
-	param := profile.SetParam{Version: "", Management: configmap.Values{}, System: system}
-	version, err := profile.CanonicalVersion(param)
-	if err != nil {
-		slog.Error("switch configuration version derivation failed", "error", err)
-		return profile.SetParam{}, fmt.Errorf("derive configuration version: %w", err)
+	if request.Ports.Present {
+		for _, old := range prior.Ports.Value {
+			if slices.ContainsFunc(effective.Ports.Value, func(port network.SwitchPortConfig) bool { return port.Index == old.Index }) {
+				continue
+			}
+			profile.DeleteRecord(param.System, portPrefix(old.Index))
+			for _, vlan := range profile.RecordPrefixes(param.System, "switch.vlan.") {
+				profile.DeleteRecord(param.System, vlan+"port."+strconv.Itoa(int(old.Index))+".")
+			}
+		}
 	}
-	param.Version = version
-	return param, nil
+	requestedPorts := slices.Clone(request.Ports.Value)
+	slices.SortFunc(requestedPorts, func(left, right network.SwitchPortConfig) int { return int(left.Index) - int(right.Index) })
+	for _, port := range requestedPorts {
+		if err := applyPortRequest(param.System, descriptor, prior, effective, port); err != nil {
+			return profile.Compilation{}, err
+		}
+	}
+	if request.SSH.Present {
+		if err := profile.WriteSSH(param.System, request.SSH.Value, secrets); err != nil {
+			slog.Warn("configuration composition failed")
+			return profile.Compilation{}, fmt.Errorf("compose switch: %w", err)
+		}
+	}
+	bindings, err = resolvePorts(param.System, effective)
+	if err != nil {
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose switch: %w", err)
+	}
+	param.Version, err = profile.CanonicalVersion(param)
+	if err != nil {
+		slog.Warn("configuration composition failed")
+		return profile.Compilation{}, fmt.Errorf("compose switch: %w", err)
+	}
+	return profile.Compilation{Param: param, Switch: &effective, AP: nil, Bindings: profile.CloneBindings(bindings)}, nil
 }
 
-func reportedPorts(descriptor profile.DeviceDescriptor) (map[uint16]profile.PortCapability, error) {
-	if len(descriptor.Ports) == 0 {
-		return nil, fmt.Errorf("no reported ports")
+func portPrefix(index uint16) string { return fmt.Sprintf("switch.port.%d.", index) }
+
+func resolvePorts(values configmap.Values, config network.SwitchConfig) ([]profile.ResourceBinding, error) {
+	var bindings []profile.ResourceBinding
+	for _, port := range config.Ports.Value {
+		prefix := portPrefix(port.Index)
+		if values[prefix+"opmode"] == "" {
+			return nil, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+		}
+		bindings = append(bindings, profile.ResourceBinding{Kind: "port", Identity: strconv.Itoa(int(port.Index)), RadioID: "", Prefixes: []string{prefix}})
 	}
-	ports := make(map[uint16]profile.PortCapability, len(descriptor.Ports))
+	return profile.CloneBindings(bindings), nil
+}
+
+func reportedPort(descriptor profile.DeviceDescriptor, index uint16) (profile.PortCapability, error) {
+	var result profile.PortCapability
+	found := false
 	for _, port := range descriptor.Ports {
-		if port.Index == 0 {
-			return nil, fmt.Errorf("reported port index must be greater than zero")
+		if port.Index != index {
+			continue
 		}
-		if strings.ContainsAny(port.Interface, "\r\n") {
-			return nil, fmt.Errorf("reported port %d interface contains newline", port.Index)
+		if found {
+			return result, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
 		}
-		if _, exists := ports[port.Index]; exists {
-			return nil, fmt.Errorf("duplicate reported port index %d", port.Index)
-		}
-		ports[port.Index] = port
+		result, found = port, true
 	}
-	return ports, nil
+	if !found {
+		return result, fmt.Errorf("ports: requested port is not reported")
+	}
+	return result, nil
 }
 
-func validateRequests(requested []network.SwitchPortConfig, ports map[uint16]profile.PortCapability) error {
-	for requestIndex, request := range requested {
-		port, exists := ports[request.Index]
-		if !exists {
-			return fmt.Errorf("ports[%d].index: port %d is not reported", requestIndex, request.Index)
-		}
-		if port.VLAN == nil || !*port.VLAN {
-			return fmt.Errorf("ports[%d]: VLAN configuration lacks capability evidence", requestIndex)
-		}
-		if request.PoE.Value != "" && !slices.Contains(port.PoEModes, request.PoE.Value) {
-			return fmt.Errorf("ports[%d].poe: mode %q is not reported", requestIndex, request.PoE.Value)
-		}
-	}
-	return nil
-}
-
-func desiredVLANs(ports []network.SwitchPortConfig) []network.VLANID {
-	seen := map[network.VLANID]struct{}{1: {}}
-	for _, port := range ports {
-		seen[port.NativeVLAN.Value] = struct{}{}
-		for _, vlan := range port.TaggedVLANs.Value {
-			seen[vlan] = struct{}{}
-		}
-	}
-	vlans := make([]network.VLANID, 0, len(seen))
-	for vlan := range seen {
-		vlans = append(vlans, vlan)
-	}
-	slices.Sort(vlans)
-	return vlans
-}
-
-func writeVLANs(values configmap.Values, vlans []network.VLANID) error {
-	for vlanIndex, vlan := range vlans {
-		prefix := fmt.Sprintf("switch.vlan.%d.", vlanIndex+1)
-		mode := "tagged"
-		if vlan == 1 {
-			mode = "untagged"
-		}
-		if err := setAll(values,
-			configRecord{key: prefix + "id", value: strconv.Itoa(int(vlan))},
-			configRecord{key: prefix + "mode", value: mode},
-			configRecord{key: prefix + "status", value: "enabled"},
-		); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func writePorts(values configmap.Values, requested []network.SwitchPortConfig, vlans []network.VLANID) error {
-	for _, port := range requested {
-		prefix := fmt.Sprintf("switch.port.%d.", port.Index)
+func overlayPort(values configmap.Values, request, effective network.SwitchPortConfig) error {
+	prefix := portPrefix(request.Index)
+	if request.Enabled.Present {
 		status := "disabled"
-		if port.Enabled.Value {
+		if request.Enabled.Value {
 			status = "enabled"
 		}
-		if err := setAll(values,
-			configRecord{key: prefix + "opmode", value: "switch"},
-			configRecord{key: prefix + "status", value: status},
-			configRecord{key: prefix + "pvid", value: strconv.Itoa(int(port.NativeVLAN.Value))},
-		); err != nil {
-			return err
-		}
-		tagged := make(map[network.VLANID]struct{}, len(port.TaggedVLANs.Value))
-		for _, vlan := range port.TaggedVLANs.Value {
-			tagged[vlan] = struct{}{}
-		}
-		for vlanIndex, vlan := range vlans {
-			mode := "exclude"
-			if vlan == port.NativeVLAN.Value {
-				mode = "untagged"
-			} else if _, exists := tagged[vlan]; exists {
-				mode = "tagged"
-			}
-			key := fmt.Sprintf("switch.vlan.%d.port.%d.mode", vlanIndex+1, port.Index)
-			if err := values.Set(key, mode); err != nil {
-				slog.Warn("switch VLAN membership write failed", "port_index", port.Index)
-				return fmt.Errorf("set switch port VLAN membership: %w", err)
-			}
-		}
-		if port.PoE.Value != "" {
-			poe := "auto"
-			if port.PoE.Value == network.PoEOff {
-				poe = "shutdown"
-			}
-			if err := values.Set(prefix+"poe", poe); err != nil {
-				slog.Warn("switch PoE mode write failed", "port_index", port.Index)
-				return fmt.Errorf("set switch port PoE mode: %w", err)
-			}
-		}
+		values[prefix+"status"] = status
 	}
-	return nil
-}
-
-func writeSSH(values configmap.Values, ssh network.SSHConfig, secrets profile.SecretReader, ports map[uint16]profile.PortCapability) error {
-	if strings.ContainsAny(ssh.Username.Value, "\r\n") {
-		return fmt.Errorf("ssh.username: contains newline")
+	if request.PoE.Present && request.PoE.Value != "" {
+		mode := "auto"
+		if request.PoE.Value == network.PoEOff {
+			mode = "shutdown"
+		}
+		values[prefix+"poe"] = mode
 	}
-	password, err := secrets.ReadSecret(ssh.Password.Value)
+	if !request.NativeVLAN.Present && !request.TaggedVLANs.Present {
+		return nil
+	}
+	native, err := strconv.ParseUint(values[prefix+"pvid"], 10, 16)
+	if request.NativeVLAN.Present {
+		native, err = uint64(request.NativeVLAN.Value), nil
+	}
+	if err != nil || native == 0 {
+		return &network.ControlError{Code: network.PolicyRequired, Field: "ports"}
+	}
+	tagged, err := portTaggedVLANs(values, request, effective, network.VLANID(native))
 	if err != nil {
-		slog.Error("SSH secret read failed", "error", err)
-		return fmt.Errorf("ssh.password: %w", err)
-	}
-	plainPassword := strings.Trim(string(password), "\r\n")
-	if plainPassword == "" || strings.ContainsAny(plainPassword, "\r\n") {
-		return fmt.Errorf("ssh.password: secret is empty or contains newline")
-	}
-	interfaceName := managementInterface(ports)
-	if interfaceName == "" {
-		return fmt.Errorf("ssh: no reported port has an interface")
-	}
-	digest := sha256.Sum256([]byte(ssh.Username.Value + "\x00" + plainPassword))
-	salt := "$6$" + hex.EncodeToString(digest[:8])
-	passwordHash, err := sha512_crypt.New().Generate([]byte(plainPassword), []byte(salt))
-	if err != nil {
-		return fmt.Errorf("ssh.password: hash secret: %w", err)
-	}
-	if err := setAll(values,
-		configRecord{key: "sshd.status", value: "enabled"},
-		configRecord{key: "sshd.auth.passwd", value: "enabled"},
-		configRecord{key: "sshd.1.ifname", value: interfaceName},
-		configRecord{key: "sshd.1.status", value: "enabled"},
-		configRecord{key: "users.status", value: "enabled"},
-		configRecord{key: "users.1.status", value: "enabled"},
-		configRecord{key: "users.1.name", value: ssh.Username.Value},
-		configRecord{key: "users.1.password", value: passwordHash},
-	); err != nil {
 		return err
 	}
-	return nil
-}
-
-func managementInterface(ports map[uint16]profile.PortCapability) string {
-	indices := make([]uint16, 0, len(ports))
-	for index := range ports {
-		indices = append(indices, index)
+	if request.NativeVLAN.Present {
+		values[prefix+"pvid"], values[prefix+"opmode"] = strconv.FormatUint(native, 10), "switch"
 	}
-	slices.Sort(indices)
-	for _, index := range indices {
-		if ports[index].Interface != "" {
-			return ports[index].Interface
+	for _, vlan := range profile.RecordPrefixes(values, "switch.vlan.") {
+		id, err := strconv.ParseUint(values[vlan+"id"], 10, 16)
+		if err != nil {
+			return &network.ControlError{Code: network.BaselineUnusable, Field: ""}
 		}
-	}
-	return ""
-}
-
-func setAll(values configmap.Values, records ...configRecord) error {
-	for _, record := range records {
-		if err := values.Set(record.key, record.value); err != nil {
-			slog.Warn("switch configuration record write failed")
-			return fmt.Errorf("set switch configuration record: %w", err)
+		mode := "exclude"
+		if id == native {
+			mode = "untagged"
+		} else if tagged[network.VLANID(id)] {
+			mode = "tagged"
+		}
+		key := fmt.Sprintf("%sport.%d.mode", vlan, request.Index)
+		// Omitted membership outside the changed native/tagged set stays absent.
+		if _, exists := values[key]; exists || id == native || tagged[network.VLANID(id)] {
+			values[key] = mode
 		}
 	}
 	return nil
+}
+
+func applyPortRequest(values configmap.Values, descriptor profile.DeviceDescriptor, prior, effective network.SwitchConfig, port network.SwitchPortConfig) error {
+	capability, err := reportedPort(descriptor, port.Index)
+	if err != nil {
+		slog.Warn("configuration composition failed")
+		return fmt.Errorf("compose switch: %w", err)
+	}
+	current := effective.Ports.Value[slices.IndexFunc(effective.Ports.Value, func(candidate network.SwitchPortConfig) bool { return candidate.Index == port.Index })]
+	if !slices.ContainsFunc(prior.Ports.Value, func(candidate network.SwitchPortConfig) bool { return candidate.Index == port.Index }) {
+		complete := network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{current})}
+		if err := complete.ValidateComplete(); err != nil {
+			slog.Warn("configuration composition failed")
+			return fmt.Errorf("compose switch: %w", err)
+		}
+	}
+	if (port.NativeVLAN.Present || port.TaggedVLANs.Present) && (capability.VLAN == nil || !*capability.VLAN) {
+		return fmt.Errorf("ports: VLAN configuration lacks capability evidence")
+	}
+	if port.PoE.Present && port.PoE.Value != "" && !slices.Contains(capability.PoEModes, port.PoE.Value) {
+		return fmt.Errorf("ports: PoE mode lacks capability evidence")
+	}
+	return overlayPort(values, port, current)
+}
+
+func portTaggedVLANs(values configmap.Values, request, effective network.SwitchPortConfig, native network.VLANID) (map[network.VLANID]bool, error) {
+	tagged := make(map[network.VLANID]bool)
+	for _, vlan := range profile.RecordPrefixes(values, "switch.vlan.") {
+		if values[fmt.Sprintf("%sport.%d.mode", vlan, request.Index)] != "tagged" {
+			continue
+		}
+		id, err := strconv.ParseUint(values[vlan+"id"], 10, 16)
+		if err != nil {
+			return nil, &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+		}
+		tagged[network.VLANID(id)] = true
+	}
+	if request.TaggedVLANs.Present {
+		clear(tagged)
+		for _, vlan := range effective.TaggedVLANs.Value {
+			tagged[vlan] = true
+		}
+	}
+	if tagged[native] {
+		return nil, fmt.Errorf("ports: tagged VLAN repeats native VLAN")
+	}
+
+	required := []network.VLANID{native}
+	for vlan := range tagged {
+		required = append(required, vlan)
+	}
+	slices.Sort(required)
+	required = slices.Compact(required)
+	for _, id := range required {
+		vlan, err := profile.MatchRecord(values, "switch.vlan.", "id", strconv.Itoa(int(id)))
+		if err != nil {
+			slog.Warn("configuration composition failed")
+			return nil, fmt.Errorf("compose switch: %w", err)
+		}
+		if vlan != "" {
+			continue
+		}
+		vlan = profile.NextRecord(values, "switch.vlan.")
+		values[vlan+"id"] = strconv.Itoa(int(id))
+		mode := "tagged"
+		if id == native {
+			mode = "untagged"
+		}
+		values[vlan+"mode"], values[vlan+"status"] = mode, "enabled"
+	}
+
+	return tagged, nil
 }

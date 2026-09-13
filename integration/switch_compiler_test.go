@@ -2,15 +2,16 @@ package integration_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/GehirnInc/crypt/sha512_crypt"
-
-	"goodkind.io/unifi-go/internal/configmap"
 	"goodkind.io/unifi-go/internal/informmodel"
 	"goodkind.io/unifi-go/internal/profile"
 	"goodkind.io/unifi-go/internal/profile/switches"
@@ -57,176 +58,142 @@ func TestSwitchCompilerFromNetworkServerFixture(t *testing.T) {
 		suppliedSwitchPort(2, true, 20, []network.VLANID{}, ""),
 		suppliedSwitchPort(4, false, 1, []network.VLANID{}, network.PoEOff),
 	)
-	compiled, err := switches.New().Compile(descriptor, config, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	physicalProtocol := descriptor
-	physicalProtocol.Protocol.PacketVersion = 0
-	versionZero, err := switches.New().Compile(physicalProtocol, config, nil)
-	if err != nil || versionZero.Version != compiled.Version {
-		t.Fatal("verified physical packet version 0 changed or rejected switch compilation")
-	}
-	expected := configmap.Values{
-		"switch.vlan.1.id": "1", "switch.vlan.1.mode": "untagged",
-		"switch.vlan.1.status": "enabled", "switch.vlan.2.id": "20",
-		"switch.vlan.2.mode": "tagged", "switch.vlan.2.status": "enabled",
-		"switch.port.2.opmode": "switch", "switch.port.2.status": "enabled",
-		"switch.port.2.pvid": "20", "switch.vlan.1.port.2.mode": "exclude",
-		"switch.vlan.2.port.2.mode": "untagged",
-		"switch.port.3.opmode":      "switch", "switch.port.3.status": "enabled",
-		"switch.port.3.pvid": "1", "switch.vlan.1.port.3.mode": "untagged",
-		"switch.vlan.2.port.3.mode": "tagged",
-		"switch.port.4.opmode":      "switch", "switch.port.4.status": "disabled",
-		"switch.port.4.pvid": "1", "switch.port.4.poe": "shutdown",
-		"switch.vlan.1.port.4.mode": "untagged", "switch.vlan.2.port.4.mode": "exclude",
-		"switch.port.5.opmode": "switch", "switch.port.5.status": "enabled",
-		"switch.port.5.pvid": "1", "switch.port.5.poe": "auto",
-		"switch.vlan.1.port.5.mode": "untagged", "switch.vlan.2.port.5.mode": "exclude",
-	}
-	if compiled.Version == "" || !maps.Equal(compiled.System, expected) {
-		t.Fatalf("compiled switch map differs from reference-backed keys: %#v", compiled.System)
-	}
-	if _, exists := compiled.System["switch.port.2.poe"]; exists {
-		t.Fatal("empty PoE request emitted a key")
-	}
-	for key := range compiled.System {
-		if strings.HasPrefix(key, "sshd.") || strings.HasPrefix(key, "users.") {
-			t.Fatal("configuration without SSH emitted credential keys")
+
+	baseline := compilerFixture(t, "switch", "operation-08-reply.json")
+	// Explicit synthetic status and native policy supplement the captured port records.
+	for _, port := range config.Ports.Value {
+		prefix := fmt.Sprintf("switch.port.%d.", port.Index)
+		baseline.System[prefix+"opmode"] = "switch"
+		baseline.System[prefix+"status"] = "enabled"
+		baseline.System[prefix+"pvid"] = strconv.Itoa(int(port.NativeVLAN.Value))
+		for _, vlanPrefix := range profile.RecordPrefixes(baseline.System, "switch.vlan.") {
+			id, err := strconv.Atoi(baseline.System[vlanPrefix+"id"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			mode := "exclude"
+			if network.VLANID(id) == port.NativeVLAN.Value {
+				mode = "untagged"
+			} else if slices.Contains(port.TaggedVLANs.Value, network.VLANID(id)) {
+				mode = "tagged"
+			}
+			baseline.System[fmt.Sprintf("%sport.%d.mode", vlanPrefix, port.Index)] = mode
 		}
 	}
-	repeated, err := switches.New().Compile(descriptor, config, nil)
-	if err != nil || repeated.Version != compiled.Version || !maps.Equal(repeated.System, compiled.System) {
-		t.Fatal("switch compilation is not deterministic")
+	baseline.System["operator.unmodeled"], baseline.System["locale.timezone"] = "retain", "operator-zone"
+	baseline.System["switch.port.2.operator.unmodeled"] = "retain-port"
+	baseline.Management["operator.unmodeled"] = "retain-management"
+	input := profile.CompilationInput{Baseline: baseline, Switch: &config}
+	registry := profile.NewRegistry(nil, switches.New())
+	request := network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{{Index: 2, Enabled: network.Supplied(false)}, {Index: 3}, {Index: 4}, {Index: 5}})}
+	before := baseline.System.Clone()
+	compiled, err := registry.CompileSwitch(descriptor, input, request, nil)
+	if err != nil {
+		t.Fatal("baseline composition failed", err)
+	}
+	expected := before.Clone()
+	expected["switch.port.2.status"] = "disabled"
+	assertComposition(t, compiled.Param, baseline.Management, expected)
+	if !maps.Equal(before, baseline.System) || !config.Ports.Value[2].Enabled.Value {
+		t.Fatal("input mutated")
+	}
+	if compiled.Switch == nil || compiled.AP != nil {
+		t.Fatal("wrong result family")
+	}
+	repeated, err := registry.CompileSwitch(descriptor, profile.CompilationInput{Baseline: compiled.Param, Switch: compiled.Switch, Bindings: compiled.Bindings}, request, nil)
+	if err != nil || repeated.Param.Version != compiled.Param.Version || !reflect.DeepEqual(repeated.Bindings, compiled.Bindings) {
+		t.Fatal("repeated compilation changed identity")
 	}
 	unfamiliar := descriptor
-	unfamiliar.Model = "UNFAMILIAR-SWITCH"
-	unfamiliar.Firmware = "99.88.77"
-	unfamiliarCompiled, err := switches.New().Compile(unfamiliar, config, nil)
-	if err != nil || unfamiliarCompiled.Version != compiled.Version || !maps.Equal(unfamiliarCompiled.System, compiled.System) {
-		t.Fatal("model or firmware changed capability-equivalent compilation")
+	unfamiliar.Model = "UNRECOGNIZED"
+	unfamiliar.Ports = append([]profile.PortCapability(nil), descriptor.Ports...)
+	for index := range unfamiliar.Ports {
+		unfamiliar.Ports[index].VLAN = nil
+		unfamiliar.Ports[index].PoEModes = nil
 	}
-	passwordPath := filepath.Join(t.TempDir(), "password")
-	if err := os.WriteFile(passwordPath, []byte("fixture-password\n"), 0o600); err != nil {
-		t.Fatal(err)
+	if _, err := registry.CompileSwitch(unfamiliar, input, request, nil); err != nil {
+		t.Fatal("untouched capability blocked enabled setting")
 	}
-	sshConfig := config
-	sshConfig.SSH = network.Supplied(network.SSHConfig{Username: network.Supplied("fixture-user"), Password: network.Supplied(network.SecretFile(passwordPath))}) // gitleaks:allow
-	sshCompiled, err := switches.New().Compile(descriptor, sshConfig, fileSecrets{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sshCompiled.System["sshd.1.ifname"] != "eth0" || sshCompiled.System["users.1.name"] != "fixture-user" {
-		t.Fatal("requested SSH configuration compiled incorrectly")
-	}
-	if err := sha512_crypt.New().Verify(sshCompiled.System["users.1.password"], []byte("fixture-password")); err != nil {
-		t.Fatal("SSH password hash does not verify")
-	}
-	repeatedSSH, err := switches.New().Compile(descriptor, sshConfig, fileSecrets{})
-	if err != nil || repeatedSSH.System["users.1.password"] != sshCompiled.System["users.1.password"] {
-		t.Fatal("SSH password hash is not deterministic")
-	}
-	vlanSupported := true
-	managementDescriptor := profile.DeviceDescriptor{
-		Family: network.FamilySwitch, Protocol: descriptor.Protocol,
-		Ports: []profile.PortCapability{
-			{Index: 7, Interface: "eth6", VLAN: &vlanSupported},
-			{Index: 1, Interface: ""},
-		},
-	}
-	managementConfig := network.SwitchConfig{
-		Ports: network.Supplied([]network.SwitchPortConfig{suppliedSwitchPort(7, true, 1, []network.VLANID{}, "")}),
-		SSH:   sshConfig.SSH,
-	}
-	managementCompiled, err := switches.New().Compile(managementDescriptor, managementConfig, fileSecrets{})
-	if err != nil || managementCompiled.System["sshd.1.ifname"] != "eth6" {
-		t.Fatal("SSH did not select the lowest reported nonempty interface")
-	}
-	managementDescriptor.Ports[0], managementDescriptor.Ports[1] = managementDescriptor.Ports[1], managementDescriptor.Ports[0]
-	reorderedManagement, err := switches.New().Compile(managementDescriptor, managementConfig, fileSecrets{})
-	if err != nil || reorderedManagement.System["sshd.1.ifname"] != "eth6" || reorderedManagement.Version != managementCompiled.Version {
-		t.Fatal("SSH interface selection depends on report order")
-	}
-	managementDescriptor.Ports[1].Interface = ""
-	if _, err := switches.New().Compile(managementDescriptor, managementConfig, fileSecrets{}); err == nil {
-		t.Fatal("SSH accepted an inventory without any reported interface")
-	}
+	t.Run("omitted collection", func(t *testing.T) {
+		result, err := registry.CompileSwitch(descriptor, input, network.SwitchConfig{}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertComposition(t, result.Param, baseline.Management, before)
+	})
+	t.Run("empty collection removes only owned ports", func(t *testing.T) {
+		result, err := registry.CompileSwitch(descriptor, input, network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{})}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Param.System["switch.port.2.operator.unmodeled"] != "" || result.Param.System["operator.unmodeled"] != "retain" || result.Param.System["switch.port.1.pvid"] != before["switch.port.1.pvid"] {
+			t.Fatal("removed unrelated policy")
+		}
+	})
+	t.Run("explicit empty tagged collection", func(t *testing.T) {
+		req := network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{{Index: 2}, {Index: 3, TaggedVLANs: network.Supplied([]network.VLANID{})}, {Index: 4}, {Index: 5}})}
+		result, err := registry.CompileSwitch(descriptor, input, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Param.System["switch.vlan.2.port.3.mode"] != "exclude" {
+			t.Fatal("explicit empty tagged VLANs were omitted")
+		}
+		if _, err := registry.CompileSwitch(unfamiliar, input, req, nil); err == nil {
+			t.Fatal("missing VLAN capability accepted")
+		}
+	})
+	t.Run("new port requires policy", func(t *testing.T) {
+		if _, err := registry.CompileSwitch(descriptor, input, network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{{Index: 7}})}, nil); err == nil {
+			t.Fatal("new port used hidden policy")
+		}
+	})
 
-	noncontiguous := profile.DeviceDescriptor{
-		Family: network.FamilySwitch, Model: "SYNTHETIC", Protocol: descriptor.Protocol,
-		Ports: []profile.PortCapability{
-			{Index: 7, Interface: "eth6", VLAN: &vlanSupported},
-			{Index: 2, Interface: "eth1", VLAN: &vlanSupported},
-		},
-	}
-	noncontiguousConfig := suppliedSwitchConfig(
-		suppliedSwitchPort(7, true, 300, []network.VLANID{20}, ""),
-		suppliedSwitchPort(2, true, 1, []network.VLANID{}, ""),
-	)
-	noncontiguousCompiled, err := switches.New().Compile(noncontiguous, noncontiguousConfig, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if noncontiguousCompiled.System["switch.vlan.2.id"] != "20" || noncontiguousCompiled.System["switch.vlan.3.id"] != "300" || noncontiguousCompiled.System["switch.port.7.pvid"] != "300" {
-		t.Fatal("noncontiguous ports or sorted VLAN numbering compiled incorrectly")
-	}
-	secondReport := loadReport("operation-02-report.json")
-	secondDescriptor, err := profile.DescribeWithFamily(secondReport, network.FamilySwitch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := switches.New().Compile(secondDescriptor, suppliedSwitchConfig(suppliedSwitchPort(8, true, 1, []network.VLANID{}, "")), nil); err != nil {
-		t.Fatal("different non-PoE inventory was rejected")
-	}
-
-	missingPort := config
-	missingPort.Ports = network.Supplied([]network.SwitchPortConfig{suppliedSwitchPort(99, true, 1, []network.VLANID{}, "")})
-	if _, err := switches.New().Compile(descriptor, missingPort, nil); err == nil {
-		t.Fatal("missing reported port was accepted")
-	}
-	duplicatePort := config
-	duplicatePort.Ports = network.Supplied([]network.SwitchPortConfig{suppliedSwitchPort(2, true, 1, []network.VLANID{}, ""), suppliedSwitchPort(2, true, 20, []network.VLANID{}, "")})
-	if _, err := switches.New().Compile(descriptor, duplicatePort, nil); err == nil {
-		t.Fatal("duplicate requested port was accepted")
-	}
-	overlap := config
-	overlap.Ports = network.Supplied([]network.SwitchPortConfig{suppliedSwitchPort(2, true, 20, []network.VLANID{20}, "")})
-	if _, err := switches.New().Compile(descriptor, overlap, nil); err == nil {
-		t.Fatal("native and tagged VLAN overlap was accepted")
-	}
-	withoutPoE := descriptor
-	withoutPoE.Ports = append([]profile.PortCapability(nil), descriptor.Ports...)
-	withoutPoE.Ports[1].PoEModes = nil
-	if _, err := switches.New().Compile(withoutPoE, suppliedSwitchConfig(suppliedSwitchPort(2, true, 1, []network.VLANID{}, network.PoEAuto)), nil); err == nil {
-		t.Fatal("unreported PoE mode was accepted")
-	}
-	vlanUnsupported := false
-	withoutVLAN := descriptor
-	withoutVLAN.Ports = append([]profile.PortCapability(nil), descriptor.Ports...)
-	withoutVLAN.Ports[1].VLAN = &vlanUnsupported
-	if _, err := switches.New().Compile(withoutVLAN, suppliedSwitchConfig(suppliedSwitchPort(2, true, 1, []network.VLANID{}, "")), nil); err == nil {
-		t.Fatal("explicitly unsupported VLAN configuration was accepted")
-	}
-	withoutVLAN.Ports[1].VLAN = nil
-	if _, err := switches.New().Compile(withoutVLAN, suppliedSwitchConfig(suppliedSwitchPort(2, true, 1, []network.VLANID{}, "")), nil); err == nil {
-		t.Fatal("unknown VLAN capability was accepted")
-	}
-	unsupportedProtocol := descriptor
-	unsupportedProtocol.Protocol.PacketVersion = 2
-	if switches.New().Supports(unsupportedProtocol) {
-		t.Fatal("unverified packet protocol was accepted")
-	}
-	unsupportedProtocol.Protocol.PacketVersion, unsupportedProtocol.Protocol.PayloadVersion = 1, 2
-	if switches.New().Supports(unsupportedProtocol) {
-		t.Fatal("unverified payload protocol was accepted")
-	}
-	wrongFamily := descriptor
-	wrongFamily.Family = network.FamilyAP
-	registry := profile.NewRegistry(nil, switches.New())
-	if _, err := registry.CompileSwitch(wrongFamily, config, nil); err == nil {
-		t.Fatal("switch registry accepted an access point descriptor")
-	}
-
+	t.Run("add explicit physical port", func(t *testing.T) {
+		req := network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{{Index: 2}, {Index: 3}, {Index: 4}, {Index: 5}, suppliedSwitchPort(7, false, 1, []network.VLANID{}, network.PoEAuto)})}
+		result, err := registry.CompileSwitch(descriptor, input, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Param.System["switch.port.7.status"] != "disabled" || result.Param.System["switch.port.7.pvid"] != "1" {
+			t.Fatal("added port policy missing")
+		}
+		for key, value := range before {
+			if strings.HasPrefix(key, "switch.port.7.") || strings.Contains(key, ".port.7.") {
+				continue
+			}
+			if result.Param.System[key] != value {
+				t.Fatal("port addition changed unrelated policy")
+			}
+		}
+	})
+	t.Run("PoE alone preserves VLAN policy", func(t *testing.T) {
+		req := network.SwitchConfig{Ports: network.Supplied([]network.SwitchPortConfig{{Index: 2}, {Index: 3}, {Index: 4, PoE: network.Supplied(network.PoEOff)}, {Index: 5}})}
+		result, err := registry.CompileSwitch(descriptor, input, req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := before.Clone()
+		want["switch.port.4.poe"] = "shutdown"
+		assertComposition(t, result.Param, baseline.Management, want)
+		if _, err := registry.CompileSwitch(unfamiliar, input, req, nil); err == nil {
+			t.Fatal("missing PoE evidence accepted")
+		}
+	})
+	t.Run("untouched absent port policy", func(t *testing.T) {
+		sparse := input
+		sparse.Baseline.System = before.Clone()
+		delete(sparse.Baseline.System, "switch.port.2.status")
+		delete(sparse.Baseline.System, "switch.port.2.pvid")
+		sparse.Baseline.System["switch.port.2.opmode"] = "operator-mode"
+		result, err := registry.CompileSwitch(descriptor, sparse, request, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := sparse.Baseline.System.Clone()
+		want["switch.port.2.status"] = "disabled"
+		assertComposition(t, result.Param, baseline.Management, want)
+	})
 	snapshot, err := switches.New().Decode(report)
 	if err != nil {
 		t.Fatal(err)

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"goodkind.io/unifi-go/internal/configmap"
 	"goodkind.io/unifi-go/internal/informmodel"
 	"goodkind.io/unifi-go/internal/profile"
 	"goodkind.io/unifi-go/network"
@@ -77,40 +78,35 @@ func (c *Controller) apply(id network.DeviceID, family network.DeviceFamily, ap 
 	if err != nil {
 		return "", &network.ControlError{Code: network.FamilyMismatch, Field: ""}
 	}
-	var param profile.SetParam
+	input, err := typedCompilationInput(device)
+	if err != nil {
+		return "", err
+	}
+	var compilation profile.Compilation
 	switch family {
 	case network.FamilyAP:
 		if ap == nil || sw != nil {
 			return "", &network.ControlError{Code: network.InvalidConfig, Field: ""}
 		}
-		param, err = c.registry.CompileAP(descriptor, *ap, fileSecrets{})
+		compilation, err = c.registry.CompileAP(descriptor, input, *ap, fileSecrets{})
 	case network.FamilySwitch:
 		if sw == nil || ap != nil {
 			return "", &network.ControlError{Code: network.InvalidConfig, Field: ""}
 		}
-		param, err = c.registry.CompileSwitch(descriptor, *sw, fileSecrets{})
+		compilation, err = c.registry.CompileSwitch(descriptor, input, *sw, fileSecrets{})
 	default:
 		return "", &network.ControlError{Code: network.FamilyMismatch, Field: ""}
 	}
 	if err != nil {
 		return "", compilerFailure(err)
 	}
-	if err := c.augmentSystem(param.System, device, descriptor); err != nil {
-		return "", &network.ControlError{Code: network.EncodingFailed, Field: ""}
-	}
-	management := param.Management.Clone()
-	management["authkey"], management["inform_url"], management["cfgversion"] = device.Key, c.advertise, string(param.Version)
-	managementEncoded, err := management.Encode()
+	param := compilation.Param
+	command, err := c.typedReply(&param, device, descriptor)
 	if err != nil {
-		return "", &network.ControlError{Code: network.EncodingFailed, Field: ""}
+		return "", err
 	}
-	systemEncoded, err := param.System.Encode()
-	if err != nil {
-		return "", &network.ControlError{Code: network.EncodingFailed, Field: ""}
-	}
-	command := Reply{Type: ReplySetparam, ConfigVersion: string(param.Version), ManagementConfig: managementEncoded, SystemConfig: systemEncoded, Command: "", Key: "", URI: "", Interval: 0, BlockedStations: "", ServerTime: 0}
 	previous := device
-	if ap != nil && ap.SSH.Present || sw != nil && sw.SSH.Present {
+	if ap != nil && ap.SSH.Present && ap.SSH.Value.Password.Present || sw != nil && sw.SSH.Present && sw.SSH.Value.Password.Present {
 		username, passwordHash := param.System["users.1.name"], param.System["users.1.password"]
 		if username == "" || !strings.HasPrefix(passwordHash, "$6$") {
 			return "", &network.ControlError{Code: network.EncodingFailed, Field: ""}
@@ -118,8 +114,12 @@ func (c *Controller) apply(id network.DeviceID, family network.DeviceFamily, ap 
 		device.SSHUsername, device.SSHPasswordHash = username, passwordHash
 		device.SSHPassword = ""
 	}
-	if !prepareTypedDevice(&device, family, descriptor, ap, sw, param.Version, command) {
-		return "", &network.ControlError{Code: network.BaselineUnusable, Field: ""}
+	device.Family, device.Descriptor = family, &descriptor
+	device.DesiredAP, device.DesiredSwitch, device.DesiredVersion = compilation.AP, compilation.Switch, param.Version
+	device.LastSetParam = &command
+	device.Baseline = &ConfigurationBaseline{
+		SchemaVersion: baselineSchemaVersion, TypedReady: true, Bindings: profile.CloneBindings(compilation.Bindings),
+		Config: network.Config{Version: param.Version, Management: command.ManagementConfig, System: command.SystemConfig},
 	}
 	c.devices[mac] = device
 	if err := c.saveLocked(); err != nil {
@@ -219,4 +219,48 @@ func (c *Controller) deviceSnapshots() ([]network.DeviceSnapshot, error) {
 	}
 	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].ID < snapshots[j].ID })
 	return snapshots, nil
+}
+
+func typedCompilationInput(device Device) (profile.CompilationInput, error) {
+	if device.Baseline == nil {
+		return profile.CompilationInput{}, &network.ControlError{Code: network.BaselineRequired}
+	}
+	if !device.Baseline.TypedReady || device.Baseline.SchemaVersion != baselineSchemaVersion {
+		return profile.CompilationInput{}, &network.ControlError{Code: network.BaselineUnusable}
+	}
+	baselineManagement, err := configmap.Parse(device.Baseline.Config.Management)
+	if err != nil {
+		return profile.CompilationInput{}, &network.ControlError{Code: network.BaselineUnusable}
+	}
+	baselineSystem, err := configmap.Parse(device.Baseline.Config.System)
+	if err != nil {
+		return profile.CompilationInput{}, &network.ControlError{Code: network.BaselineUnusable}
+	}
+	input := profile.CompilationInput{Baseline: profile.SetParam{Version: device.Baseline.Config.Version, Management: baselineManagement, System: baselineSystem}, AP: device.DesiredAP, Switch: device.DesiredSwitch, Bindings: device.Baseline.Bindings}
+
+	return input, nil
+}
+
+func (c *Controller) typedReply(param *profile.SetParam, device Device, descriptor profile.DeviceDescriptor) (Reply, error) {
+	if err := c.augmentSystem(param.System, device, descriptor); err != nil {
+		return Reply{}, &network.ControlError{Code: network.EncodingFailed, Field: ""}
+	}
+	version, err := profile.CanonicalVersion(*param)
+	if err != nil {
+		return Reply{}, &network.ControlError{Code: network.EncodingFailed}
+	}
+	param.Version = version
+	management := param.Management.Clone()
+	management["authkey"], management["inform_url"], management["cfgversion"] = device.Key, c.advertise, string(param.Version)
+	managementEncoded, err := management.Encode()
+	if err != nil {
+		return Reply{}, &network.ControlError{Code: network.EncodingFailed, Field: ""}
+	}
+	systemEncoded, err := param.System.Encode()
+	if err != nil {
+		return Reply{}, &network.ControlError{Code: network.EncodingFailed, Field: ""}
+	}
+	command := Reply{Type: ReplySetparam, ConfigVersion: string(param.Version), ManagementConfig: managementEncoded, SystemConfig: systemEncoded, Command: "", Key: "", URI: "", Interval: 0, BlockedStations: "", ServerTime: 0}
+
+	return command, nil
 }

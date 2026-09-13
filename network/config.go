@@ -341,7 +341,7 @@ func validateSSH(config Optional[SSHConfig], path string) error {
 	return nil
 }
 
-// ValidateComplete requires all policy needed by the current full AP compiler.
+// ValidateComplete requires a complete typed access point projection.
 func (config APConfig) ValidateComplete() error {
 	if err := config.Validate(); err != nil {
 		return err
@@ -406,7 +406,7 @@ func (config APConfig) ValidateComplete() error {
 	return validateCompleteSSH(config.SSH)
 }
 
-// ValidateComplete requires all policy needed by the current full switch compiler.
+// ValidateComplete requires a complete typed switch projection.
 func (config SwitchConfig) ValidateComplete() error {
 	if err := config.Validate(); err != nil {
 		return err

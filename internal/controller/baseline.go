@@ -71,22 +71,6 @@ func baselineFromLegacy(device Device) (*ConfigurationBaseline, error) {
 	return baseline, nil
 }
 
-func readyBaseline(device Device) *ConfigurationBaseline {
-	baseline, err := baselineFromLegacy(device)
-	if err != nil || !baseline.TypedReady {
-		return nil
-	}
-	return baseline
-}
-
-func prepareTypedDevice(device *Device, family network.DeviceFamily, descriptor profile.DeviceDescriptor, ap *network.APConfig, sw *network.SwitchConfig, version network.ConfigVersion, command Reply) bool {
-	device.Family, device.Descriptor = family, &descriptor
-	device.DesiredAP, device.DesiredSwitch, device.DesiredVersion = ap, sw, version
-	device.LastSetParam = &command
-	device.Baseline = readyBaseline(*device)
-	return device.Baseline != nil
-}
-
 func baselineBindings(device Device, management, system configmap.Values) ([]profile.ResourceBinding, bool) {
 	if management["cfgversion"] != string(device.DesiredVersion) || device.Descriptor == nil {
 		return nil, false

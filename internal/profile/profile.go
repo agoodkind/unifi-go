@@ -68,13 +68,13 @@ type SecretReader interface {
 // APCompiler compiles and decodes access point configuration and state.
 type APCompiler interface {
 	Supports(DeviceDescriptor) bool
-	Compile(DeviceDescriptor, network.APConfig, SecretReader) (SetParam, error)
+	Compile(DeviceDescriptor, CompilationInput, network.APConfig, SecretReader) (Compilation, error)
 	Decode(informmodel.Report) (network.APSnapshot, error)
 }
 
 // SwitchCompiler compiles and decodes switch configuration and state.
 type SwitchCompiler interface {
 	Supports(DeviceDescriptor) bool
-	Compile(DeviceDescriptor, network.SwitchConfig, SecretReader) (SetParam, error)
+	Compile(DeviceDescriptor, CompilationInput, network.SwitchConfig, SecretReader) (Compilation, error)
 	Decode(informmodel.Report) (network.SwitchSnapshot, error)
 }
