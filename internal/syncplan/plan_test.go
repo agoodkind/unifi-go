@@ -236,3 +236,33 @@ func TestCompare_RejectsARecordWithoutItsIdentity(t *testing.T) {
 		t.Fatalf("error is %q, want it to name the missing identity", err)
 	}
 }
+
+func TestRender_DigestsOneValueTheSameWayOnBothSides(t *testing.T) {
+	collection := wlanconf(t)
+	compact := []unifiapi.Record{record(t, `{"name":"Lab","x_ssh_keys":[{"name":"one","key":"AAAA"}]}`)}
+	spaced := []unifiapi.Record{record(t, `{"_id":"64f0","name":"Lab","x_ssh_keys":[ { "key" : "AAAA" , "name" : "one" } ]}`)}
+
+	plan, err := Compare(collection, compact, spaced, false)
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+
+	if !plan.Empty() {
+		t.Fatalf("the same key spelled two ways produced work:\n%s", render(t, plan))
+	}
+
+	changed := []unifiapi.Record{record(t, `{"_id":"64f0","name":"Lab","x_ssh_keys":[{"name":"two","key":"BBBB"}]}`)}
+	plan, err = Compare(collection, compact, changed, false)
+	if err != nil {
+		t.Fatalf("compare changed key: %v", err)
+	}
+	text := render(t, plan)
+	digests := strings.Count(text, "sha256:")
+	if digests != 2 {
+		t.Fatalf("a replaced key rendered %d digests, want one for each side:\n%s", digests, text)
+	}
+	before, after, found := strings.Cut(strings.SplitN(text, "x_ssh_keys: ", 2)[1], " -> ")
+	if !found || before == after {
+		t.Fatalf("a replaced key rendered the same digest on both sides:\n%s", text)
+	}
+}

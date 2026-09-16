@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"goodkind.io/unifi-go/internal/syncstore"
 )
 
 // secretMarkers name the substrings a credential-bearing member carries. The
@@ -43,10 +45,17 @@ func carriesText(trimmed string) bool {
 }
 
 // digest returns a short stable fingerprint, so a changed secret stays visible
-// in a diff while its value never reaches the output.
-func digest(raw json.RawMessage) string {
-	sum := sha256.Sum256(raw)
-	return fmt.Sprintf("sha256:%x", sum[:4])
+// in a diff while its value never reaches the output. It hashes the canonical
+// form rather than the received bytes, because the controller and a stored file
+// spell the same value with different spacing and member order, and hashing
+// those bytes would report an unchanged secret as changed.
+func digest(raw json.RawMessage) (string, error) {
+	canonical, err := syncstore.MarshalCanonical(raw)
+	if err != nil {
+		return "", failure("canonicalize credential value", err)
+	}
+	sum := sha256.Sum256(canonical)
+	return fmt.Sprintf("sha256:%x", sum[:4]), nil
 }
 
 // redact replaces every credential-bearing member of one value with a digest.
@@ -61,7 +70,11 @@ func redact(name string, raw json.RawMessage) (json.RawMessage, error) {
 	// number beside a credential name states whether the feature is on, so it
 	// stays readable.
 	if secretMember(name) && carriesText(trimmed) {
-		encoded, err := json.Marshal(digest(raw))
+		fingerprint, err := digest(raw)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(fingerprint)
 		if err != nil {
 			return nil, failure("encode redacted value", err)
 		}
