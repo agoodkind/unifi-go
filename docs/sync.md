@@ -45,7 +45,7 @@ reach a stored file and never count as a difference.
 ## A write overlays, it does not replace
 
 A push sends the controller's own record with the stored fields applied over it.
-Editing one field therefore leaves every neighbouring field on that record alone,
+Editing one field therefore leaves every neighboring field on that record alone,
 including fields the sync does not manage. A create sends only the stored fields
 and lets the controller assign the rest.
 
