@@ -2,7 +2,6 @@
 package ap
 
 import (
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -667,21 +666,6 @@ func selectWiFiSource(bindings []profile.ResourceBinding, wifiName, copyFrom, ra
 	return source, nil
 }
 
-func validatePSK(psk string) error {
-	if strings.ContainsAny(psk, "\r\n") {
-		return fmt.Errorf("secret contains newline")
-	}
-	if len(psk) >= 8 && len(psk) <= 63 {
-		return nil
-	}
-	if len(psk) == 64 {
-		if _, err := hex.DecodeString(psk); err == nil {
-			return nil
-		}
-	}
-	return fmt.Errorf("must contain 8 through 63 bytes or 64 hexadecimal characters")
-}
-
 func ieeeMode(band network.RadioBand, width network.ChannelWidthMHz) string {
 	if band == network.Band2GHz {
 		return fmt.Sprintf("11nght%d", width)
@@ -807,27 +791,6 @@ func overlayPower(values configmap.Values, prefix string, capability profile.Rad
 	} else if request.Power.Value.Mode.Present {
 		values[prefix+"txpower_mode"], values[prefix+"txpower"] = "auto", "auto"
 	}
-	return nil
-}
-
-func overlaySecurity(values configmap.Values, wireless, aaa string, security network.WiFiSecurity, secrets profile.SecretReader) error {
-	if security.Mode.Present {
-		values[wireless+"security"], values[aaa+"wpa"], values[aaa+"wpa.1.pairwise"], values[aaa+"wpa.key.1.mgmt"] = "none", "2", "CCMP", "WPA-PSK"
-	}
-	if !security.PSK.Present {
-		return nil
-	}
-	if secrets == nil {
-		return &network.ControlError{Code: network.FileReadFailed, Field: "networks"}
-	}
-	psk, err := secrets.ReadSecret(security.PSK.Value)
-	if err != nil {
-		return &network.ControlError{Code: network.FileReadFailed, Field: "networks"}
-	}
-	if err := validatePSK(string(psk)); err != nil {
-		return err
-	}
-	values[aaa+"wpa.psk"] = string(psk)
 	return nil
 }
 
