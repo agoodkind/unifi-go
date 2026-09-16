@@ -114,12 +114,45 @@ func control(ctx context.Context, socket string, request controller.ControlReque
 	return nil
 }
 
+// clearStaleSocket removes a control socket that no controller is listening on.
+// An unclean exit leaves the file behind, and every later start then fails to
+// bind. A socket that still accepts a connection belongs to a running
+// controller and survives.
+func clearStaleSocket(ctx context.Context, socket string) error {
+	slog.Info("control socket check")
+	info, err := os.Stat(socket)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat control socket: %w", err)
+	}
+	if info.Mode().Type() != os.ModeSocket {
+		return errors.New("control socket path holds a regular file")
+	}
+	dialer := &net.Dialer{Timeout: time.Second}
+	// #nosec G704 -- socket is the operator-supplied local control path, not a network address
+	conn, err := dialer.DialContext(ctx, "unix", socket)
+	if err == nil {
+		conn.Close()
+		return errors.New("another controller owns the control socket")
+	}
+	slog.Warn("removing stale control socket")
+	if err := os.Remove(socket); err != nil {
+		return fmt.Errorf("remove control socket: %w", err)
+	}
+	return nil
+}
+
 func serve(ctx context.Context, listen, advertise, stateFile, socket string, output io.Writer) error {
 	c, err := controller.Open(stateFile, advertise, profile.NewRegistry(ap.New(), switches.New()))
 	if err != nil {
 		return failure("open controller", err)
 	}
 	socket = filepath.Clean(socket)
+	if err := clearStaleSocket(ctx, socket); err != nil {
+		return failure("clear stale control socket", err)
+	}
 	listenerConfig := new(net.ListenConfig)
 	controlListener, err := listenerConfig.Listen(ctx, "unix", socket)
 	if err != nil {

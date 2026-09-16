@@ -45,8 +45,14 @@ const (
 	// Band5GHz identifies the 5 GHz radio band.
 	Band5GHz RadioBand = "5ghz"
 
-	// WPA2Personal identifies WPA2 personal security.
+	// WPA2Personal identifies WPA2 personal security with a pre-shared key.
 	WPA2Personal WiFiSecurityMode = "wpa2-personal"
+	// WPA3Personal identifies WPA3 personal security with simultaneous
+	// authentication of equals and required protected management frames.
+	WPA3Personal WiFiSecurityMode = "wpa3-personal"
+	// WPA2WPA3Personal identifies the transition mode that accepts both a
+	// pre-shared key and simultaneous authentication of equals.
+	WPA2WPA3Personal WiFiSecurityMode = "wpa2/wpa3-personal"
 
 	// BSSTransitionEnabled advertises BSS Transition support.
 	BSSTransitionEnabled BSSTransitionMode = "enabled"
@@ -401,11 +407,11 @@ func validateWiFiSecurity(securityConfig Optional[WiFiSecurity], path string) er
 	if security.Mode.Null || security.PSK.Null {
 		return fmt.Errorf("%s.security: null is not supported", path)
 	}
-	if security.Mode.Present && security.Mode.Value != WPA2Personal {
+	if security.Mode.Present && !validSecurityMode(security.Mode.Value) {
 		return fmt.Errorf("%s.security.mode: unknown value %q", path, security.Mode.Value)
 	}
 	if security.PSK.Present && security.PSK.Value == "" {
-		return fmt.Errorf("%s.security.psk: required for WPA2-Personal", path)
+		return fmt.Errorf("%s.security.psk: required for personal security", path)
 	}
 	return nil
 }
@@ -555,6 +561,10 @@ func requiredPolicy(field string) error {
 
 func validRadioBand(band RadioBand) bool {
 	return band == Band2GHz || band == Band5GHz
+}
+
+func validSecurityMode(mode WiFiSecurityMode) bool {
+	return mode == WPA2Personal || mode == WPA3Personal || mode == WPA2WPA3Personal
 }
 
 func validVLAN(vlan VLANID) bool {
