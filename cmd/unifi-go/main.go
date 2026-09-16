@@ -36,7 +36,10 @@ func main() {
 
 func run(ctx context.Context, args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: unifi-go serve|adopt|import|send|status|apply|wifi|radio|port [flags]")
+		return errors.New("usage: unifi-go serve|adopt|import|send|status|apply|wifi|radio|port|sync [flags]")
+	}
+	if args[0] == "sync" {
+		return runSync(ctx, args[1:], output)
 	}
 	if args[0] == "wifi" || args[0] == "radio" || args[0] == "port" {
 		return runResource(ctx, args, output)

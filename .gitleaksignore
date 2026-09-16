@@ -183,3 +183,5 @@ internal/controller/controller_test.go:dotfiles-generic-secret-assignment:387
 internal/controller/controller_test.go:dotfiles-generic-secret-assignment:409
 network/config.go:dotfiles-generic-secret-assignment:281
 server/init-mongo.js:dotfiles-generic-secret-assignment:6
+internal/unifiapi/client.go:dotfiles-generic-secret-assignment:200
+cmd/unifi-go/sync.go:dotfiles-generic-secret-assignment:97

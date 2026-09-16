@@ -270,6 +270,64 @@ Device keys, full baselines, typed identities, and descriptors reload. Reports a
 queued commands disappear. Fresh informs restore observations. Reapply configuration
 explicitly if a command was pending when the controller restarted.
 
+## Sync a UniFi Network Application
+
+Sync copies the configuration records a UniFi Network Application holds, in
+either direction, and shows the difference for the destination before and after
+it writes. It carries every collection the controller serves, not only WiFi:
+networks, port profiles, firewall rules and groups, port forwards, routing,
+RADIUS profiles, user groups, WLAN groups, deep packet inspection groups,
+hotspot records, site settings, client records, and the configurable members of
+each adopted device.
+
+Put the controller account in two owner-only files, then read the controller
+into a local directory:
+
+```sh
+umask 077
+CONTROLLER='https://<controller IPv4 address>:8443'
+unifi-go sync pull --controller-url="$CONTROLLER" --site=default \
+    --username-file=state/unifi-user --password-file=state/unifi-password \
+    --dir=state/controller --dry-run
+```
+
+Dry run prints the difference and writes nothing. Drop `--dry-run` to store the
+records. Each record becomes one JSON file at
+`<dir>/<site>/<collection>/<identity>.json`, with object members sorted so a
+later pull changes a file only when the controller changed. Identity is the name
+for most collections, the setting key for a site setting, and the hardware
+address for a device or client record. A file name percent-escapes every
+character outside letters, digits, and `.`, `_`, and `-`.
+
+Edit the stored files, then write them back:
+
+```sh
+unifi-go sync push --controller-url="$CONTROLLER" --site=default \
+    --username-file=state/unifi-user --password-file=state/unifi-password \
+    --dir=state/controller --dry-run
+```
+
+Push sends only the fields the stored record carries and leaves every other
+field on the controller record unchanged, so an edit to one field never resets
+its neighbours. Use `--collections=wlanconf,device` to sync a subset, and
+`--insecure` when the controller presents its own certificate.
+
+Neither direction removes a destination record by default, because a partial
+source would otherwise delete live configuration. Add `--prune` to remove the
+records the source no longer holds.
+
+A device record mixes configuration with live counters, so only its configurable
+members sync, and a device is never created or removed through this path.
+Adoption and forget stay with the controller. Site settings update in place and
+never appear as a new or removed record.
+
+Rendered output digests every credential member, at any depth, so a changed
+secret stays visible as a different digest and its value never reaches the
+terminal. The stored files hold the controller's real values, including WiFi
+passphrases and RADIUS secrets, in mode-0600 files under mode-0700 directories.
+Keep that directory private. The default `state/controller` sits under the
+ignored `state/` directory, so stored secrets stay out of version control.
+
 ## Validate captures
 
 Run the isolated live acceptance flow:
