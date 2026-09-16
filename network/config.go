@@ -59,6 +59,11 @@ const (
 	// BSSTransitionDisabled suppresses BSS Transition support.
 	BSSTransitionDisabled BSSTransitionMode = "disabled"
 
+	// BSSTransitionEnabled advertises BSS Transition support.
+	BSSTransitionEnabled BSSTransitionMode = "enabled"
+	// BSSTransitionDisabled suppresses BSS Transition support.
+	BSSTransitionDisabled BSSTransitionMode = "disabled"
+
 	// Width20 identifies a 20 MHz channel.
 	Width20 ChannelWidthMHz = 20
 	// Width40 identifies a 40 MHz channel.
