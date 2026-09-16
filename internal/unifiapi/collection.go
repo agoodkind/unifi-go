@@ -58,6 +58,9 @@ var volatileFields = []string{
 // device record reports live counters, which change every inform and carry no
 // operator intent.
 var deviceFields = []string{
+	// The inform key lets a shadow controller answer this device once an
+	// operator promotes it, so it stores and compares like any other field.
+	"x_authkey",
 	"name",
 	"disabled",
 	"led_override",

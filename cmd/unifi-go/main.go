@@ -36,10 +36,13 @@ func main() {
 
 func run(ctx context.Context, args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: unifi-go serve|adopt|import|send|status|apply|wifi|radio|port|sync [flags]")
+		return errors.New("usage: unifi-go serve|adopt|import|import-controller|send|status|mode|promote|demote|apply|wifi|radio|port|sync [flags]")
 	}
 	if args[0] == "sync" {
 		return runSync(ctx, args[1:], output)
+	}
+	if args[0] == "import-controller" {
+		return runImportController(ctx, args[1:], output)
 	}
 	if args[0] == "wifi" || args[0] == "radio" || args[0] == "port" {
 		return runResource(ctx, args, output)
@@ -57,11 +60,12 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	keyFile := flags.String("key-file", "", "inform key file")
 	commandFile := flags.String("file", "", "controller JSON reply file")
 	setupSSH := flags.Bool("setup-ssh", false, "install generated SSH credentials during adoption")
+	mode := flags.String("mode", string(controller.ModeAuthoritative), "shadow keeps the inform listener unbound; authoritative binds it")
 	if err := flags.Parse(args[1:]); err != nil {
 		return failure("parse arguments", err)
 	}
 	if args[0] == "serve" {
-		return serve(ctx, *listen, *advertise, *state, *socket, output)
+		return serve(ctx, serveOptions{listen: *listen, advertise: *advertise, stateFile: *state, socket: *socket, mode: controller.ModeName(*mode)}, output)
 	}
 	request := controller.ControlRequest{Operation: controller.Operation(args[0]), MAC: *mac, KeyFile: *keyFile, Command: nil, Device: "", AP: nil, Switch: nil, Config: nil, TypedCommand: nil, Baseline: nil, SetupSSH: *setupSSH, PreviewToken: "", WiFiAdd: nil, WiFiSet: nil, WiFiRemove: nil, Radio: nil, Port: nil}
 	if args[0] == "send" || args[0] == "adopt" {
@@ -147,12 +151,25 @@ func clearStaleSocket(ctx context.Context, socket string) error {
 	return nil
 }
 
-func serve(ctx context.Context, listen, advertise, stateFile, socket string, output io.Writer) error {
-	c, err := controller.Open(stateFile, advertise, profile.NewRegistry(ap.New(), switches.New()))
+// serveOptions selects where the controller listens and whether it starts
+// answering device informs.
+type serveOptions struct {
+	listen    string
+	advertise string
+	stateFile string
+	socket    string
+	mode      controller.ModeName
+}
+
+func serve(ctx context.Context, options serveOptions, output io.Writer) error {
+	if options.mode != controller.ModeShadow && options.mode != controller.ModeAuthoritative {
+		return errors.New("mode must be shadow or authoritative")
+	}
+	c, err := controller.Open(options.stateFile, options.advertise, profile.NewRegistry(ap.New(), switches.New()))
 	if err != nil {
 		return failure("open controller", err)
 	}
-	socket = filepath.Clean(socket)
+	socket := filepath.Clean(options.socket)
 	if err := clearStaleSocket(ctx, socket); err != nil {
 		return failure("clear stale control socket", err)
 	}
@@ -165,25 +182,27 @@ func serve(ctx context.Context, listen, advertise, stateFile, socket string, out
 	if err := os.Chmod(socket, 0o600); err != nil {
 		return failure("set control socket permissions", err)
 	}
-	informListener, err := listenerConfig.Listen(ctx, "tcp", listen)
-	if err != nil {
-		return failure("listen for informs", err)
-	}
-	defer informListener.Close()
-	informServer := &http.Server{Handler: c, ReadHeaderTimeout: 10 * time.Second}
-	controlServer := &http.Server{Handler: http.HandlerFunc(c.Control), ReadHeaderTimeout: 10 * time.Second}
 	errorsChannel := make(chan error, 2)
-	serveHTTP(informServer, informListener, errorsChannel)
+	binder := newInformBinder(options.listen, c, errorsChannel)
+	c.SetInformListener(binder)
+	informAddress := "none"
+	if options.mode == controller.ModeAuthoritative {
+		informAddress, err = binder.Bind(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	controlServer := &http.Server{Handler: http.HandlerFunc(c.Control), ReadHeaderTimeout: 10 * time.Second}
 	serveHTTP(controlServer, controlListener, errorsChannel)
-	fmt.Fprintf(output, "inform=%s control=%s\n", informListener.Addr(), socket)
+	fmt.Fprintf(output, "mode=%s inform=%s control=%s\n", options.mode, informAddress, socket)
 	select {
 	case <-ctx.Done():
 	case err = <-errorsChannel:
 	}
 	shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if shutdownErr := informServer.Shutdown(shutdown); shutdownErr != nil {
-		return failure("stop inform server", shutdownErr)
+	if releaseErr := binder.Release(shutdown); releaseErr != nil {
+		return releaseErr
 	}
 	if shutdownErr := controlServer.Shutdown(shutdown); shutdownErr != nil {
 		return failure("stop control server", shutdownErr)

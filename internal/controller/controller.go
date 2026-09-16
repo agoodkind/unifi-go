@@ -90,6 +90,7 @@ type Controller struct {
 	awaiting  map[string]network.ConfigVersion
 	previews  map[network.PreviewToken]previewRecord
 	status    map[string]Status
+	listener  InformListener
 }
 
 // Open loads devices from a JSON file, creating an empty state when it is absent.
@@ -98,7 +99,7 @@ func Open(stateFile, advertise string, registries ...profile.Registry) (*Control
 	if err != nil || u.Scheme != "http" || u.Host == "" || u.Path != "/inform" || u.User != nil {
 		return nil, errors.New("advertise must be an HTTP URL ending in /inform")
 	}
-	c := &Controller{mu: sync.Mutex{}, stateFile: stateFile, advertise: advertise, devices: make(map[string]Device), queues: make(map[string][]Reply), status: make(map[string]Status), reports: make(map[string]informmodel.Report), registry: profile.Registry{}, awaiting: make(map[string]network.ConfigVersion), previews: make(map[network.PreviewToken]previewRecord)}
+	c := &Controller{mu: sync.Mutex{}, stateFile: stateFile, advertise: advertise, devices: make(map[string]Device), queues: make(map[string][]Reply), status: make(map[string]Status), reports: make(map[string]informmodel.Report), registry: profile.Registry{}, awaiting: make(map[string]network.ConfigVersion), previews: make(map[network.PreviewToken]previewRecord), listener: nil}
 	if len(registries) > 0 {
 		c.registry = registries[0]
 	}

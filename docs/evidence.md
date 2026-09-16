@@ -188,6 +188,30 @@ No second controller has been tested. Moving a record between two controllers is
 unverified, and records that reference another record by the controller's own
 identifier are expected to need remapping first.
 
+## Shadow and authoritative modes
+
+On September 16, 2026, a shadow controller started beside the live UniFi Network
+Application. It reported `mode=shadow` with no inform address and bound nothing,
+which `lsof` confirmed against the chosen address.
+
+Importing from the stored records registered the live access point's inform key,
+and the stored device state then carried a 32 character key for that hardware
+address. The rendered import printed a digest rather than the key.
+
+Promotion against a free address bound it, answered a request on the inform
+path, and reported the bound address. Demotion released it, and a later
+connection to that address was refused.
+
+Promotion against the address the live controller publishes bound it on the
+first attempt, because a listener asks for address reuse and a specific address
+binds beside a published wildcard address. That attempt was released at once,
+the live access point stayed connected, and promotion now connects to the
+address first and refuses while anything answers. A second attempt against the
+same live address was refused and left the controller shadowed.
+
+No device has been moved from the live controller to unifi-go. Taking over real
+device traffic is unverified.
+
 ## Unverified limits
 
 No captured station report proves a client associated with the requested WPA2

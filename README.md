@@ -315,6 +315,51 @@ To learn more about what the sync covers, how it matches records across
 controllers, and what it deliberately leaves alone, see
 [Controller record sync](docs/sync.md).
 
+## Take over from a running controller
+
+A controller starts shadowed or authoritative. A shadow controller answers its
+control socket and leaves the device address alone, so it reads and stores state
+while another controller still owns the devices. An authoritative controller
+binds the device address and answers informs.
+
+Start shadowed beside the running controller:
+
+```sh
+unifi-go serve --mode=shadow --listen=0.0.0.0:8080 \
+    --advertise='http://<host IPv4 address>:8080/inform' \
+    --state=state/devices.json --socket=/runtime/control.sock
+unifi-go mode --socket=/runtime/control.sock
+```
+
+Read the running controller and register the inform key of every stored device:
+
+```sh
+unifi-go sync pull --controller-url="$CONTROLLER" --site=default \
+    --username-file=state/unifi-user --password-file=state/unifi-password \
+    --dir=state/controller
+unifi-go import-controller --socket=/runtime/control.sock --dir=state/controller
+```
+
+Import registers keys only. It sends nothing to a device and changes nothing on
+the running controller, so a device keeps reporting where it already reports.
+
+Stop the running controller, then take the address:
+
+```sh
+unifi-go promote --socket=/runtime/control.sock
+```
+
+Promotion refuses while another controller still answers on that address, and
+leaves this controller shadowed. Stop the other controller and promote again.
+
+Hand the address back with `unifi-go demote --socket=/runtime/control.sock`.
+Devices stop reaching this controller at once, and their stored keys and
+configuration survive, so a later promotion resumes.
+
+A device reaches whichever controller holds the address it was told to report
+to. Confirm that address matches before promoting; `inform_url` in each stored
+device record carries what the device was last told.
+
 ## Validate captures
 
 Run the isolated live acceptance flow:

@@ -78,6 +78,30 @@ digits, and `.`, `_`, and `-`, which is what keeps a hardware address or a
 wireless name with a slash in it from colliding with another record or from
 breaking on a file system that rejects those characters.
 
+## Shadow and authoritative
+
+A controller answers device informs only while it holds the device address, and
+holding that address is what makes it authoritative. A shadow controller holds
+its listener unbound, so another controller keeps the address and keeps owning
+the devices while this one reads, stores, and prepares.
+
+Promotion is the moment ownership moves. It is not a handshake between the two
+controllers, because neither knows about the other. It is one process taking an
+address the other must have already released, and the devices follow because
+they were told to report to that address.
+
+Binding alone cannot detect the conflict. A listener asks the operating system
+for address reuse, so binding one specific address succeeds beside a wildcard
+listener another process already holds, and both then compete for the same
+device traffic. Promotion therefore connects to the address first and refuses
+when anything answers.
+
+Answering a device needs its inform key, which the controller stores on the
+device record. A shadow controller registers those keys from the stored records
+before promotion, which sends nothing to any device and changes nothing on the
+running controller. Without that step a promoted controller holds the address
+and cannot read what arrives on it.
+
 ## What the sync does not do
 
 Adoption stays with the controller. The sync never creates or removes a device,

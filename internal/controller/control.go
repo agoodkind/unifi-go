@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,12 @@ const (
 	OpSend Operation = "send"
 	// OpAdopt starts the inform key transition and provisioning.
 	OpAdopt Operation = "adopt"
+	// OpMode reads whether this controller answers device informs.
+	OpMode Operation = "mode"
+	// OpPromote binds the device listener.
+	OpPromote Operation = "promote"
+	// OpDemote releases the device listener.
+	OpDemote Operation = "demote"
 )
 
 // ControlRequest is sent over the private local socket; secrets use file references.
@@ -69,6 +76,38 @@ func (c *Controller) Control(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if modeOperation(request.Operation) {
+		c.serveMode(r.Context(), w, request.Operation)
+		return
+	}
+	if request.Operation == OpStatus {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(c.Status()); err != nil {
+			return
+		}
+		return
+	}
+	response, err := c.dispatch(request)
+	if err != nil {
+		if typedControlOperation(request.Operation) {
+			writeControlError(w, err)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if typedControlOperation(request.Operation) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			return
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// dispatch runs one control operation and returns what the caller reads back.
+func (c *Controller) dispatch(request ControlRequest) (controlResponse, error) {
 	var err error
 	var response controlResponse
 	switch request.Operation {
@@ -98,12 +137,6 @@ func (c *Controller) Control(w http.ResponseWriter, r *http.Request) {
 		response.Device = &snapshot
 	case "devices":
 		response.Devices, err = c.deviceSnapshots()
-	case OpStatus:
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(c.Status()); err != nil {
-			return
-		}
-		return
 	case OpImport:
 		var data []byte
 		data, err = readSecret(request.KeyFile)
@@ -122,32 +155,19 @@ func (c *Controller) Control(w http.ResponseWriter, r *http.Request) {
 		} else {
 			err = c.Adopt(request.MAC, *request.Command, request.SetupSSH)
 		}
+	case OpStatus, OpMode, OpPromote, OpDemote:
+		err = errors.New("operation is answered before dispatch")
 	default:
 		err = errors.New("unknown operation")
 	}
-	if err != nil {
-		if typedControlOperation(request.Operation) {
-			writeControlError(w, err)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if typedControlOperation(request.Operation) {
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(response); err != nil {
-			return
-		}
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	return response, err
 }
 
 func typedControlOperation(operation Operation) bool {
 	switch operation {
 	case "apply-ap", "apply-switch", "preview-ap", "preview-switch", "apply-config", "device", "devices", "command", "baseline-import", "wifi-list", "wifi-add", "wifi-set", "wifi-remove", "radio-set", "port-set":
 		return true
-	case OpStatus, OpImport, OpSend, OpAdopt:
+	case OpStatus, OpImport, OpSend, OpAdopt, OpMode, OpPromote, OpDemote:
 		return false
 	default:
 		return false
@@ -196,7 +216,7 @@ func (c *Controller) resourceControl(request ControlRequest) (controlResponse, e
 		response.Version, err = c.setRadio(request.Device, *request.Radio)
 	case "port-set":
 		response.Version, err = c.setSwitchPort(request.Device, *request.Port)
-	case OpStatus, OpImport, OpSend, OpAdopt:
+	case OpStatus, OpImport, OpSend, OpAdopt, OpMode, OpPromote, OpDemote:
 		err = &network.ControlError{Code: network.InvalidConfig}
 	default:
 		err = &network.ControlError{Code: network.InvalidConfig}
@@ -410,4 +430,35 @@ func readSecret(path string) ([]byte, error) {
 		return nil, errors.New("cannot read credential file")
 	}
 	return data, nil
+}
+
+// modeOperation reports whether this operation reads or changes the listener.
+func modeOperation(operation Operation) bool {
+	return operation == OpMode || operation == OpPromote || operation == OpDemote
+}
+
+// serveMode answers the three listener operations with the resulting mode.
+func (c *Controller) serveMode(ctx context.Context, w http.ResponseWriter, operation Operation) {
+	var report ModeReport
+	var err error
+	switch operation {
+	case OpPromote:
+		report, err = c.Promote(ctx)
+	case OpDemote:
+		report, err = c.Demote(ctx)
+	case OpMode:
+		report = c.Mode()
+	case OpStatus, OpImport, OpSend, OpAdopt:
+		err = errors.New("operation is not a listener operation")
+	default:
+		err = errors.New("operation is not a listener operation")
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(report); err != nil {
+		return
+	}
 }
