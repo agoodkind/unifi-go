@@ -746,18 +746,6 @@ func oracleNextRecord(values configmap.Values, namespace string) string {
 			return candidate
 		}
 	}
-	if index != 3 {
-		t.Fatal("live adopted inventory does not contain three devices")
-	}
-}
-
-func mustLiveJSON(t *testing.T, value any) []byte {
-	t.Helper()
-	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return data
 }
 
 func oracleCopyRecord(values configmap.Values, source, destination string, references map[string]string) {

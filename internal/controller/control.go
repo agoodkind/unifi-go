@@ -224,67 +224,6 @@ func (c *Controller) resourceControl(request ControlRequest) (controlResponse, e
 	return response, err
 }
 
-func typedControlOperation(operation Operation) bool {
-	switch operation {
-	case "apply-ap", "apply-switch", "preview-ap", "preview-switch", "apply-config", "device", "devices", "command", "baseline-import", "wifi-list", "wifi-add", "wifi-set", "wifi-remove", "radio-set", "port-set":
-		return true
-	case OpStatus, OpImport, OpSend, OpAdopt:
-		return false
-	default:
-		return false
-	}
-}
-
-func validResourceRequest(request ControlRequest, expected string) bool {
-	if request.AP != nil || request.Switch != nil || request.Config != nil || request.MAC != "" || request.KeyFile != "" || request.Command != nil || request.TypedCommand != nil || request.Baseline != nil || request.SetupSSH || request.PreviewToken != "" {
-		return false
-	}
-	fields := map[string]bool{
-		"wifi-add":    request.WiFiAdd != nil,
-		"wifi-set":    request.WiFiSet != nil,
-		"wifi-remove": request.WiFiRemove != nil,
-		"radio-set":   request.Radio != nil,
-		"port-set":    request.Port != nil,
-	}
-	for name, present := range fields {
-		if present != (name == expected) {
-			return false
-		}
-	}
-	return true
-}
-
-func (c *Controller) resourceControl(request ControlRequest) (controlResponse, error) {
-	var response controlResponse
-	expected := string(request.Operation)
-	if request.Operation == "wifi-list" {
-		expected = ""
-	}
-	if !validResourceRequest(request, expected) {
-		return response, &network.ControlError{Code: network.InvalidConfig}
-	}
-	var err error
-	switch request.Operation {
-	case "wifi-list":
-		response.WiFiNetworks, err = c.wifiNetworks(request.Device)
-	case "wifi-add":
-		response.Version, err = c.addWiFi(request.Device, *request.WiFiAdd)
-	case "wifi-set":
-		response.Version, err = c.setWiFi(request.Device, *request.WiFiSet)
-	case "wifi-remove":
-		response.Version, err = c.removeWiFi(request.Device, *request.WiFiRemove)
-	case "radio-set":
-		response.Version, err = c.setRadio(request.Device, *request.Radio)
-	case "port-set":
-		response.Version, err = c.setSwitchPort(request.Device, *request.Port)
-	case OpStatus, OpImport, OpSend, OpAdopt:
-		err = &network.ControlError{Code: network.InvalidConfig}
-	default:
-		err = &network.ControlError{Code: network.InvalidConfig}
-	}
-	return response, err
-}
-
 func decodeControlRequest(w http.ResponseWriter, r *http.Request) (ControlRequest, bool) {
 	var request ControlRequest
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8388608))
