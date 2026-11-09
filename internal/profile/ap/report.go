@@ -202,7 +202,7 @@ func decodeClients(report informmodel.Report) ([]network.ClientSnapshot, error) 
 	for _, vap := range report.VAPTable {
 		radioID := clientRadioID(vap, report.RadioTable)
 		for _, station := range vap.Stations {
-			ip, err := decodeOptionalAddress(station.IP)
+			ipAddress, err := decodeOptionalAddress(station.IP)
 			if err != nil {
 				slog.Error("station address decoding failed", "error", err)
 				return nil, fmt.Errorf("station IP: %w", err)
@@ -212,7 +212,7 @@ func decodeClients(report informmodel.Report) ([]network.ClientSnapshot, error) 
 				clients,
 				network.ClientSnapshot{
 					MAC:       station.MAC,
-					IP:        ip,
+					IP:        ipAddress,
 					Name:      station.Hostname,
 					SSID:      vap.ESSID,
 					RadioID:   radioID,
@@ -258,7 +258,7 @@ func decodeUplink(report informmodel.Report) (*network.UplinkSnapshot, error) {
 	if report.Uplink != nil &&
 		(report.Uplink.MAC != "" || report.Uplink.IP != "" || report.Uplink.Name != "" || report.Uplink.Speed != nil) {
 		uplink := &report.Uplink.Uplink
-		ip, err := decodeOptionalAddress(uplink.IP)
+		uplinkAddress, err := decodeOptionalAddress(uplink.IP)
 		if err != nil {
 			slog.Error("uplink address decoding failed", "error", err)
 			return nil, fmt.Errorf("uplink IP: %w", err)
@@ -266,7 +266,7 @@ func decodeUplink(report informmodel.Report) (*network.UplinkSnapshot, error) {
 
 		return &network.UplinkSnapshot{
 			MAC:       uplink.MAC,
-			IP:        ip,
+			IP:        uplinkAddress,
 			Name:      uplink.Name,
 			SpeedMbps: uplink.Speed,
 		}, nil

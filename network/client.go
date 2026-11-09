@@ -93,7 +93,7 @@ func (client *Client) ApplySwitch(
 // ApplyConfig queues complete configuration records and returns their supplied version.
 func (client *Client) ApplyConfig(
 	ctx context.Context,
-	id DeviceID,
+	deviceID DeviceID,
 	config Config,
 ) (ConfigVersion, error) {
 	if err := config.Validate(); err != nil {
@@ -102,7 +102,7 @@ func (client *Client) ApplyConfig(
 
 	response, err := client.call(
 		ctx,
-		controlRequest{Operation: "apply-config", Device: id, Config: &config},
+		controlRequest{Operation: "apply-config", Device: deviceID, Config: &config},
 	)
 
 	return response.Version, err
@@ -120,7 +120,7 @@ func (client *Client) SendCommand(ctx context.Context, id DeviceID, command Comm
 // ImportBaseline records a baseline without queueing or claiming device application.
 func (client *Client) ImportBaseline(
 	ctx context.Context,
-	id DeviceID,
+	deviceID DeviceID,
 	baseline BaselineImport,
 ) error {
 	if err := baseline.Config.Validate(); err != nil {
@@ -129,7 +129,7 @@ func (client *Client) ImportBaseline(
 
 	_, err := client.call(
 		ctx,
-		controlRequest{Operation: "baseline-import", Device: id, Baseline: &baseline},
+		controlRequest{Operation: "baseline-import", Device: deviceID, Baseline: &baseline},
 	)
 
 	return err

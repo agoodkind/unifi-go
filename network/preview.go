@@ -37,7 +37,7 @@ func (client *Client) PreviewSwitch(
 // ApplyAPPreview applies access point policy only when its preview still matches.
 func (client *Client) ApplyAPPreview(
 	ctx context.Context,
-	id DeviceID,
+	deviceID DeviceID,
 	config APConfig,
 	token PreviewToken,
 ) (ConfigVersion, error) {
@@ -47,7 +47,7 @@ func (client *Client) ApplyAPPreview(
 
 	response, err := client.call(
 		ctx,
-		controlRequest{Operation: "apply-ap", Device: id, AP: &config, PreviewToken: token},
+		controlRequest{Operation: "apply-ap", Device: deviceID, AP: &config, PreviewToken: token},
 	)
 	if err != nil {
 		return "", err
@@ -59,7 +59,7 @@ func (client *Client) ApplyAPPreview(
 // ApplySwitchPreview applies switch policy only when its preview still matches.
 func (client *Client) ApplySwitchPreview(
 	ctx context.Context,
-	id DeviceID,
+	deviceID DeviceID,
 	config SwitchConfig,
 	token PreviewToken,
 ) (ConfigVersion, error) {
@@ -69,7 +69,12 @@ func (client *Client) ApplySwitchPreview(
 
 	response, err := client.call(
 		ctx,
-		controlRequest{Operation: "apply-switch", Device: id, Switch: &config, PreviewToken: token},
+		controlRequest{
+			Operation:    "apply-switch",
+			Device:       deviceID,
+			Switch:       &config,
+			PreviewToken: token,
+		},
 	)
 	if err != nil {
 		return "", err

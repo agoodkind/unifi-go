@@ -306,26 +306,9 @@ func (c *Controller) Adopt(mac string, template Reply, setupSSH bool) error {
 	device, existed := c.devices[mac]
 	previous := device
 	if !existed {
-		keyBytes := make([]byte, 16)
-		if _, err := rand.Read(keyBytes); err != nil {
-			return fault("generate inform key", err)
-		}
-
-		device = Device{
-			MAC:             mac,
-			Key:             inform.DefaultKey,
-			LastSetParam:    nil,
-			SSHUsername:     "",
-			SSHPassword:     "",
-			SSHPasswordHash: "",
-			NextKey:         hex.EncodeToString(keyBytes),
-			Family:          "",
-			Descriptor:      nil,
-			DesiredAP:       nil,
-			DesiredSwitch:   nil,
-			DesiredVersion:  "",
-			Baseline:        nil,
-			wifiCopies:      nil,
+		device, err = newAdoptingDevice(mac)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -387,6 +370,30 @@ func (c *Controller) Adopt(mac string, template Reply, setupSSH bool) error {
 	c.queues[mac] = []Reply{template}
 
 	return nil
+}
+
+func newAdoptingDevice(mac string) (Device, error) {
+	keyBytes := make([]byte, 16)
+	if _, err := rand.Read(keyBytes); err != nil {
+		return Device{}, fault("generate inform key", err)
+	}
+
+	return Device{
+		MAC:             mac,
+		Key:             inform.DefaultKey,
+		LastSetParam:    nil,
+		SSHUsername:     "",
+		SSHPassword:     "",
+		SSHPasswordHash: "",
+		NextKey:         hex.EncodeToString(keyBytes),
+		Family:          "",
+		Descriptor:      nil,
+		DesiredAP:       nil,
+		DesiredSwitch:   nil,
+		DesiredVersion:  "",
+		Baseline:        nil,
+		wifiCopies:      nil,
+	}, nil
 }
 
 func setConfigValue(config, key, value string) string {
@@ -531,6 +538,44 @@ func (c *Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		delete(c.awaiting, mac)
 	}
 
+	reply, consumeCommand := c.replyForInform(mac, device, adoptionCompleted)
+
+	if adoptionCompleted {
+		device.Key = device.NextKey
+		device.NextKey = ""
+		c.devices[mac] = device
+		if err := c.saveLocked(); err != nil {
+			http.Error(w, "cannot save adoption", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	reply.ServerTime = clock.Now().UnixMilli()
+	payload, err := json.Marshal(reply)
+	if err != nil {
+		http.Error(w, "cannot encode reply", http.StatusInternalServerError)
+		return
+	}
+
+	useGCM := binary.BigEndian.Uint16(body[14:16])&8 != 0
+	encoded, err := encodeControllerReply(packet.MAC, payload, responseKey, useGCM)
+	if err != nil {
+		http.Error(w, "cannot encode reply", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-binary")
+	if _, err := w.Write(encoded); err == nil && consumeCommand {
+		c.queues[mac] = c.queues[mac][1:]
+	}
+}
+
+// replyForInform reads the queue while the caller keeps c.mu locked.
+func (c *Controller) replyForInform(
+	mac string,
+	device Device,
+	adoptionCompleted bool,
+) (Reply, bool) {
 	reply := Reply{
 		Type:             ReplyNoop,
 		Command:          "",
@@ -564,34 +609,7 @@ func (c *Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		consumeCommand = true
 	}
 
-	if adoptionCompleted {
-		device.Key = device.NextKey
-		device.NextKey = ""
-		c.devices[mac] = device
-		if err := c.saveLocked(); err != nil {
-			http.Error(w, "cannot save adoption", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	reply.ServerTime = clock.Now().UnixMilli()
-	payload, err := json.Marshal(reply)
-	if err != nil {
-		http.Error(w, "cannot encode reply", http.StatusInternalServerError)
-		return
-	}
-
-	useGCM := binary.BigEndian.Uint16(body[14:16])&8 != 0
-	encoded, err := encodeControllerReply(packet.MAC, payload, responseKey, useGCM)
-	if err != nil {
-		http.Error(w, "cannot encode reply", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/x-binary")
-	if _, err := w.Write(encoded); err == nil && consumeCommand {
-		c.queues[mac] = c.queues[mac][1:]
-	}
+	return reply, consumeCommand
 }
 
 func decodeDeviceInform(body []byte, device Device) (*inform.Packet, string, bool, error) {

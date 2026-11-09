@@ -101,12 +101,12 @@ func overlaySecurity(
 	}
 
 	if secrets == nil {
-		return &network.ControlError{Code: network.FileReadFailed, Field: "networks"}
+		return &network.ControlError{Code: network.FileReadFailed, Field: networksField}
 	}
 
 	psk, err := secrets.ReadSecret(security.PSK.Value)
 	if err != nil {
-		return &network.ControlError{Code: network.FileReadFailed, Field: "networks"}
+		return &network.ControlError{Code: network.FileReadFailed, Field: networksField}
 	}
 
 	if err := validatePSK(string(psk)); err != nil {

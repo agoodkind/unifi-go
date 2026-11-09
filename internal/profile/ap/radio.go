@@ -124,7 +124,7 @@ func resolveNetworkRadios(
 	case wifi.Bands.Present && len(wifi.Bands.Value) > 0:
 		result, err = radiosByBand(wifi.Bands.Value, radios)
 	default:
-		return nil, &network.ControlError{Code: network.PolicyRequired, Field: "networks"}
+		return nil, &network.ControlError{Code: network.PolicyRequired, Field: networksField}
 	}
 
 	if err != nil {
@@ -132,7 +132,7 @@ func resolveNetworkRadios(
 	}
 
 	if len(result) == 0 {
-		return nil, &network.ControlError{Code: network.InvalidConfig, Field: "networks"}
+		return nil, &network.ControlError{Code: network.InvalidConfig, Field: networksField}
 	}
 
 	slices.SortFunc(
@@ -164,11 +164,11 @@ func radiosByID(identifiers []network.RadioID, radios []resolvedRadio) ([]resolv
 		}
 
 		if len(matches) != 1 {
-			return nil, &network.ControlError{Code: network.InvalidConfig, Field: "networks"}
+			return nil, &network.ControlError{Code: network.InvalidConfig, Field: networksField}
 		}
 
 		if matches[0].Capability.SyntheticID {
-			return nil, &network.ControlError{Code: network.BaselineUnusable, Field: "networks"}
+			return nil, &network.ControlError{Code: network.BaselineUnusable, Field: networksField}
 		}
 
 		result = append(result, matches[0])
@@ -189,7 +189,10 @@ func radiosByBand(bands []network.RadioBand, radios []resolvedRadio) ([]resolved
 			}
 
 			if radio.Capability.SyntheticID {
-				return nil, &network.ControlError{Code: network.BaselineUnusable, Field: "networks"}
+				return nil, &network.ControlError{
+					Code:  network.BaselineUnusable,
+					Field: networksField,
+				}
 			}
 
 			matched = true
@@ -197,7 +200,7 @@ func radiosByBand(bands []network.RadioBand, radios []resolvedRadio) ([]resolved
 		}
 
 		if !matched {
-			return nil, &network.ControlError{Code: network.InvalidConfig, Field: "networks"}
+			return nil, &network.ControlError{Code: network.InvalidConfig, Field: networksField}
 		}
 	}
 

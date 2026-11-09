@@ -137,16 +137,17 @@ func runWiFiAdd(ctx context.Context, args []string, output io.Writer) error {
 		return err
 	}
 
-	secret := network.SecretFile(*passwordFile)
 	version, err := client.AddWiFi(
 		ctx,
 		id,
 		network.AddWiFiRequest{
-			Name:     selectedName,
-			Password: secret,
+			Name: selectedName,
+			Password: network.SecretFile( // gitleaks:allow -- controller-visible file reference
+				*passwordFile,
+			),
 			CopyFrom: selectedSource,
 		},
-	) // gitleaks:allow -- controller-visible file reference
+	)
 	if err != nil {
 		slog.Error("add WiFi resource failed", "err", err)
 		return fmt.Errorf("add WiFi resource: %w", err)

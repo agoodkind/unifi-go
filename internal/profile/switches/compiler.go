@@ -65,19 +65,8 @@ func (compiler) Compile(
 		return profile.Compilation{}, fmt.Errorf("compose switch: %w", err)
 	}
 
-	for _, stored := range input.Bindings {
-		index := slices.IndexFunc(
-			bindings,
-			func(binding profile.ResourceBinding) bool {
-				return binding.Kind == stored.Kind && binding.Identity == stored.Identity
-			},
-		)
-		if index < 0 || !slices.Equal(bindings[index].Prefixes, stored.Prefixes) {
-			return profile.Compilation{}, &network.ControlError{
-				Code:  network.BaselineUnusable,
-				Field: "",
-			}
-		}
+	if err := verifyBindings(input.Bindings, bindings); err != nil {
+		return profile.Compilation{}, err
 	}
 
 	if request.Ports.Present {
@@ -369,4 +358,23 @@ func portTaggedVLANs(
 	}
 
 	return tagged, nil
+}
+
+func verifyBindings(storedBindings, bindings []profile.ResourceBinding) error {
+	for _, stored := range storedBindings {
+		index := slices.IndexFunc(
+			bindings,
+			func(binding profile.ResourceBinding) bool {
+				return binding.Kind == stored.Kind && binding.Identity == stored.Identity
+			},
+		)
+		if index < 0 || !slices.Equal(bindings[index].Prefixes, stored.Prefixes) {
+			return &network.ControlError{
+				Code:  network.BaselineUnusable,
+				Field: "",
+			}
+		}
+	}
+
+	return nil
 }

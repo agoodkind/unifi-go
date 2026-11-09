@@ -59,7 +59,11 @@ type ControlError struct {
 }
 
 var safeField = regexp.MustCompile(
-	`^(country_code|networks|radios|ports|ssh(\.(username|password))?|radios\[[0-9]{1,6}\](\.(id|band|enabled|channel|width_mhz|power(\.(mode|dbm))?))?|networks\[[0-9]{1,6}\](\.(name|enabled|vlan|bands(\[[0-9]{1,6}\])?|radio_ids(\[[0-9]{1,6}\])?|bss_transition|security(\.(mode|psk))?))?|ports\[[0-9]{1,6}\](\.(index|enabled|native_vlan|tagged_vlans(\[[0-9]{1,6}\])?|poe))?)$`,
+	`^(country_code|networks|radios|ports|ssh(\.(username|password))?` +
+		`|radios\[[0-9]{1,6}\](\.(id|band|enabled|channel|width_mhz|power(\.(mode|dbm))?))?` +
+		`|networks\[[0-9]{1,6}\](\.(name|enabled|vlan|bands(\[[0-9]{1,6}\])?` +
+		`|radio_ids(\[[0-9]{1,6}\])?|bss_transition|security(\.(mode|psk))?))?` +
+		`|ports\[[0-9]{1,6}\](\.(index|enabled|native_vlan|tagged_vlans(\[[0-9]{1,6}\])?|poe))?)$`,
 )
 
 // Error renders the safe category and field without underlying values.

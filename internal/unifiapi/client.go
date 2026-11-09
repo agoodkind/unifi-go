@@ -276,8 +276,8 @@ func (client *Client) login(ctx context.Context, username, password string) erro
 		return errors.New("controller username and password are required")
 	}
 
-	// #nosec G117 -- the controller login endpoint takes the operator password in the request body
 	secret := password
+	// #nosec G117 -- the controller login endpoint takes the operator password in the request body
 	body, err := json.Marshal(loginRequest{
 		Username: username,
 		Password: secret,

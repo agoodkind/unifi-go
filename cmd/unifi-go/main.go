@@ -22,6 +22,7 @@ import (
 	"goodkind.io/unifi-go/internal/profile"
 	"goodkind.io/unifi-go/internal/profile/ap"
 	"goodkind.io/unifi-go/internal/profile/switches"
+	"goodkind.io/unifi-go/internal/synccli"
 )
 
 func main() {
@@ -318,4 +319,20 @@ func serveHTTP(server *http.Server, listener net.Listener, result chan<- error) 
 func failure(message string, err error) error {
 	slog.Error(message, "error", err)
 	return fmt.Errorf("%s: %w", message, err)
+}
+
+func runSync(ctx context.Context, args []string, output io.Writer) error {
+	if err := synccli.Run(ctx, args, output); err != nil {
+		slog.Error("controller synchronization failed", "err", err)
+		return fmt.Errorf("%w", err)
+	}
+
+	return nil
+}
+
+func syncFailure(message string, err error) error {
+	failure := synccli.Failure(message, err)
+	slog.Error("controller operation failed", "err", failure)
+
+	return fmt.Errorf("%w", failure)
 }

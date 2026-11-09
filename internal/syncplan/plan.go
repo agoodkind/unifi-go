@@ -124,7 +124,7 @@ func Compare(
 			continue
 		}
 
-		id, _ := destinationByIdentity[identity].Text("_id")
+		recordIdentity, _ := destinationByIdentity[identity].Text("_id")
 		changes = append(
 			changes,
 			Change{
@@ -133,7 +133,7 @@ func Compare(
 				Action:     ActionDelete,
 				Fields:     nil,
 				Record:     nil,
-				ID:         id,
+				ID:         recordIdentity,
 			},
 		)
 	}
@@ -293,7 +293,7 @@ func updateChange(
 		fields,
 		func(left, right FieldChange) int { return strings.Compare(left.Field, right.Field) },
 	)
-	id, _ := destination.Text("_id")
+	destinationID, _ := destination.Text("_id")
 
 	return Change{
 		Collection: collection.Name,
@@ -301,7 +301,7 @@ func updateChange(
 		Action:     ActionUpdate,
 		Fields:     fields,
 		Record:     record,
-		ID:         id,
+		ID:         destinationID,
 	}, true, nil
 }
 

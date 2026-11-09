@@ -79,12 +79,12 @@ func resolveBoundRadio(
 func validateEffectiveSecurity(values configmap.Values, aaa string) error {
 	if values[aaa+"wpa"] != "2" || values[aaa+"wpa.1.pairwise"] != "CCMP" ||
 		!supportedKeyManagement(values[aaa+"wpa.key.1.mgmt"]) {
-		return &network.ControlError{Code: network.PolicyRequired, Field: "networks"}
+		return &network.ControlError{Code: network.PolicyRequired, Field: networksField}
 	}
 
 	psk := values[aaa+"wpa.psk"]
 	if psk == "" {
-		return &network.ControlError{Code: network.PolicyRequired, Field: "networks"}
+		return &network.ControlError{Code: network.PolicyRequired, Field: networksField}
 	}
 
 	return validatePSK(psk)

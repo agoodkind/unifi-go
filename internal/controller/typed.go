@@ -59,13 +59,13 @@ func (fileSecrets) ReadSecret(path network.SecretFile) ([]byte, error) {
 }
 
 func (c *Controller) apply(
-	id network.DeviceID,
+	deviceID network.DeviceID,
 	family network.DeviceFamily,
 	ap *network.APConfig,
 	sw *network.SwitchConfig,
 	token network.PreviewToken,
 ) (network.ConfigVersion, error) {
-	mac, err := normalizeMAC(string(id))
+	mac, err := normalizeMAC(string(deviceID))
 	if err != nil {
 		return "", &network.ControlError{Code: network.InvalidDevice, Field: ""}
 	}

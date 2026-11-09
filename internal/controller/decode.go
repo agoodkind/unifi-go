@@ -111,13 +111,13 @@ func decryptInform(data []byte, keyHex string, flags uint16) ([]byte, error) {
 	return plain, nil
 }
 
-func decryptInformCBC(block cipher.Block, iv, body []byte) ([]byte, error) {
+func decryptInformCBC(block cipher.Block, initializationVector, body []byte) ([]byte, error) {
 	if len(body) == 0 || len(body)%aes.BlockSize != 0 {
 		return nil, errors.New("invalid inform ciphertext length")
 	}
 
 	plain := make([]byte, len(body))
-	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, body)
+	cipher.NewCBCDecrypter(block, initializationVector).CryptBlocks(plain, body)
 	padding := int(plain[len(plain)-1])
 	if padding == 0 || padding > aes.BlockSize || padding > len(plain) {
 		return nil, errors.New("invalid inform padding")
