@@ -45,11 +45,15 @@ func Describe(report informmodel.Report) (DeviceDescriptor, error) {
 }
 
 // DescribeWithFamily uses familyHint only when the report has no family evidence.
-func DescribeWithFamily(report informmodel.Report, familyHint network.DeviceFamily) (DeviceDescriptor, error) {
+func DescribeWithFamily(
+	report informmodel.Report,
+	familyHint network.DeviceFamily,
+) (DeviceDescriptor, error) {
 	family, err := reportedFamily(report, familyHint)
 	if err != nil {
 		return DeviceDescriptor{}, err
 	}
+
 	descriptor := DeviceDescriptor{
 		Family:          family,
 		Model:           report.Model,
@@ -67,56 +71,73 @@ func DescribeWithFamily(report informmodel.Report, familyHint network.DeviceFami
 	if report.Uplink != nil {
 		descriptor.UplinkInterface = report.Uplink.Interface
 	}
+
 	radioIDs := StableRadioIDs(report.RadioTable)
+
 	radioCodeCounts := radioCodeCounts(report.RadioTable)
 	for radioIndex, radio := range report.RadioTable {
 		capability := RadioCapability{
-			ID:          radioIDs[radioIndex],
-			SyntheticID: radio.Name == "" && (radio.Radio == "" || radioCodeCounts[radio.Radio] != 1),
+			ID: radioIDs[radioIndex],
+			SyntheticID: radio.Name == "" &&
+				(radio.Radio == "" || radioCodeCounts[radio.Radio] != 1),
 			Interface:   radio.Name,
 			Band:        radioBand(radio.Radio),
 			Channels:    append([]uint16(nil), radio.Channels...),
 			Widths:      nil,
-			MinPowerDBm: radio.MinTXPower, MaxPowerDBm: radio.MaxTXPower,
+			MinPowerDBm: radio.MinTXPower,
+			MaxPowerDBm: radio.MaxTXPower,
 		}
 		for _, width := range radio.Widths {
 			capability.Widths = append(capability.Widths, network.ChannelWidthMHz(width))
 		}
+
 		descriptor.Radios = append(descriptor.Radios, capability)
 	}
+
 	ports := reportedPorts(report, family)
+
 	soleUpIndex := soleUpPortIndex(ports)
 	for portIndex, port := range ports {
 		interfaceName := port.Interface
 		if interfaceName == "" && len(ports) == 1 && report.Uplink != nil {
 			interfaceName = report.Uplink.Interface
 		}
+
 		if interfaceName == "" && portIndex == soleUpIndex && report.Uplink != nil {
 			interfaceName = report.Uplink.Interface
 		}
+
 		capability := PortCapability{
-			Index: port.Index, Interface: interfaceName, VLAN: nil, PoEModes: nil,
+			Index:     port.Index,
+			Interface: interfaceName,
+			VLAN:      nil,
+			PoEModes:  nil,
 		}
 		if report.SwitchCaps != nil && report.SwitchCaps.VLANCaps != nil {
 			supported := *report.SwitchCaps.VLANCaps != 0
 			capability.VLAN = &supported
 		}
+
 		if port.PoECaps != nil {
 			if *port.PoECaps&poeNegotiatedCapabilities != 0 {
 				capability.PoEModes = append(capability.PoEModes, network.PoEAuto)
 			}
+
 			if *port.PoECaps&poeOutputCapabilities != 0 {
 				capability.PoEModes = append(capability.PoEModes, network.PoEOff)
 			}
 		}
+
 		descriptor.Ports = append(descriptor.Ports, capability)
 	}
+
 	return descriptor, nil
 }
 
 // StableRadioIDs derives the strongest reported identity for each physical radio.
 func StableRadioIDs(radios []informmodel.Radio) []string {
 	bandCounts := radioCodeCounts(radios)
+
 	result := make([]string, len(radios))
 	for index, radio := range radios {
 		switch {
@@ -128,6 +149,7 @@ func StableRadioIDs(radios []informmodel.Radio) []string {
 			result[index] = fmt.Sprintf("radio-%d", index)
 		}
 	}
+
 	return result
 }
 
@@ -138,6 +160,7 @@ func radioCodeCounts(radios []informmodel.Radio) map[string]int {
 			result[radio.Radio]++
 		}
 	}
+
 	return result
 }
 
@@ -145,32 +168,55 @@ func reportedPorts(report informmodel.Report, family network.DeviceFamily) []inf
 	if family != network.FamilyAP || len(report.EthernetTable.Entries) == 0 {
 		return report.PortTable
 	}
+
 	ports := make([]informmodel.Port, 0, len(report.EthernetTable.Entries))
 	for portIndex, ethernet := range report.EthernetTable.Entries {
-		ports = append(ports, informmodel.Port{
-			Index: uint16(portIndex + 1), Interface: ethernet.Name, Name: "", PoECaps: nil,
-			PoEEnabled: nil, Up: nil, Speed: nil, FullDuplex: nil, RxBytes: nil,
-			TxBytes: nil, PoEPower: nil, NativeVLAN: nil, TaggedVLANs: nil, PoEMode: "",
-		})
+		ports = append(
+			ports,
+			informmodel.Port{
+				Index:       uint16(portIndex + 1),
+				Interface:   ethernet.Name,
+				Name:        "",
+				PoECaps:     nil,
+				PoEEnabled:  nil,
+				Up:          nil,
+				Speed:       nil,
+				FullDuplex:  nil,
+				RxBytes:     nil,
+				TxBytes:     nil,
+				PoEPower:    nil,
+				NativeVLAN:  nil,
+				TaggedVLANs: nil,
+				PoEMode:     "",
+			},
+		)
 	}
+
 	return ports
 }
 
 func soleUpPortIndex(ports []informmodel.Port) int {
 	result := -1
+
 	for index, port := range ports {
 		if port.Up == nil || !*port.Up {
 			continue
 		}
+
 		if result != -1 {
 			return -2
 		}
+
 		result = index
 	}
+
 	return result
 }
 
-func reportedFamily(report informmodel.Report, familyHint network.DeviceFamily) (network.DeviceFamily, error) {
+func reportedFamily(
+	report informmodel.Report,
+	familyHint network.DeviceFamily,
+) (network.DeviceFamily, error) {
 	var family network.DeviceFamily
 	switch reportedType(report.Type) {
 	case reportedTypeAP:
@@ -181,21 +227,30 @@ func reportedFamily(report informmodel.Report, familyHint network.DeviceFamily) 
 		if len(report.RadioTable) > 0 && len(report.PortTable) == 0 {
 			family = network.FamilyAP
 		}
+
 		if len(report.PortTable) > 0 && len(report.RadioTable) == 0 {
 			family = network.FamilySwitch
 		}
 	default:
 		return "", fmt.Errorf("describe device: unknown reported type %q", report.Type)
 	}
+
 	if family == "" {
 		family = familyHint
 	}
+
 	if family != network.FamilyAP && family != network.FamilySwitch {
 		return "", fmt.Errorf("describe device: family is not reported or unambiguous")
 	}
+
 	if familyHint != "" && familyHint != family {
-		return "", fmt.Errorf("describe device: family hint %q conflicts with report family %q", familyHint, family)
+		return "", fmt.Errorf(
+			"describe device: family hint %q conflicts with report family %q",
+			familyHint,
+			family,
+		)
 	}
+
 	return family, nil
 }
 

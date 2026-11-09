@@ -47,18 +47,22 @@ func (binder *informBinder) Bind(ctx context.Context) (string, error) {
 	if binder.listener != nil {
 		return binder.listener.Addr().String(), nil
 	}
+
 	if err := binder.refuseOccupied(ctx); err != nil {
 		return "", err
 	}
+
 	listenerConfig := new(net.ListenConfig)
 	listener, err := listenerConfig.Listen(ctx, "tcp", binder.address)
 	if err != nil {
 		return "", failure("listen for informs", err)
 	}
+
 	server := &http.Server{Handler: binder.handler, ReadHeaderTimeout: 10 * time.Second}
 	binder.listener, binder.server = listener, server
 	binder.serve(server, listener)
 	slog.Info("inform listener bound", slog.String("address", listener.Addr().String()))
+
 	return listener.Addr().String(), nil
 }
 
@@ -69,6 +73,7 @@ func (binder *informBinder) Release(ctx context.Context) error {
 	if binder.server == nil {
 		return nil
 	}
+
 	shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), informShutdownWait)
 	defer cancel()
 	server := binder.server
@@ -76,7 +81,9 @@ func (binder *informBinder) Release(ctx context.Context) error {
 	if err := server.Shutdown(shutdown); err != nil {
 		return failure("stop inform server", err)
 	}
+
 	slog.Info("inform listener released")
+
 	return nil
 }
 
@@ -87,6 +94,7 @@ func (binder *informBinder) Address() string {
 	if binder.listener == nil {
 		return ""
 	}
+
 	return binder.listener.Addr().String()
 }
 
@@ -118,8 +126,14 @@ func (binder *informBinder) refuseOccupied(ctx context.Context) error {
 		slog.Info("inform address is free", slog.String("address", target))
 		return nil
 	}
+
 	err := fmt.Errorf("another controller answers on %s; stop it before promoting", target)
-	slog.Error("inform address already answers", slog.String("address", target), slog.String("error", err.Error()))
+	slog.Error(
+		"inform address already answers",
+		slog.String("address", target),
+		slog.String("error", err.Error()),
+	)
+
 	return err
 }
 
@@ -130,9 +144,11 @@ func addressAnswers(ctx context.Context, target string) bool {
 	if err != nil {
 		return false
 	}
+
 	if closeErr := connection.Close(); closeErr != nil {
 		slog.Warn("close occupancy probe failed", slog.String("error", closeErr.Error()))
 	}
+
 	return true
 }
 
@@ -143,8 +159,10 @@ func probeTarget(address string) string {
 	if err != nil {
 		return address
 	}
+
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		return net.JoinHostPort("127.0.0.1", port)
 	}
+
 	return net.JoinHostPort(host, port)
 }

@@ -76,6 +76,11 @@ type APCompiler interface {
 // SwitchCompiler compiles and decodes switch configuration and state.
 type SwitchCompiler interface {
 	Supports(DeviceDescriptor) bool
-	Compile(DeviceDescriptor, CompilationInput, network.SwitchConfig, SecretReader) (Compilation, error)
+	Compile(
+		DeviceDescriptor,
+		CompilationInput,
+		network.SwitchConfig,
+		SecretReader,
+	) (Compilation, error)
 	Decode(informmodel.Report) (network.SwitchSnapshot, error)
 }

@@ -28,6 +28,7 @@ func TestParseRoundTripPreservesValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
 	}
+
 	if got != encoded {
 		t.Fatalf("Encode() = %q, want %q", got, encoded)
 	}
@@ -54,6 +55,7 @@ func TestCloneIsIndependent(t *testing.T) {
 	if err := clone.Set("key", "changed"); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
+
 	if err := clone.Set("new", "value"); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
@@ -70,6 +72,7 @@ func TestSetReplacesAndDeleteRemoves(t *testing.T) {
 	if err := values.Set("key", "new"); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
+
 	values.Delete("remove")
 
 	want := configmap.Values{"key": "new"}
@@ -83,6 +86,7 @@ func TestParseEmptyInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
+
 	if len(values) != 0 {
 		t.Fatalf("len(Parse()) = %d, want 0", len(values))
 	}
@@ -91,6 +95,7 @@ func TestParseEmptyInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
 	}
+
 	if encoded != "" {
 		t.Fatalf("Encode() = %q, want empty string", encoded)
 	}
@@ -106,11 +111,14 @@ func TestParseRejectsMalformedInput(t *testing.T) {
 	}
 
 	for name, encoded := range tests {
-		t.Run(name, func(t *testing.T) {
-			if _, err := configmap.Parse(encoded); err == nil {
-				t.Fatal("Parse() error = nil, want error")
-			}
-		})
+		t.Run(
+			name,
+			func(t *testing.T) {
+				if _, err := configmap.Parse(encoded); err == nil {
+					t.Fatal("Parse() error = nil, want error")
+				}
+			},
+		)
 	}
 }
 
@@ -128,15 +136,19 @@ func TestSetRejectsInvalidRecords(t *testing.T) {
 	}
 
 	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			values := configmap.Values{}
-			if err := values.Set(test.key, test.value); err == nil {
-				t.Fatal("Set() error = nil, want error")
-			}
-			if len(values) != 0 {
-				t.Fatalf("Set() changed values to %#v", values)
-			}
-		})
+		t.Run(
+			name,
+			func(t *testing.T) {
+				values := configmap.Values{}
+				if err := values.Set(test.key, test.value); err == nil {
+					t.Fatal("Set() error = nil, want error")
+				}
+
+				if len(values) != 0 {
+					t.Fatalf("Set() changed values to %#v", values)
+				}
+			},
+		)
 	}
 }
 
@@ -149,10 +161,13 @@ func TestEncodeRejectsInvalidMap(t *testing.T) {
 	}
 
 	for name, values := range tests {
-		t.Run(name, func(t *testing.T) {
-			if _, err := values.Encode(); err == nil {
-				t.Fatal("Encode() error = nil, want error")
-			}
-		})
+		t.Run(
+			name,
+			func(t *testing.T) {
+				if _, err := values.Encode(); err == nil {
+					t.Fatal("Encode() error = nil, want error")
+				}
+			},
+		)
 	}
 }
