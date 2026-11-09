@@ -220,7 +220,8 @@ func readConfigFile(path string) (string, error) {
 	return string(data), nil
 }
 
-func decodeConfigFile[T network.APConfig | network.SwitchConfig | network.Command | network.BaselineImport | network.WiFiNetwork | network.RadioConfig | network.SwitchPortConfig](
+func decodeConfigFile[T network.APConfig | network.SwitchConfig | network.Command |
+	network.BaselineImport | network.WiFiNetwork | network.RadioConfig | network.SwitchPortConfig](
 	path string,
 	config *T,
 ) error {
@@ -364,7 +365,8 @@ type queuedVersion struct {
 	Version network.ConfigVersion `json:"version"`
 }
 
-func encodeTyped[T network.DeviceSnapshot | []network.DeviceSnapshot | []network.ClientSnapshot | []network.PortSnapshot | []network.WiFiNetworkView | network.ConfigPreview | queuedVersion](
+func encodeTyped[T network.DeviceSnapshot | []network.DeviceSnapshot | []network.ClientSnapshot |
+	[]network.PortSnapshot | []network.WiFiNetworkView | network.ConfigPreview | queuedVersion](
 	output io.Writer,
 	value T,
 ) error {
