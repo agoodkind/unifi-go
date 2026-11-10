@@ -74,6 +74,7 @@ func (client *Client) ApplyAP(
 		ctx,
 		controlRequest{Operation: "apply-ap", Device: id, AP: &config},
 	)
+
 	return response.Version, err
 }
 
@@ -87,6 +88,7 @@ func (client *Client) ApplySwitch(
 		ctx,
 		controlRequest{Operation: "apply-switch", Device: id, Switch: &config},
 	)
+
 	return response.Version, err
 }
 
@@ -114,6 +116,7 @@ func (client *Client) SendCommand(ctx context.Context, id DeviceID, command Comm
 		ctx,
 		controlRequest{Operation: "command", Device: id, TypedCommand: &command},
 	)
+
 	return err
 }
 
@@ -175,6 +178,7 @@ func (client *Client) AddWiFi(
 		ctx,
 		controlRequest{Operation: "wifi-add", Device: id, WiFiAdd: &request},
 	)
+
 	return response.Version, err
 }
 
@@ -188,6 +192,7 @@ func (client *Client) SetWiFi(
 		ctx,
 		controlRequest{Operation: "wifi-set", Device: id, WiFiSet: &request},
 	)
+
 	return response.Version, err
 }
 
@@ -201,6 +206,7 @@ func (client *Client) RemoveWiFi(
 		ctx,
 		controlRequest{Operation: "wifi-remove", Device: id, WiFiRemove: &name},
 	)
+
 	return response.Version, err
 }
 
@@ -214,6 +220,7 @@ func (client *Client) SetRadio(
 		ctx,
 		controlRequest{Operation: "radio-set", Device: id, Radio: &config},
 	)
+
 	return response.Version, err
 }
 
@@ -227,6 +234,7 @@ func (client *Client) SetSwitchPort(
 		ctx,
 		controlRequest{Operation: "port-set", Device: id, Port: &config},
 	)
+
 	return response.Version, err
 }
 

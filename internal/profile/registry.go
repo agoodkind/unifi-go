@@ -48,6 +48,7 @@ func (registry Registry) CompileAP(
 			"err",
 			&network.ControlError{Code: network.InvalidConfig},
 		)
+
 		return Compilation{}, fmt.Errorf("compile access point: %w", err)
 	}
 
@@ -76,6 +77,7 @@ func (registry Registry) CompileSwitch(
 			"err",
 			&network.ControlError{Code: network.InvalidConfig},
 		)
+
 		return Compilation{}, fmt.Errorf("compile switch: %w", err)
 	}
 

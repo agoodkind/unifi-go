@@ -710,6 +710,7 @@ func validatePublication(
 	for value, category := range sensitiveValues {
 		if trackedValueRemains(leaves, value, category) {
 			path := publicationValuePath(descriptor, exchanges, value, category)
+
 			return fmt.Errorf(
 				"sanitized output retains tracked source category %s length %d in %s",
 				category,

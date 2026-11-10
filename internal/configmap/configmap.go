@@ -28,12 +28,15 @@ func Parse(encoded string) (Values, error) {
 		if !found {
 			return nil, fmt.Errorf("parse config map record %q: missing separator", record)
 		}
+
 		if err := validateRecord(key, value); err != nil {
 			return nil, err
 		}
+
 		if _, exists := values[key]; exists {
 			return nil, fmt.Errorf("parse config map: duplicate key %q", key)
 		}
+
 		values[key] = value
 	}
 
@@ -44,6 +47,7 @@ func Parse(encoded string) (Values, error) {
 func (values Values) Clone() Values {
 	clone := make(Values, len(values))
 	maps.Copy(clone, values)
+
 	return clone
 }
 
@@ -54,17 +58,21 @@ func (values Values) Encode() (string, error) {
 		if err := validateRecord(key, value); err != nil {
 			return "", err
 		}
+
 		keys = append(keys, key)
 	}
+
 	sort.Strings(keys)
 
 	var encoded strings.Builder
+
 	for _, key := range keys {
 		encoded.WriteString(key)
 		encoded.WriteByte('=')
 		encoded.WriteString(values[key])
 		encoded.WriteByte('\n')
 	}
+
 	return encoded.String(), nil
 }
 
@@ -73,10 +81,13 @@ func (values Values) Set(key string, value string) error {
 	if err := validateRecord(key, value); err != nil {
 		return err
 	}
+
 	if values == nil {
 		return fmt.Errorf("set config map key %q: nil map", key)
 	}
+
 	values[key] = value
+
 	return nil
 }
 
@@ -89,14 +100,18 @@ func validateRecord(key string, value string) error {
 	if key == "" {
 		return fmt.Errorf("empty key")
 	}
+
 	if strings.ContainsRune(key, '=') {
 		return fmt.Errorf("key contains separator")
 	}
+
 	if strings.ContainsAny(key, "\r\n") {
 		return fmt.Errorf("key contains newline")
 	}
+
 	if strings.ContainsAny(value, "\r\n") {
 		return fmt.Errorf("value contains newline")
 	}
+
 	return nil
 }
