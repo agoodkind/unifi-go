@@ -1844,6 +1844,7 @@ func (r *liveRun) addSecondAP(model liveModel, index int) (string, string) {
 		"second AP adoption",
 		func() bool {
 			snapshot := r.snapshot(id)
+
 			return snapshot.Family == network.FamilyAP &&
 				snapshot.ReportedConfigVersion == "unifi-go-1"
 		},

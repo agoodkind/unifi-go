@@ -40,10 +40,12 @@ func (value Optional[T]) MarshalJSON() ([]byte, error) {
 	if !value.Present || value.Null {
 		return []byte("null"), nil
 	}
+
 	encoded, err := json.Marshal(value.Value)
 	if err != nil {
 		return nil, fmt.Errorf("marshal optional value: %w", err)
 	}
+
 	return encoded, nil
 }
 
@@ -54,17 +56,22 @@ func (value *Optional[T]) UnmarshalJSON(data []byte) error {
 		var zero T
 		*value = Cleared[T]()
 		value.Value = zero
+
 		return nil
 	}
+
 	var decoded T
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&decoded); err != nil {
 		return fmt.Errorf("unmarshal optional value: %w", err)
 	}
+
 	if decoder.Decode(new(json.RawMessage)) != io.EOF {
 		return fmt.Errorf("unmarshal optional value: trailing JSON value")
 	}
+
 	*value = Supplied(decoded)
+
 	return nil
 }
