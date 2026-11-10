@@ -44,6 +44,7 @@ func (c *Controller) Mode() ModeReport {
 	if c.listener == nil || c.listener.Address() == "" {
 		return ModeReport{Mode: ModeShadow, Address: ""}
 	}
+
 	return ModeReport{Mode: ModeAuthoritative, Address: c.listener.Address()}
 }
 
@@ -53,13 +54,19 @@ func (c *Controller) Mode() ModeReport {
 func (c *Controller) Promote(ctx context.Context) (ModeReport, error) {
 	slog.Info("controller promote requested")
 	if c.listener == nil {
-		return ModeReport{Mode: ModeShadow, Address: ""}, errors.New("this controller has no device listener to bind")
+		return ModeReport{
+			Mode:    ModeShadow,
+			Address: "",
+		}, errors.New("this controller has no device listener to bind")
 	}
+
 	address, err := c.listener.Bind(ctx)
 	if err != nil {
 		return ModeReport{Mode: ModeShadow, Address: ""}, fault("bind the inform listener", err)
 	}
+
 	slog.Info("controller authoritative", slog.String("inform_address", address))
+
 	return ModeReport{Mode: ModeAuthoritative, Address: address}, nil
 }
 
@@ -70,9 +77,15 @@ func (c *Controller) Demote(ctx context.Context) (ModeReport, error) {
 	if c.listener == nil {
 		return ModeReport{Mode: ModeShadow, Address: ""}, nil
 	}
+
 	if err := c.listener.Release(ctx); err != nil {
-		return ModeReport{Mode: ModeAuthoritative, Address: c.listener.Address()}, fault("release the inform listener", err)
+		return ModeReport{
+			Mode:    ModeAuthoritative,
+			Address: c.listener.Address(),
+		}, fault("release the inform listener", err)
 	}
+
 	slog.Info("controller shadowed")
+
 	return ModeReport{Mode: ModeShadow, Address: ""}, nil
 }

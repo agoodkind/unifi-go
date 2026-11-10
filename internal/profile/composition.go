@@ -31,13 +31,20 @@ func CloneBaseline(input CompilationInput) (SetParam, error) {
 	if len(input.Baseline.Management) == 0 || len(input.Baseline.System) == 0 {
 		return SetParam{}, &network.ControlError{Code: network.BaselineRequired}
 	}
+
 	if _, err := input.Baseline.Management.Encode(); err != nil {
 		return SetParam{}, UnusableBaseline()
 	}
+
 	if _, err := input.Baseline.System.Encode(); err != nil {
 		return SetParam{}, UnusableBaseline()
 	}
-	return SetParam{Version: "", Management: input.Baseline.Management.Clone(), System: input.Baseline.System.Clone()}, nil
+
+	return SetParam{
+		Version:    "",
+		Management: input.Baseline.Management.Clone(),
+		System:     input.Baseline.System.Clone(),
+	}, nil
 }
 
 // UnusableBaseline returns a body-free ownership error.
@@ -49,52 +56,71 @@ func CloneBindings(bindings []ResourceBinding) []ResourceBinding {
 	for index := range result {
 		result[index].Prefixes = slices.Clone(result[index].Prefixes)
 	}
-	slices.SortFunc(result, func(left, right ResourceBinding) int {
-		return strings.Compare(left.Kind+"\x00"+left.Identity+"\x00"+left.RadioID, right.Kind+"\x00"+right.Identity+"\x00"+right.RadioID)
-	})
+
+	slices.SortFunc(
+		result,
+		func(left, right ResourceBinding) int {
+			return strings.Compare(
+				left.Kind+"\x00"+left.Identity+"\x00"+left.RadioID,
+				right.Kind+"\x00"+right.Identity+"\x00"+right.RadioID,
+			)
+		},
+	)
+
 	return result
 }
 
 // RecordPrefixes returns only immediate numbered records in a namespace.
 func RecordPrefixes(values configmap.Values, namespace string) []string {
 	var result []string
+
 	for key := range values {
 		suffix, found := strings.CutPrefix(key, namespace)
 		if !found {
 			continue
 		}
+
 		number, _, found := strings.Cut(suffix, ".")
 		if !found {
 			continue
 		}
+
 		index, err := strconv.Atoi(number)
 		if err != nil || index < 1 {
 			continue
 		}
+
 		result = append(result, namespace+number+".")
 	}
+
 	slices.Sort(result)
+
 	return slices.Compact(result)
 }
 
 // MatchRecord resolves one exact record, rejecting duplicate identity matches.
 func MatchRecord(values configmap.Values, namespace, field, value string) (string, error) {
 	var result string
+
 	for _, prefix := range RecordPrefixes(values, namespace) {
 		if values[prefix+field] != value {
 			continue
 		}
+
 		if result != "" {
 			return "", UnusableBaseline()
 		}
+
 		result = prefix
 	}
+
 	return result, nil
 }
 
 // NextRecord returns an unused numbered prefix without moving existing records.
 func NextRecord(values configmap.Values, namespace string) string {
 	occupied := RecordPrefixes(values, namespace)
+
 	for index := 1; ; index++ {
 		prefix := namespace + strconv.Itoa(index) + "."
 		if !slices.Contains(occupied, prefix) {
@@ -104,19 +130,27 @@ func NextRecord(values configmap.Values, namespace string) string {
 }
 
 // CopyBindingRecords copies all owned keys and remaps only named reference fields.
-func CopyBindingRecords(values configmap.Values, prefixes map[string]string, references map[string]string) {
+func CopyBindingRecords(
+	values configmap.Values,
+	prefixes map[string]string,
+	references map[string]string,
+) {
 	before := values.Clone()
+
 	for oldPrefix, newPrefix := range prefixes {
 		for key, value := range before {
 			suffix, found := strings.CutPrefix(key, oldPrefix)
 			if !found {
 				continue
 			}
-			if suffix == "devname" || suffix == "parent" || suffix == "ssid" || suffix == "br.devname" {
+
+			if suffix == "devname" || suffix == "parent" || suffix == "ssid" ||
+				suffix == "br.devname" {
 				if replacement, exists := references[value]; exists {
 					value = replacement
 				}
 			}
+
 			values[newPrefix+suffix] = value
 		}
 	}
@@ -139,17 +173,23 @@ func overlay[T interface {
 	if supplied.Present {
 		return supplied
 	}
+
 	return prior
 }
 
 // MergeSSH preserves individually omitted credential fields.
-func MergeSSH(prior, supplied network.Optional[network.SSHConfig]) network.Optional[network.SSHConfig] {
+func MergeSSH(
+	prior network.Optional[network.SSHConfig],
+	supplied network.Optional[network.SSHConfig],
+) network.Optional[network.SSHConfig] {
 	if !supplied.Present {
 		return prior
 	}
+
 	result := supplied
 	result.Value.Username = overlay(prior.Value.Username, supplied.Value.Username)
 	result.Value.Password = overlay(prior.Value.Password, supplied.Value.Password) // gitleaks:allow
+
 	return result
 }
 
@@ -159,6 +199,7 @@ func MergeAP(prior *network.APConfig, request network.APConfig) network.APConfig
 	if prior != nil {
 		result = *prior
 	}
+
 	result.CountryCode = overlay(result.CountryCode, request.CountryCode)
 	result.SSH = MergeSSH(result.SSH, request.SSH)
 	oldNetworks, oldRadios := result.Networks.Value, result.Radios.Value
@@ -171,16 +212,20 @@ func MergeAP(prior *network.APConfig, request network.APConfig) network.APConfig
 		if request.Networks.Present {
 			wifi = mergeWiFi(oldNetworks, wifi)
 		}
+
 		wifi.Bands.Value = slices.Clone(wifi.Bands.Value)
 		wifi.RadioIDs.Value = slices.Clone(wifi.RadioIDs.Value)
 		result.Networks.Value[index] = wifi
 	}
+
 	for index, radio := range result.Radios.Value {
 		if request.Radios.Present {
 			radio = mergeRadio(oldRadios, radio)
 		}
+
 		result.Radios.Value[index] = radio
 	}
+
 	return result
 }
 
@@ -190,9 +235,11 @@ func MergeSwitch(prior *network.SwitchConfig, request network.SwitchConfig) netw
 	if prior != nil {
 		result = *prior
 	}
+
 	result.SSH = MergeSSH(result.SSH, request.SSH)
 	oldPorts := result.Ports.Value
 	result.Ports = overlay(result.Ports, request.Ports)
+
 	result.Ports.Value = slices.Clone(result.Ports.Value)
 	for index, port := range result.Ports.Value {
 		if request.Ports.Present {
@@ -200,15 +247,18 @@ func MergeSwitch(prior *network.SwitchConfig, request network.SwitchConfig) netw
 				if old.Index != port.Index {
 					continue
 				}
+
 				port.Enabled = overlay(old.Enabled, port.Enabled)
 				port.NativeVLAN = overlay(old.NativeVLAN, port.NativeVLAN)
 				port.TaggedVLANs = overlay(old.TaggedVLANs, port.TaggedVLANs)
 				port.PoE = overlay(old.PoE, port.PoE)
 			}
 		}
+
 		port.TaggedVLANs.Value = slices.Clone(port.TaggedVLANs.Value)
 		result.Ports.Value[index] = port
 	}
+
 	return result
 }
 
@@ -217,6 +267,7 @@ func mergeWiFi(prior []network.WiFiNetwork, wifi network.WiFiNetwork) network.Wi
 		if old.Name != wifi.Name {
 			continue
 		}
+
 		wifi.Enabled = overlay(old.Enabled, wifi.Enabled)
 		wifi.VLAN = overlay(old.VLAN, wifi.VLAN)
 		bandsSupplied := wifi.Bands.Present
@@ -226,9 +277,11 @@ func mergeWiFi(prior []network.WiFiNetwork, wifi network.WiFiNetwork) network.Wi
 		if bandsSupplied && !radioIDsSupplied {
 			wifi.RadioIDs = network.Optional[[]network.RadioID]{}
 		}
+
 		if radioIDsSupplied && !bandsSupplied {
 			wifi.Bands = network.Optional[[]network.RadioBand]{}
 		}
+
 		wifi.BSSTransition = overlay(old.BSSTransition, wifi.BSSTransition)
 		security := wifi.Security
 		wifi.Security = overlay(old.Security, security)
@@ -237,11 +290,13 @@ func mergeWiFi(prior []network.WiFiNetwork, wifi network.WiFiNetwork) network.Wi
 			wifi.Security.Value.PSK = overlay(old.Security.Value.PSK, security.Value.PSK)
 		}
 	}
+
 	return wifi
 }
 
 func mergeRadio(prior []network.RadioConfig, radio network.RadioConfig) network.RadioConfig {
 	var matches []network.RadioConfig
+
 	for _, old := range prior {
 		if radio.ID != "" {
 			if old.ID == radio.ID {
@@ -251,13 +306,16 @@ func mergeRadio(prior []network.RadioConfig, radio network.RadioConfig) network.
 			matches = append(matches, old)
 		}
 	}
+
 	if len(matches) != 1 {
 		return radio
 	}
+
 	old := matches[0]
 	if radio.ID == "" {
 		radio.ID = old.ID
 	}
+
 	radio.Enabled = overlay(old.Enabled, radio.Enabled)
 	radio.Channel = overlay(old.Channel, radio.Channel)
 	radio.WidthMHz = overlay(old.WidthMHz, radio.WidthMHz)
@@ -266,10 +324,12 @@ func mergeRadio(prior []network.RadioConfig, radio network.RadioConfig) network.
 	if !power.Present {
 		return radio
 	}
+
 	radio.Power.Value.Mode = overlay(old.Power.Value.Mode, power.Value.Mode)
 	radio.Power.Value.DBm = overlay(old.Power.Value.DBm, power.Value.DBm)
 	if power.Value.Mode.Present && power.Value.Mode.Value == network.PowerAuto {
 		radio.Power.Value.DBm = network.Optional[int]{}
 	}
+
 	return radio
 }

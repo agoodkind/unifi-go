@@ -18,16 +18,20 @@ func (value *Uint16Scalar) UnmarshalJSON(data []byte) error {
 	if len(data) == 0 {
 		return fmt.Errorf("decode uint16 scalar: empty value")
 	}
+
 	if data[0] == '"' {
 		var encoded string
 		if err := json.Unmarshal(data, &encoded); err != nil {
 			return fmt.Errorf("decode uint16 scalar string: %w", err)
 		}
+
 		parsed, err := strconv.ParseUint(encoded, 10, 16)
 		if err != nil {
 			return fmt.Errorf("decode uint16 scalar string %q: %w", encoded, err)
 		}
+
 		*value = Uint16Scalar(parsed)
+
 		return nil
 	}
 
@@ -35,7 +39,9 @@ func (value *Uint16Scalar) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return fmt.Errorf("decode uint16 scalar: %w", err)
 	}
+
 	*value = Uint16Scalar(parsed)
+
 	return nil
 }
 
@@ -76,25 +82,33 @@ func (value *UplinkValue) UnmarshalJSON(data []byte) error {
 	if bytes.Equal(data, []byte("null")) {
 		return nil
 	}
+
 	if len(data) == 0 {
 		return fmt.Errorf("decode uplink: empty value")
 	}
+
 	if data[0] == '"' {
 		if err := json.Unmarshal(data, &value.Interface); err != nil {
 			return fmt.Errorf("decode uplink interface: %w", err)
 		}
+
 		value.Uplink.Interface = value.Interface
+
 		return nil
 	}
+
 	if data[0] != '{' {
 		return fmt.Errorf("decode uplink: unsupported value")
 	}
+
 	var details Uplink
 	if err := json.Unmarshal(data, &details); err != nil {
 		return fmt.Errorf("decode uplink object: %w", err)
 	}
+
 	value.Uplink = details
 	value.Interface = details.Interface
+
 	return nil
 }
 
@@ -110,6 +124,7 @@ func (table *EthernetTable) UnmarshalJSON(data []byte) error {
 	if len(data) == 0 {
 		return fmt.Errorf("decode ethernet table: empty value")
 	}
+
 	switch data[0] {
 	case '"':
 		if err := json.Unmarshal(data, &table.Interface); err != nil {
@@ -124,30 +139,38 @@ func (table *EthernetTable) UnmarshalJSON(data []byte) error {
 			Interface string     `json:"Interface"`
 			Entries   []Ethernet `json:"Entries"`
 		}
-		if err := json.Unmarshal(data, &wrapped); err == nil && (wrapped.Interface != "" || wrapped.Entries != nil) {
+		if err := json.Unmarshal(data, &wrapped); err == nil &&
+			(wrapped.Interface != "" || wrapped.Entries != nil) {
 			table.Interface = wrapped.Interface
 			table.Entries = wrapped.Entries
+
 			return nil
 		}
+
 		var keyed map[string]Ethernet
 		if err := json.Unmarshal(data, &keyed); err != nil {
 			return fmt.Errorf("decode keyed ethernet table: %w", err)
 		}
+
 		interfaceNames := make([]string, 0, len(keyed))
 		for interfaceName := range keyed {
 			interfaceNames = append(interfaceNames, interfaceName)
 		}
+
 		sort.Strings(interfaceNames)
+
 		for _, interfaceName := range interfaceNames {
 			entry := keyed[interfaceName]
 			if entry.Name == "" {
 				entry.Name = interfaceName
 			}
+
 			table.Entries = append(table.Entries, entry)
 		}
 	default:
 		return fmt.Errorf("decode ethernet table: unsupported value")
 	}
+
 	return nil
 }
 

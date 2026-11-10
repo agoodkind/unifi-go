@@ -22,6 +22,7 @@ import (
 	"goodkind.io/unifi-go/internal/profile"
 	"goodkind.io/unifi-go/internal/profile/ap"
 	"goodkind.io/unifi-go/internal/profile/switches"
+	"goodkind.io/unifi-go/internal/synccli"
 )
 
 func main() {
@@ -36,21 +37,34 @@ func main() {
 
 func run(ctx context.Context, args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: unifi-go serve|adopt|import|import-controller|send|status|mode|promote|demote|apply|wifi|radio|port|sync [flags]")
+		return errors.New(
+			"usage: unifi-go serve|adopt|import|import-controller|send|status|mode|promote|demote|apply|wifi|radio|port|sync [flags]",
+		)
 	}
+
 	if args[0] == "sync" {
 		return runSync(ctx, args[1:], output)
 	}
+
 	if args[0] == "import-controller" {
 		return runImportController(ctx, args[1:], output)
 	}
+
 	if args[0] == "wifi" || args[0] == "radio" || args[0] == "port" {
 		return runResource(ctx, args, output)
 	}
+
 	switch typedOperation(args[0]) {
-	case operationApply, operationDevices, operationDevice, operationClients, operationPorts, operationCommand, operationBaselineImport:
+	case operationApply,
+		operationDevices,
+		operationDevice,
+		operationClients,
+		operationPorts,
+		operationCommand,
+		operationBaselineImport:
 		return runTyped(ctx, args, output)
 	}
+
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	socket := flags.String("socket", "/tmp/unifi-go.sock", "local control socket")
 	listen := flags.String("listen", ":18080", "inform listener")
@@ -60,48 +74,100 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	keyFile := flags.String("key-file", "", "inform key file")
 	commandFile := flags.String("file", "", "controller JSON reply file")
 	setupSSH := flags.Bool("setup-ssh", false, "install generated SSH credentials during adoption")
-	mode := flags.String("mode", string(controller.ModeAuthoritative), "shadow keeps the inform listener unbound; authoritative binds it")
+	mode := flags.String(
+		"mode",
+		string(controller.ModeAuthoritative),
+		"shadow keeps the inform listener unbound; authoritative binds it",
+	)
 	if err := flags.Parse(args[1:]); err != nil {
 		return failure("parse arguments", err)
 	}
+
 	if args[0] == "serve" {
-		return serve(ctx, serveOptions{listen: *listen, advertise: *advertise, stateFile: *state, socket: *socket, mode: controller.ModeName(*mode)}, output)
+		return serve(
+			ctx,
+			serveOptions{
+				listen:    *listen,
+				advertise: *advertise,
+				stateFile: *state,
+				socket:    *socket,
+				mode:      controller.ModeName(*mode),
+			},
+			output,
+		)
 	}
-	request := controller.ControlRequest{Operation: controller.Operation(args[0]), MAC: *mac, KeyFile: *keyFile, Command: nil, Device: "", AP: nil, Switch: nil, Config: nil, TypedCommand: nil, Baseline: nil, SetupSSH: *setupSSH, PreviewToken: "", WiFiAdd: nil, WiFiSet: nil, WiFiRemove: nil, Radio: nil, Port: nil}
+
+	request := controller.ControlRequest{
+		Operation:    controller.Operation(args[0]),
+		MAC:          *mac,
+		KeyFile:      *keyFile,
+		Command:      nil,
+		Device:       "",
+		AP:           nil,
+		Switch:       nil,
+		Config:       nil,
+		TypedCommand: nil,
+		Baseline:     nil,
+		SetupSSH:     *setupSSH,
+		PreviewToken: "",
+		WiFiAdd:      nil,
+		WiFiSet:      nil,
+		WiFiRemove:   nil,
+		Radio:        nil,
+		Port:         nil,
+	}
 	if args[0] == "send" || args[0] == "adopt" {
 		data, err := os.ReadFile(filepath.Clean(*commandFile))
 		if err != nil {
 			return failure("read command file", err)
 		}
+
 		var command controller.Reply
 		decoder := json.NewDecoder(bytes.NewReader(data))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&command); err != nil {
 			return failure("decode typed command file", err)
 		}
+
 		request.Command = &command
 	}
+
 	return control(ctx, *socket, request, output)
 }
 
-func control(ctx context.Context, socket string, request controller.ControlRequest, output io.Writer) error {
+func control(
+	ctx context.Context,
+	socket string,
+	request controller.ControlRequest,
+	output io.Writer,
+) error {
 	body, err := json.Marshal(request)
 	if err != nil {
 		return failure("encode control request", err)
 	}
-	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		connection, dialErr := (&net.Dialer{}).DialContext(ctx, "unix", socket)
-		if dialErr != nil {
-			return nil, failure("connect control socket", dialErr)
-		}
-		return connection, nil
-	}}
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			connection, dialErr := (&net.Dialer{}).DialContext(ctx, "unix", socket)
+			if dialErr != nil {
+				return nil, failure("connect control socket", dialErr)
+			}
+
+			return connection, nil
+		},
+	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: 45 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://local/control", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"http://local/control",
+		bytes.NewReader(body),
+	)
 	if err != nil {
 		return failure("create control request", err)
 	}
+
 	response, err := client.Do(req)
 	if err != nil {
 		return failure("send control request", err)
@@ -112,12 +178,15 @@ func control(ctx context.Context, socket string, request controller.ControlReque
 		if err != nil {
 			return failure("read control error", err)
 		}
+
 		return fmt.Errorf("control request failed: %s", message)
 	}
+
 	_, err = io.Copy(output, response.Body)
 	if err != nil {
 		return failure("write control response", err)
 	}
+
 	return nil
 }
 
@@ -131,12 +200,15 @@ func clearStaleSocket(ctx context.Context, socket string) error {
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+
 	if err != nil {
 		return fmt.Errorf("stat control socket: %w", err)
 	}
+
 	if info.Mode().Type() != os.ModeSocket {
 		return errors.New("control socket path holds a regular file")
 	}
+
 	dialer := &net.Dialer{Timeout: time.Second}
 	// #nosec G704 -- socket is the operator-supplied local control path, not a network address
 	conn, err := dialer.DialContext(ctx, "unix", socket)
@@ -144,10 +216,12 @@ func clearStaleSocket(ctx context.Context, socket string) error {
 		conn.Close()
 		return errors.New("another controller owns the control socket")
 	}
+
 	slog.Warn("removing stale control socket")
 	if err := os.Remove(socket); err != nil {
 		return fmt.Errorf("remove control socket: %w", err)
 	}
+
 	return nil
 }
 
@@ -165,14 +239,21 @@ func serve(ctx context.Context, options serveOptions, output io.Writer) error {
 	if options.mode != controller.ModeShadow && options.mode != controller.ModeAuthoritative {
 		return errors.New("mode must be shadow or authoritative")
 	}
-	c, err := controller.Open(options.stateFile, options.advertise, profile.NewRegistry(ap.New(), switches.New()))
+
+	c, err := controller.Open(
+		options.stateFile,
+		options.advertise,
+		profile.NewRegistry(ap.New(), switches.New()),
+	)
 	if err != nil {
 		return failure("open controller", err)
 	}
+
 	socket := filepath.Clean(options.socket)
 	if err := clearStaleSocket(ctx, socket); err != nil {
 		return failure("clear stale control socket", err)
 	}
+
 	listenerConfig := new(net.ListenConfig)
 	controlListener, err := listenerConfig.Listen(ctx, "unix", socket)
 	if err != nil {
@@ -182,6 +263,7 @@ func serve(ctx context.Context, options serveOptions, output io.Writer) error {
 	if err := os.Chmod(socket, 0o600); err != nil {
 		return failure("set control socket permissions", err)
 	}
+
 	errorsChannel := make(chan error, 2)
 	binder := newInformBinder(options.listen, c, errorsChannel)
 	c.SetInformListener(binder)
@@ -192,24 +274,32 @@ func serve(ctx context.Context, options serveOptions, output io.Writer) error {
 			return err
 		}
 	}
-	controlServer := &http.Server{Handler: http.HandlerFunc(c.Control), ReadHeaderTimeout: 10 * time.Second}
+
+	controlServer := &http.Server{
+		Handler:           http.HandlerFunc(c.Control),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	serveHTTP(controlServer, controlListener, errorsChannel)
 	fmt.Fprintf(output, "mode=%s inform=%s control=%s\n", options.mode, informAddress, socket)
 	select {
 	case <-ctx.Done():
 	case err = <-errorsChannel:
 	}
+
 	shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if releaseErr := binder.Release(shutdown); releaseErr != nil {
 		return releaseErr
 	}
+
 	if shutdownErr := controlServer.Shutdown(shutdown); shutdownErr != nil {
 		return failure("stop control server", shutdownErr)
 	}
+
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
+
 	return err
 }
 
@@ -229,4 +319,20 @@ func serveHTTP(server *http.Server, listener net.Listener, result chan<- error) 
 func failure(message string, err error) error {
 	slog.Error(message, "error", err)
 	return fmt.Errorf("%s: %w", message, err)
+}
+
+func runSync(ctx context.Context, args []string, output io.Writer) error {
+	if err := synccli.Run(ctx, args, output); err != nil {
+		slog.Error("controller synchronization failed", "err", err)
+		return fmt.Errorf("%w", err)
+	}
+
+	return nil
+}
+
+func syncFailure(message string, err error) error {
+	failure := synccli.Failure(message, err)
+	slog.Error("controller operation failed", "err", failure)
+
+	return fmt.Errorf("%w", failure)
 }

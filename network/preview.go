@@ -14,36 +14,72 @@ type ConfigPreview struct {
 }
 
 // PreviewAP compiles access point policy without persisting or queueing it.
-func (client *Client) PreviewAP(ctx context.Context, id DeviceID, config APConfig) (ConfigPreview, error) {
+func (client *Client) PreviewAP(
+	ctx context.Context,
+	id DeviceID,
+	config APConfig,
+) (ConfigPreview, error) {
 	return client.preview(ctx, controlRequest{Operation: "preview-ap", Device: id, AP: &config})
 }
 
 // PreviewSwitch compiles switch policy without persisting or queueing it.
-func (client *Client) PreviewSwitch(ctx context.Context, id DeviceID, config SwitchConfig) (ConfigPreview, error) {
-	return client.preview(ctx, controlRequest{Operation: "preview-switch", Device: id, Switch: &config})
+func (client *Client) PreviewSwitch(
+	ctx context.Context,
+	id DeviceID,
+	config SwitchConfig,
+) (ConfigPreview, error) {
+	return client.preview(
+		ctx,
+		controlRequest{Operation: "preview-switch", Device: id, Switch: &config},
+	)
 }
 
 // ApplyAPPreview applies access point policy only when its preview still matches.
-func (client *Client) ApplyAPPreview(ctx context.Context, id DeviceID, config APConfig, token PreviewToken) (ConfigVersion, error) {
+func (client *Client) ApplyAPPreview(
+	ctx context.Context,
+	deviceID DeviceID,
+	config APConfig,
+	token PreviewToken,
+) (ConfigVersion, error) {
 	if token == "" {
 		return "", &ControlError{Code: PreviewStale}
 	}
-	response, err := client.call(ctx, controlRequest{Operation: "apply-ap", Device: id, AP: &config, PreviewToken: token})
+
+	response, err := client.call(
+		ctx,
+		controlRequest{Operation: "apply-ap", Device: deviceID, AP: &config, PreviewToken: token},
+	)
 	if err != nil {
 		return "", err
 	}
+
 	return response.Version, nil
 }
 
 // ApplySwitchPreview applies switch policy only when its preview still matches.
-func (client *Client) ApplySwitchPreview(ctx context.Context, id DeviceID, config SwitchConfig, token PreviewToken) (ConfigVersion, error) {
+func (client *Client) ApplySwitchPreview(
+	ctx context.Context,
+	deviceID DeviceID,
+	config SwitchConfig,
+	token PreviewToken,
+) (ConfigVersion, error) {
 	if token == "" {
 		return "", &ControlError{Code: PreviewStale}
 	}
-	response, err := client.call(ctx, controlRequest{Operation: "apply-switch", Device: id, Switch: &config, PreviewToken: token})
+
+	response, err := client.call(
+		ctx,
+		controlRequest{
+			Operation:    "apply-switch",
+			Device:       deviceID,
+			Switch:       &config,
+			PreviewToken: token,
+		},
+	)
 	if err != nil {
 		return "", err
 	}
+
 	return response.Version, nil
 }
 
@@ -52,8 +88,10 @@ func (client *Client) preview(ctx context.Context, request controlRequest) (Conf
 	if err != nil {
 		return ConfigPreview{}, err
 	}
+
 	if response.Preview == nil {
 		return ConfigPreview{}, &ControlError{Code: RequestFailed}
 	}
+
 	return *response.Preview, nil
 }
